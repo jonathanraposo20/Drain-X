@@ -30,30 +30,74 @@ export class ApiError extends Error {
 
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}${endpoint}`;
+  let res: Response;
   try {
-    const res = await fetch(url, {
+    res = await fetch(url, {
       ...options,
       headers: {
         'Content-Type': 'application/json',
         ...options?.headers,
       },
     });
-
-    if (!res.ok) {
-      let errorData;
-      try {
-        errorData = await res.json();
-      } catch {
-        errorData = await res.text();
-      }
-      throw new ApiError(res.status, `Request failed: ${res.statusText}`, errorData);
-    }
-
-    return (await res.json()) as T;
   } catch (err) {
     if (err instanceof ApiError) throw err;
     throw new ApiError(0, err instanceof Error ? err.message : 'Network error');
   }
+
+  // Consume response body exactly once
+  let rawText = '';
+  let parsedData: unknown = undefined;
+  let bodyConsumed = false;
+
+  if (typeof res.text === 'function') {
+    try {
+      rawText = await res.text();
+      bodyConsumed = true;
+    } catch {
+      rawText = '';
+    }
+  }
+
+  if (bodyConsumed) {
+    if (rawText && rawText.trim().length > 0) {
+      try {
+        parsedData = JSON.parse(rawText);
+      } catch {
+        // Body is non-JSON text (e.g. HTML error page or plain text message)
+        parsedData = rawText;
+      }
+    }
+  } else if (typeof res.json === 'function') {
+    // Fallback for custom mocks where only res.json is defined
+    try {
+      parsedData = await res.json();
+    } catch {
+      parsedData = undefined;
+    }
+  }
+
+  if (!res.ok) {
+    // Extract meaningful error message while preserving HTTP status
+    let message = `Request failed: ${res.statusText || res.status}`;
+    if (parsedData && typeof parsedData === 'object') {
+      if ('detail' in parsedData && typeof (parsedData as Record<string, unknown>).detail === 'string') {
+        message = (parsedData as Record<string, unknown>).detail as string;
+      } else if ('message' in parsedData && typeof (parsedData as Record<string, unknown>).message === 'string') {
+        message = (parsedData as Record<string, unknown>).message as string;
+      }
+    } else if (typeof parsedData === 'string' && parsedData.trim().length > 0) {
+      message = parsedData.trim();
+    }
+
+    throw new ApiError(res.status, message, parsedData);
+  }
+
+  // Handle empty successful responses (e.g., 204 No Content or empty 200)
+  if (parsedData === undefined || (typeof parsedData === 'string' && parsedData.trim().length === 0)) {
+    return {} as T;
+  }
+
+  return parsedData as T;
 }
 
 export interface SimulationStateResponse {

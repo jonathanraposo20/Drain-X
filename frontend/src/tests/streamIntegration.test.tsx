@@ -96,7 +96,7 @@ describe('Digital Twin & UI Stream Integration', () => {
     );
 
     expect(screen.getByText(/STAGE: PARTIALLY_ASSEMBLED/i)).toBeTruthy();
-    expect(screen.getByText(/PHYSICAL BENCH/i)).toBeTruthy();
+    expect(screen.getByText(/LIVE \(ESP32\)/i)).toBeTruthy();
   });
 
   it('renders LiveTelemetryTable with stream status badge', () => {

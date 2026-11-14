@@ -199,7 +199,7 @@ class StateStore:
                 self.hardware_validation_stage = reading.metadata.get("validation_stage") or reading.metadata.get("hardware_validation_stage")
 
             # Strict operational partition routing
-            if reading.source == DataSource.PHYSICAL:
+            if reading.source in (DataSource.PHYSICAL, DataSource.LIVE):
                 # In PHYSICAL or SAFE_HOLD modes, physical telemetry updates the active hardware partition
                 self._physical_latest_readings[sensor_id] = reading
                 if sensor_id not in self._physical_history:

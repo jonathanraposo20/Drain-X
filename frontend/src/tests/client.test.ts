@@ -95,4 +95,85 @@ describe('API Client Abstraction', () => {
 
     await expect(apiClient.resolveAlert('non-existent-id')).rejects.toThrow(ApiError);
   });
+
+  // REGRESSION TESTS: Response Body Stream Single-Consumption
+  it('does NOT throw "body stream already read" when backend returns non-JSON error HTML (e.g. 502/500/404)', async () => {
+    // Real Response object whose ReadableStream will throw TypeError if read more than once
+    const htmlErrorBody = '<!DOCTYPE html><html><body>502 Bad Gateway from Render</body></html>';
+    const realResponse = new Response(htmlErrorBody, {
+      status: 502,
+      statusText: 'Bad Gateway',
+      headers: { 'Content-Type': 'text/html' },
+    });
+
+    global.fetch = vi.fn().mockResolvedValue(realResponse);
+
+    try {
+      await apiClient.getStatus();
+      expect.fail('Should have thrown an ApiError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError);
+      const apiErr = err as ApiError;
+      // Must preserve the actual HTTP status
+      expect(apiErr.status).toBe(502);
+      // Must NOT fail with stream already read error
+      expect(apiErr.message).not.toContain('body stream already read');
+      expect(apiErr.message).toContain('502 Bad Gateway');
+      expect(apiErr.data).toBe(htmlErrorBody);
+    }
+  });
+
+  it('preserves genuine HTTP status and extracts FastAPI error detail from JSON error', async () => {
+    const errorJson = JSON.stringify({ detail: 'Unauthenticated or expired token' });
+    const realResponse = new Response(errorJson, {
+      status: 401,
+      statusText: 'Unauthorized',
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    global.fetch = vi.fn().mockResolvedValue(realResponse);
+
+    try {
+      await apiClient.getLatestTelemetry();
+      expect.fail('Should have thrown an ApiError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError);
+      const apiErr = err as ApiError;
+      expect(apiErr.status).toBe(401);
+      expect(apiErr.message).toBe('Unauthenticated or expired token');
+      expect(apiErr.data).toEqual({ detail: 'Unauthenticated or expired token' });
+    }
+  });
+
+  it('handles empty response bodies (204 No Content or empty 200) without crashing', async () => {
+    const noContentResponse = new Response(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+
+    global.fetch = vi.fn().mockResolvedValue(noContentResponse);
+
+    const result = await apiClient.stopScenario();
+    expect(result).toBeDefined();
+    expect(typeof result).toBe('object');
+  });
+
+  it('handles empty error responses gracefully without stream errors', async () => {
+    const emptyErrorResponse = new Response('', {
+      status: 500,
+      statusText: 'Internal Server Error',
+    });
+
+    global.fetch = vi.fn().mockResolvedValue(emptyErrorResponse);
+
+    try {
+      await apiClient.getStatus();
+      expect.fail('Should have thrown an ApiError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError);
+      const apiErr = err as ApiError;
+      expect(apiErr.status).toBe(500);
+      expect(apiErr.message).toBe('Request failed: Internal Server Error');
+    }
+  });
 });

@@ -167,6 +167,7 @@ class TelemetryStreamManager:
         sensor_status_str = reading.status.value if isinstance(reading.status, Enum) else str(reading.status)
         
         # Water level vs Flow rate extraction without fabrication
+        metadata = reading.metadata or {}
         water_level_cm: Optional[float] = None
         flow_rate_lpm: Optional[float] = None
         cumulative_volume_liters: Optional[float] = None
@@ -175,10 +176,9 @@ class TelemetryStreamManager:
             water_level_cm = reading.value
         elif reading.sensor_type == SensorType.FLOW_RATE:
             flow_rate_lpm = reading.value
-            cumulative_volume_liters = reading.metadata.get("cumulative_volume_liters") or reading.metadata.get("total_volume_liters")
+            cumulative_volume_liters = metadata.get("cumulative_volume_liters") or metadata.get("total_volume_liters")
 
         # Fault and validity extraction
-        metadata = reading.metadata or {}
         fault_code = metadata.get("fault_code")
         if not fault_code and reading.status == SensorHealthStatus.FAULT:
             fault_code = "SENSOR_FAULT"
@@ -281,9 +281,12 @@ class TelemetryStreamManager:
             if client.is_closed:
                 continue
 
-            # 1. Source isolation filter
-            if client.source_filter and source and client.source_filter != source:
-                continue
+            # 1. Source isolation filter (normalizing LIVE and PHYSICAL as equivalent hardware streams)
+            if client.source_filter and source:
+                norm_filter = "PHYSICAL" if client.source_filter in ("PHYSICAL", "LIVE") else client.source_filter
+                norm_source = "PHYSICAL" if source in ("PHYSICAL", "LIVE") else source
+                if norm_filter != norm_source:
+                    continue
 
             # 2. Sensor identifier filter
             if client.sensor_filter and sensor_id and client.sensor_filter != sensor_id:

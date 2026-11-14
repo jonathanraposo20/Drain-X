@@ -338,7 +338,7 @@ def test_sit_suite_c_rate_of_rise_linear_regression(client: TestClient):
 
 def test_sit_suite_c_zero_flow_vs_fault_discrimination(client: TestClient):
     """SIT-C3: Zero flow (0.0 L/min, OK) is valid physical flow; FAULT readings are excluded."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(second=5, microsecond=0)
     # 1. Ingest valid zero flow
     client.post("/api/v1/telemetry/ingest", json={
         "sensor_id": "FS_FLUME_01",

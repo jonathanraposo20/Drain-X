@@ -348,3 +348,24 @@ def test_existing_ingestion_api_compatibility(client: TestClient):
     assert "blockage" in body
     assert "gate_directive" in body
     assert "gate_command" in body
+
+
+def test_flow_rate_ingest_without_metadata_does_not_500(client: TestClient):
+    """
+    Regression Test: Ingesting a FLOW_RATE reading with no metadata or empty metadata
+    must never raise AttributeError or cause an HTTP 500 Internal Server Error.
+    """
+    payload = {
+        "sensor_id": "FS_FLUME_01",
+        "section_id": "SEC_APPROACH",
+        "sensor_type": "FLOW_RATE",
+        "value": 14.5,
+        "unit": "L/min",
+        "source": "SIMULATED",
+        "status": "OK",
+    }
+    res = client.post("/api/v1/telemetry", json=payload)
+    assert res.status_code == 201
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["ingested_count"] == 1

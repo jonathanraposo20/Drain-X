@@ -37,7 +37,7 @@ export type OperatorIndicator =
 export const DiversionGateTwin: React.FC<DiversionGateTwinProps> = ({
   mode,
   upstreamDepth,
-  weirHead,
+  weirHead: _weirHead,
   inflow,
   gateDirective,
   readings,
@@ -519,7 +519,7 @@ export const DiversionGateTwin: React.FC<DiversionGateTwinProps> = ({
 
           {/* Primary Route Label */}
           <text x="790" y="72" fill="#38bdf8" fontSize="10" textAnchor="end" fontWeight="bold">
-            PRIMARY CHANNEL &rarr; OUTLET WEIR (hw: {weirHead.toFixed(1)} cm)
+            PRIMARY DRAINAGE CHANNEL (CONTINUATION)
           </text>
           <text x="790" y="105" fill="#94a3b8" fontSize="9" textAnchor="end">
             FLOW: {primaryFlow} L/min ({(primaryFraction * 100).toFixed(0)}%)

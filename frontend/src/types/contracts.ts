@@ -1,4 +1,8 @@
-export type DataSource = 'PHYSICAL' | 'SIMULATED' | 'REPLAY';
+export type DataSource = 'PHYSICAL' | 'LIVE' | 'SIMULATED' | 'REPLAY' | 'OFFLINE';
+
+export type TelemetrySource = 'SIMULATED' | 'LIVE' | 'OFFLINE';
+
+export type TelemetryConnectionState = 'LIVE' | 'SIMULATED' | 'OFFLINE' | 'STALE' | 'FAULT';
 
 export type SensorHealthStatus = 'OK' | 'DEGRADED' | 'FAULT' | 'CALIBRATING';
 

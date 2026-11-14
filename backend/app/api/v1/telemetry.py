@@ -57,7 +57,7 @@ async def ingest_telemetry(
     single_msg_id = payload.message_id if isinstance(payload, SensorReadingContract) else None
 
     # Strict operational mode validation: prevent cross-contamination
-    if state_store.is_simulation() and any(r.source == DataSource.PHYSICAL for r in readings):
+    if state_store.is_simulation() and any(r.source in (DataSource.PHYSICAL, DataSource.LIVE) for r in readings):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="System is in SIMULATION mode. Physical hardware telemetry rejected to prevent simulation contamination. Explicitly switch mode to PHYSICAL first.",

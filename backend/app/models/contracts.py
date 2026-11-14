@@ -7,8 +7,10 @@ from pydantic import BaseModel, Field, field_validator
 
 class DataSource(str, Enum):
     PHYSICAL = "PHYSICAL"
+    LIVE = "LIVE"
     SIMULATED = "SIMULATED"
     REPLAY = "REPLAY"
+    OFFLINE = "OFFLINE"
 
 
 class OperationalMode(str, Enum):
