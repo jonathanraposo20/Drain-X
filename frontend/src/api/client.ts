@@ -12,10 +12,42 @@ import {
   IncidentResponseContract,
   IncidentCreateContract,
   IncidentUpdateContract,
+  FieldTeamContract,
+  IncidentAuditContract,
+  IncidentVerifyRequest,
+  IncidentAssignRequest,
+  IncidentReassignRequest,
+  IncidentUnassignRequest,
+  IncidentRejectRequest,
+  MunicipalKpiResponseContract,
+  MunicipalQueueResponseContract,
+  MunicipalQueueFilters,
 } from '../types/contracts';
 
 const RAW_API_BASE = import.meta.env.VITE_API_BASE_URL;
 const API_BASE = RAW_API_BASE ? RAW_API_BASE.replace(/\/+$/, '') + '/api/v1' : '/api/v1';
+
+let currentAuthToken: string | null = null;
+try {
+  currentAuthToken = typeof localStorage !== 'undefined' ? localStorage.getItem('drainx_auth_token') : null;
+} catch {
+  currentAuthToken = null;
+}
+
+export const setAuthToken = (token: string | null) => {
+  currentAuthToken = token;
+  try {
+    if (token) {
+      localStorage.setItem('drainx_auth_token', token);
+    } else {
+      localStorage.removeItem('drainx_auth_token');
+    }
+  } catch {
+    // Ignore storage issues in test/restricted environments
+  }
+};
+
+export const getAuthToken = () => currentAuthToken;
 
 export class ApiError extends Error {
   constructor(
@@ -31,11 +63,16 @@ export class ApiError extends Error {
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}${endpoint}`;
   let res: Response;
+  const authHeaders: Record<string, string> = {};
+  if (currentAuthToken) {
+    authHeaders['Authorization'] = `Bearer ${currentAuthToken}`;
+  }
   try {
     res = await fetch(url, {
       ...options,
       headers: {
         'Content-Type': 'application/json',
+        ...authHeaders,
         ...options?.headers,
       },
     });
@@ -231,6 +268,69 @@ export const apiClient = {
       method: 'PATCH',
       body: JSON.stringify(payload),
     });
+  },
+
+  async getMunicipalKpis(): Promise<MunicipalKpiResponseContract> {
+    return request<MunicipalKpiResponseContract>('/incidents/municipal/kpis');
+  },
+
+  async getMunicipalQueue(filters?: MunicipalQueueFilters): Promise<MunicipalQueueResponseContract> {
+    const params = new URLSearchParams();
+    if (filters?.status && filters.status !== 'ALL') params.append('status', filters.status);
+    if (filters?.category && filters.category !== 'ALL') params.append('category', filters.category);
+    if (filters?.severity && filters.severity !== 'ALL') params.append('severity', filters.severity);
+    if (filters?.source && filters.source !== 'ALL') params.append('source', filters.source);
+    if (filters?.assigned_to && filters.assigned_to !== 'ALL') params.append('assigned_to', filters.assigned_to);
+    if (filters?.search && filters.search.trim()) params.append('search', filters.search.trim());
+    if (filters?.start_date) params.append('start_date', filters.start_date);
+    if (filters?.end_date) params.append('end_date', filters.end_date);
+    if (filters?.limit !== undefined) params.append('limit', String(filters.limit));
+    if (filters?.offset !== undefined) params.append('offset', String(filters.offset));
+    const queryString = params.toString() ? `?${params.toString()}` : '';
+    return request<MunicipalQueueResponseContract>(`/incidents/municipal/queue${queryString}`);
+  },
+
+  async getFieldTeams(): Promise<FieldTeamContract[]> {
+    return request<FieldTeamContract[]>('/incidents/field-teams');
+  },
+
+  async verifyIncident(id: string, payload: IncidentVerifyRequest): Promise<IncidentResponseContract> {
+    return request<IncidentResponseContract>(`/incidents/${id}/verify`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async assignIncident(id: string, payload: IncidentAssignRequest): Promise<IncidentResponseContract> {
+    return request<IncidentResponseContract>(`/incidents/${id}/assign`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async reassignIncident(id: string, payload: IncidentReassignRequest): Promise<IncidentResponseContract> {
+    return request<IncidentResponseContract>(`/incidents/${id}/reassign`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async unassignIncident(id: string, payload: IncidentUnassignRequest): Promise<IncidentResponseContract> {
+    return request<IncidentResponseContract>(`/incidents/${id}/unassign`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async rejectIncident(id: string, payload: IncidentRejectRequest): Promise<IncidentResponseContract> {
+    return request<IncidentResponseContract>(`/incidents/${id}/reject`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async getIncidentAudits(id: string): Promise<IncidentAuditContract[]> {
+    return request<IncidentAuditContract[]>(`/incidents/${id}/audit`);
   },
 
   async queryHistoricalTelemetry(options: {

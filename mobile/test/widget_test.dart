@@ -13,5 +13,6 @@ void main() {
     expect(find.text('COMPETITION MVP DEMO'), findsOneWidget);
     expect(find.text('CITIZEN PORTAL'), findsOneWidget);
     expect(find.text('MUNICIPAL OPERATIONS'), findsOneWidget);
+    expect(find.text('FIELD WORKER PORTAL'), findsOneWidget);
   });
 }

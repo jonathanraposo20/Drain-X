@@ -1,11 +1,17 @@
 import 'package:flutter/material.dart';
 import '../../core/config/api_config.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/auth/auth_service.dart';
+import '../../models/user_session.dart';
 import 'citizen_login_screen.dart';
 import 'municipal_login_screen.dart';
+import 'worker_login_screen.dart';
+import '../citizen/citizen_dashboard_screen.dart';
+import '../municipal/municipal_dashboard_screen.dart';
+import '../worker/worker_dashboard_screen.dart';
 
 class WelcomeScreen extends StatefulWidget {
-  const WelcomeScreen({Key? key}) : super(key: key);
+  const WelcomeScreen({super.key});
 
   @override
   State<WelcomeScreen> createState() => _WelcomeScreenState();
@@ -82,8 +88,9 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
     return Scaffold(
       backgroundColor: AppTheme.primaryNavy,
       body: SafeArea(
-        child: Column(
-          children: [
+        child: SingleChildScrollView(
+          child: Column(
+            children: [
             // Top Bar with Demo Indicator and Settings
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -123,7 +130,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
               ),
             ),
 
-            const Spacer(),
+            const SizedBox(height: 16),
 
             // Hero Branding
             Padding(
@@ -139,7 +146,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
                       border: Border.all(color: AppTheme.accentCyan, width: 2),
                       boxShadow: [
                         BoxShadow(
-                          color: AppTheme.accentCyan.withOpacity(0.3),
+                          color: AppTheme.accentCyan.withValues(alpha: 0.3),
                           blurRadius: 20,
                           offset: const Offset(0, 4),
                         ),
@@ -185,9 +192,68 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
               ),
             ),
 
-            const Spacer(),
+            const SizedBox(height: 16),
 
-            // Two Distinct Entry Experience Cards
+            // Active Session Resume Banner (if authenticated)
+            if (AuthService().isLoggedIn) ...[
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: AppTheme.accentTeal),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.verified_user_outlined, color: AppTheme.accentTeal, size: 20),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Active: ${AuthService().currentSession!.name}',
+                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+                            ),
+                            Text(
+                              AuthService().currentSession!.role.displayName,
+                              style: const TextStyle(fontSize: 10, color: Color(0xFF94A3B8)),
+                            ),
+                          ],
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () {
+                          final session = AuthService().currentSession!;
+                          if (session.role == UserRole.citizen) {
+                            Navigator.push(context, MaterialPageRoute(builder: (_) => CitizenDashboardScreen(reporterName: session.name)));
+                          } else if (session.role == UserRole.municipality) {
+                            Navigator.push(context, MaterialPageRoute(builder: (_) => MunicipalDashboardScreen(officerName: session.name)));
+                          } else {
+                            Navigator.push(context, MaterialPageRoute(builder: (_) => WorkerDashboardScreen(workerName: session.name, assignedTeam: session.assignedTeam ?? 'Team Alpha')));
+                          }
+                        },
+                        child: const Text('RESUME', style: TextStyle(fontSize: 11, color: AppTheme.accentTeal, fontWeight: FontWeight.bold)),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close, size: 16, color: Colors.white54),
+                        tooltip: 'Logout',
+                        onPressed: () {
+                          setState(() {
+                            AuthService().logout();
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+
+            // Three Distinct Entry Experience Cards
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20),
               child: Column(
@@ -217,7 +283,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.15),
+                              color: Colors.white.withValues(alpha: 0.15),
                               borderRadius: BorderRadius.circular(10),
                             ),
                             child: const Icon(Icons.person_pin_circle_outlined, size: 28, color: Colors.white),
@@ -305,6 +371,62 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
                       ),
                     ),
                   ),
+
+                  const SizedBox(height: 12),
+
+                  // 3. Field Worker Portal Card
+                  InkWell(
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => const WorkerLoginScreen()),
+                      );
+                    },
+                    borderRadius: BorderRadius.circular(14),
+                    child: Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E293B),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(color: const Color(0xFFD97706), width: 1.2),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF451A03),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: const Icon(Icons.handyman_outlined, size: 28, color: Color(0xFFF59E0B)),
+                          ),
+                          const SizedBox(width: 14),
+                          const Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'FIELD WORKER PORTAL',
+                                  style: TextStyle(
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.white,
+                                    letterSpacing: 0.5,
+                                  ),
+                                ),
+                                SizedBox(height: 3),
+                                Text(
+                                  'Drainage maintenance crew, task triage, observation logs & site evidence.',
+                                  style: TextStyle(fontSize: 11, color: Color(0xFF94A3B8)),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const Icon(Icons.arrow_forward_ios, size: 16, color: Color(0xFFF59E0B)),
+                        ],
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -324,6 +446,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
               ),
             ),
           ],
+        ),
         ),
       ),
     );

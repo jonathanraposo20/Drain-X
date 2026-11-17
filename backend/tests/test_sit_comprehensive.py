@@ -1,4 +1,4 @@
-"""
+﻿"""
 DRAIN-X Comprehensive System Integration Testing (SIT) Suite.
 
 Validates complete end-to-end integration across all 10 DRAIN-X functional domains:
@@ -67,7 +67,10 @@ def client():
 # SUITE A: Telemetry Integration
 # ==============================================================================
 
-def test_sit_suite_a_telemetry_ingest_and_validation(client: TestClient):
+def test_sit_suite_i_incident_status_transition_rules(
+    client: TestClient,
+    admin_client: TestClient,
+):
     """SIT-A1: Ingestion of single and batch telemetry payloads with response contracts."""
     single_reading = {
         "sensor_id": "US_UPSTREAM_01",
@@ -638,7 +641,7 @@ def test_sit_suite_i_mobile_incident_contract_compatibility(client: TestClient):
         assert key in sample, f"Missing key '{key}' required by Flutter Incident model."
 
 
-def test_sit_suite_i_incident_status_transition_rules(client: TestClient):
+def test_sit_suite_i_incident_status_transition_rules(client: TestClient, admin_client: TestClient):
     """SIT-I2: Lifecycle status transitions enforced matching municipal workflow."""
     # Create incident
     create_res = client.post("/api/v1/incidents", json={
@@ -654,7 +657,7 @@ def test_sit_suite_i_incident_status_transition_rules(client: TestClient):
     inc_id = create_res.json()["id"]
 
     # Legal transition: REPORTED -> VERIFIED
-    patch_res = client.patch(f"/api/v1/incidents/{inc_id}", json={
+    patch_res = admin_client.patch(f"/api/v1/incidents/{inc_id}", json={
         "status": "VERIFIED",
         "municipal_notes": "Verified by engineering inspector",
     })
@@ -662,7 +665,7 @@ def test_sit_suite_i_incident_status_transition_rules(client: TestClient):
     assert patch_res.json()["status"] == "VERIFIED"
 
     # Illegal transition: cannot jump directly from VERIFIED to RESOLVED without dispatch
-    illegal_res = client.patch(f"/api/v1/incidents/{inc_id}", json={
+    illegal_res = admin_client.patch(f"/api/v1/incidents/{inc_id}", json={
         "status": "RESOLVED",
     })
     assert illegal_res.status_code == 400
@@ -689,11 +692,13 @@ def test_sit_suite_j_jwt_signature_and_expiration():
     """SIT-J1: Cryptographic JWT signature check and expiration enforcement."""
     secret = "sit-test-secret-key-32-bytes-minimum!!"
     with patch.object(settings, "SUPABASE_JWT_SECRET", secret), \
+         patch.object(settings, "SUPABASE_URL", "https://test-project.supabase.co"), \
          patch.object(settings, "ENVIRONMENT", "production"):
 
         # 1. Valid token
         valid_payload = {
             "sub": "user-123",
+            "iss": "https://test-project.supabase.co/auth/v1",
             "exp": time.time() + 3600,
             "app_metadata": {"role": "admin"}
         }
@@ -704,6 +709,7 @@ def test_sit_suite_j_jwt_signature_and_expiration():
         # 2. Expired token
         expired_payload = {
             "sub": "user-123",
+            "iss": "https://test-project.supabase.co/auth/v1",
             "exp": time.time() - 3600,
             "app_metadata": {"role": "admin"}
         }
@@ -723,12 +729,14 @@ def test_sit_suite_j_anti_privilege_escalation_role_enforcement(client: TestClie
     """SIT-J2: Rejection of user_metadata tampering; strictly enforces app_metadata."""
     secret = "sit-test-secret-key-32-bytes-minimum!!"
     with patch.object(settings, "SUPABASE_JWT_SECRET", secret), \
+         patch.object(settings, "SUPABASE_URL", "https://test-project.supabase.co"), \
          patch.object(settings, "ENVIRONMENT", "production"), \
          patch.object(settings, "SUPABASE_AUTH_ENABLED", True):
 
         # Citizen attempts to grant self "admin" via user_metadata (tampering)
         malicious_payload = {
             "sub": "attacker-456",
+            "iss": "https://test-project.supabase.co/auth/v1",
             "exp": time.time() + 3600,
             "user_metadata": {"role": "admin"},   # Untrusted!
             "app_metadata": {"role": "citizen"},  # Trusted!
@@ -760,3 +768,8 @@ def test_sit_suite_j_production_fail_closed_validation():
     with pytest.raises(RuntimeError) as exc:
         validate_production_configuration(test_settings)
     assert "DEVICE_INGEST_API_KEY must be configured" in str(exc.value)
+
+
+
+
+

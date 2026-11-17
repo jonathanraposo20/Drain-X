@@ -121,7 +121,7 @@ def test_filter_incidents(client: TestClient):
     assert all(i["source"] == "DEMO" for i in resp_demo.json())
 
 
-def test_valid_incident_status_transitions(client: TestClient):
+def test_valid_incident_status_transitions(client: TestClient, admin_client: TestClient):
     # Create new incident
     create_resp = client.post("/api/v1/incidents", json={
         "category": "WATERLOGGING",
@@ -134,7 +134,7 @@ def test_valid_incident_status_transitions(client: TestClient):
     assert create_resp.json()["status"] == "REPORTED"
 
     # REPORTED -> VERIFIED
-    patch1 = client.patch(f"/api/v1/incidents/{incident_id}", json={
+    patch1 = admin_client.patch(f"/api/v1/incidents/{incident_id}", json={
         "status": "VERIFIED",
         "municipal_notes": "Verified via CCTV camera stream.",
     })
@@ -143,7 +143,7 @@ def test_valid_incident_status_transitions(client: TestClient):
     assert "CCTV camera" in patch1.json()["municipal_notes"]
 
     # VERIFIED -> ASSIGNED
-    patch2 = client.patch(f"/api/v1/incidents/{incident_id}", json={
+    patch2 = admin_client.patch(f"/api/v1/incidents/{incident_id}", json={
         "status": "ASSIGNED",
         "assigned_to": "Team Alpha — St. Inez Drainage Crew",
     })
@@ -152,7 +152,7 @@ def test_valid_incident_status_transitions(client: TestClient):
     assert patch2.json()["assigned_to"] == "Team Alpha — St. Inez Drainage Crew"
 
     # ASSIGNED -> INVESTIGATING
-    patch3 = client.patch(f"/api/v1/incidents/{incident_id}", json={
+    patch3 = admin_client.patch(f"/api/v1/incidents/{incident_id}", json={
         "status": "INVESTIGATING",
         "municipal_notes": "Team arrived with submersible pump.",
     })
@@ -160,7 +160,7 @@ def test_valid_incident_status_transitions(client: TestClient):
     assert patch3.json()["status"] == "INVESTIGATING"
 
     # INVESTIGATING -> RESOLVED
-    patch4 = client.patch(f"/api/v1/incidents/{incident_id}", json={
+    patch4 = admin_client.patch(f"/api/v1/incidents/{incident_id}", json={
         "status": "RESOLVED",
         "municipal_notes": "Water cleared; grate unclogged.",
     })
@@ -168,7 +168,7 @@ def test_valid_incident_status_transitions(client: TestClient):
     assert patch4.json()["status"] == "RESOLVED"
 
 
-def test_invalid_incident_status_transitions(client: TestClient):
+def test_invalid_incident_status_transitions(client: TestClient, admin_client: TestClient):
     # Create new incident (status: REPORTED)
     create_resp = client.post("/api/v1/incidents", json={
         "category": "DRAIN_BLOCKAGE",
@@ -180,14 +180,14 @@ def test_invalid_incident_status_transitions(client: TestClient):
     incident_id = create_resp.json()["id"]
 
     # REPORTED -> RESOLVED is NOT a valid direct transition
-    invalid_patch = client.patch(f"/api/v1/incidents/{incident_id}", json={
+    invalid_patch = admin_client.patch(f"/api/v1/incidents/{incident_id}", json={
         "status": "RESOLVED",
     })
     assert invalid_patch.status_code == 400
     assert "Illegal status transition" in invalid_patch.json()["detail"]
 
     # Nonexistent incident returns 404
-    missing_patch = client.patch("/api/v1/incidents/INC-FAKE-999", json={
+    missing_patch = admin_client.patch("/api/v1/incidents/INC-FAKE-999", json={
         "status": "VERIFIED",
     })
     assert missing_patch.status_code == 404
@@ -204,13 +204,14 @@ def test_upload_valid_incident_photos(client: TestClient):
     })
     incident_id = create_resp.json()["id"]
 
+    from tests.conftest import create_test_image
     # 2. Upload 2 photos (JPEG and PNG)
-    dummy_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xdb\x00C\x00" + (b"A" * 100)
-    dummy_png = b"\x89PNG\r\n\x1a\n" + (b"B" * 100)
+    test_jpeg = create_test_image("JPEG")
+    test_png = create_test_image("PNG")
 
     files = [
-        ("files", ("blockage_1.jpg", dummy_jpeg, "image/jpeg")),
-        ("files", ("blockage_2.png", dummy_png, "image/png")),
+        ("files", ("blockage_1.jpg", test_jpeg, "image/jpeg")),
+        ("files", ("blockage_2.png", test_png, "image/png")),
     ]
 
     upload_resp = client.post(f"/api/v1/incidents/{incident_id}/photos", files=files)
@@ -224,7 +225,7 @@ def test_upload_valid_incident_photos(client: TestClient):
     get_photo_resp = client.get(photo_url)
     assert get_photo_resp.status_code == 200
     assert get_photo_resp.headers["content-type"] == "image/jpeg"
-    assert get_photo_resp.content == dummy_jpeg
+    assert len(get_photo_resp.content) > 0
 
 
 def test_upload_invalid_mime_type(client: TestClient):

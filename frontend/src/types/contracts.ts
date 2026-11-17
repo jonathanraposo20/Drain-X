@@ -202,6 +202,8 @@ export type IncidentStatus =
 
 export type IncidentSource = 'CITIZEN' | 'SENSOR' | 'DEMO';
 
+export type AssignmentType = 'NONE' | 'TEAM' | 'INDIVIDUAL';
+
 export interface IncidentCreateContract {
   category: IncidentCategory;
   description: string;
@@ -215,8 +217,15 @@ export interface IncidentCreateContract {
 
 export interface IncidentUpdateContract {
   status?: IncidentStatus;
+  severity?: IncidentSeverity;
   assigned_to?: string;
+  assignment_type?: AssignmentType;
+  assigned_team_id?: string;
+  assigned_worker_id?: string;
   municipal_notes?: string;
+  internal_notes?: string;
+  rejection_reason?: string;
+  verified_by?: string;
   photos?: string[];
 }
 
@@ -232,9 +241,120 @@ export interface IncidentResponseContract {
   created_at: string;
   updated_at: string;
   assigned_to?: string | null;
+  assignment_type?: AssignmentType;
+  assigned_team_id?: string | null;
+  assigned_worker_id?: string | null;
   municipal_notes?: string | null;
+  internal_notes?: string | null;
   reporter_name?: string | null;
   photos?: string[];
+  verified_at?: string | null;
+  verified_by?: string | null;
+  rejection_reason?: string | null;
+}
+
+export interface FieldTeamContract {
+  team_id: string;
+  name: string;
+  zone: string;
+  is_active: boolean;
+  is_demo?: boolean;
+  is_verified_municipal_crew?: boolean;
+  capacity: number;
+  contact_phone?: string | null;
+}
+
+export interface IncidentAuditContract {
+  audit_id: string;
+  incident_id: string;
+  actor_id: string;
+  actor_role: string;
+  action: string;
+  previous_status?: string | null;
+  new_status?: string | null;
+  previous_assigned_to?: string | null;
+  new_assigned_to?: string | null;
+  previous_assignment_type?: string | null;
+  new_assignment_type?: string | null;
+  previous_assigned_team_id?: string | null;
+  new_assigned_team_id?: string | null;
+  previous_assigned_worker_id?: string | null;
+  new_assigned_worker_id?: string | null;
+  previous_severity?: string | null;
+  new_severity?: string | null;
+  reason?: string | null;
+  internal_notes?: string | null;
+  timestamp: string;
+}
+
+export interface IncidentVerifyRequest {
+  notes?: string;
+  severity?: IncidentSeverity;
+  internal_notes?: string;
+}
+
+export interface IncidentAssignRequest {
+  assigned_to: string;
+  assignment_type?: AssignmentType;
+  assigned_worker_id?: string;
+  reason?: string;
+  internal_notes?: string;
+}
+
+export interface IncidentReassignRequest {
+  assigned_to: string;
+  assignment_type?: AssignmentType;
+  assigned_worker_id?: string;
+  reason: string;
+  internal_notes?: string;
+}
+
+export interface IncidentUnassignRequest {
+  reason: string;
+  internal_notes?: string;
+}
+
+export interface IncidentRejectRequest {
+  reason: string;
+  internal_notes?: string;
+}
+
+export interface MunicipalKpiResponseContract {
+  total_incidents: number;
+  open_incidents: number;
+  critical_or_high_incidents: number;
+  unassigned_incidents: number;
+  assigned_incidents: number;
+  investigating_incidents: number;
+  resolved_incidents: number;
+  rejected_incidents: number;
+  demo_incidents_count?: number;
+  genuine_incidents_count?: number;
+  by_category: Record<string, number>;
+  by_severity: Record<string, number>;
+  by_status: Record<string, number>;
+  by_source?: Record<string, number>;
+}
+
+export interface MunicipalQueueResponseContract {
+  items: IncidentResponseContract[];
+  total_count: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+}
+
+export interface MunicipalQueueFilters {
+  status?: string;
+  category?: string;
+  severity?: string;
+  source?: string;
+  assigned_to?: string;
+  search?: string;
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  offset?: number;
 }
 
 export type StreamConnectionStatus =

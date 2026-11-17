@@ -406,7 +406,7 @@ def _create_mock_jwt(payload: dict, secret: Optional[str] = None, alg: str = "HS
 
 def test_supabase_auth_rbac_on_mode_change(client: TestClient):
     """Verify that when SUPABASE_AUTH_ENABLED is True, operational mode changes require RBAC."""
-    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True):
+    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True), patch.object(settings, "SUPABASE_JWT_SECRET", "drainx_super_secret_test_key_12345"), patch.object(settings, "SUPABASE_URL", "https://test-project.supabase.co"):
         # 1. Missing Authorization header -> 401
         res_no_auth = client.post("/api/v1/status/mode", json={"mode": "SAFE_HOLD"})
         assert res_no_auth.status_code == 401
@@ -414,9 +414,10 @@ def test_supabase_auth_rbac_on_mode_change(client: TestClient):
         # 2. Authenticated as citizen (insufficient role) -> 403 Forbidden
         citizen_token = _create_mock_jwt({
             "sub": "citizen-123",
+            "iss": "https://test-project.supabase.co/auth/v1",
             "app_metadata": {"role": "citizen"},
             "email": "citizen@example.com",
-        })
+        }, secret="drainx_super_secret_test_key_12345")
         res_citizen = client.post(
             "/api/v1/status/mode",
             json={"mode": "SAFE_HOLD"},
@@ -427,9 +428,10 @@ def test_supabase_auth_rbac_on_mode_change(client: TestClient):
         # 3. Authenticated as municipal operator (allowed role) -> 200 OK
         operator_token = _create_mock_jwt({
             "sub": "operator-456",
+            "iss": "https://test-project.supabase.co/auth/v1",
             "app_metadata": {"role": "municipality"},
             "email": "operator@drainx.gov",
-        })
+        }, secret="drainx_super_secret_test_key_12345")
         res_operator = client.post(
             "/api/v1/status/mode",
             json={"mode": "SAFE_HOLD", "reason": "Operator maintenance test"},
@@ -444,6 +446,7 @@ def test_jwt_cryptographic_verification_and_tampering(client: TestClient):
     test_secret = "drainx_super_secret_test_key_12345"
     payload = {
         "sub": "operator-789",
+        "iss": "https://test-project.supabase.co/auth/v1",
         "app_metadata": {"role": "admin"},
         "aud": "authenticated",
         "exp": datetime.now(timezone.utc).timestamp() + 3600,
@@ -453,7 +456,7 @@ def test_jwt_cryptographic_verification_and_tampering(client: TestClient):
     valid_token = _create_mock_jwt(payload, secret=test_secret)
 
     with patch.object(settings, "SUPABASE_AUTH_ENABLED", True), \
-         patch.object(settings, "SUPABASE_JWT_SECRET", test_secret):
+         patch.object(settings, "SUPABASE_JWT_SECRET", test_secret), patch.object(settings, "SUPABASE_URL", "https://test-project.supabase.co"):
         res_valid = client.post(
             "/api/v1/status/mode",
             json={"mode": "SAFE_HOLD", "reason": "Valid cryptographic JWT test"},
@@ -476,13 +479,14 @@ def test_jwt_expiration_enforcement(client: TestClient):
     """Verify expired token is rejected with HTTP 401."""
     expired_payload = {
         "sub": "operator-exp",
+        "iss": "https://test-project.supabase.co/auth/v1",
         "app_metadata": {"role": "admin"},
         "aud": "authenticated",
         "exp": datetime.now(timezone.utc).timestamp() - 60,  # 1 minute in the past
     }
-    expired_token = _create_mock_jwt(expired_payload)
+    expired_token = _create_mock_jwt(expired_payload, secret="drainx_super_secret_test_key_12345")
 
-    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True):
+    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True), patch.object(settings, "SUPABASE_JWT_SECRET", "drainx_super_secret_test_key_12345"), patch.object(settings, "SUPABASE_URL", "https://test-project.supabase.co"):
         res = client.post(
             "/api/v1/status/mode",
             json={"mode": "SAFE_HOLD"},
@@ -500,14 +504,15 @@ def test_anti_privilege_escalation_user_metadata_rejected(client: TestClient):
     """
     malicious_payload = {
         "sub": "attacker-user",
+        "iss": "https://test-project.supabase.co/auth/v1",
         "user_metadata": {"role": "admin"},  # Client-controlled self-assigned role
         "app_metadata": {"role": "citizen"},  # Server-assigned trusted role
         "aud": "authenticated",
         "exp": datetime.now(timezone.utc).timestamp() + 3600,
     }
-    token = _create_mock_jwt(malicious_payload)
+    token = _create_mock_jwt(malicious_payload, secret="drainx_super_secret_test_key_12345")
 
-    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True):
+    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True), patch.object(settings, "SUPABASE_JWT_SECRET", "drainx_super_secret_test_key_12345"), patch.object(settings, "SUPABASE_URL", "https://test-project.supabase.co"):
         res = client.post(
             "/api/v1/status/mode",
             json={"mode": "SAFE_HOLD"},
@@ -597,7 +602,7 @@ def test_unsupported_jwt_algorithm_rejected(client: TestClient):
         {"sub": "attacker", "app_metadata": {"role": "admin"}},
         alg="none",
     )
-    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True):
+    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True), patch.object(settings, "SUPABASE_JWT_SECRET", "drainx_super_secret_test_key_12345"), patch.object(settings, "SUPABASE_URL", "https://test-project.supabase.co"):
         res = client.post(
             "/api/v1/status/mode",
             json={"mode": "SAFE_HOLD"},
@@ -614,3 +619,5 @@ def test_persistence_ping_endpoint(client: TestClient):
     data = res.json()
     assert "status" in data
     assert "mode" in data
+
+

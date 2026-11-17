@@ -338,13 +338,26 @@ class IncidentCreateContract(BaseModel):
     photos: list[str] = Field(default_factory=list, max_length=3, description="List of photo reference paths/URLs")
 
 
+class AssignmentType(str, Enum):
+    NONE = "NONE"
+    TEAM = "TEAM"
+    INDIVIDUAL = "INDIVIDUAL"
+
+
 class IncidentUpdateContract(BaseModel):
     """
     Payload for updating an incident by municipal operators or field response crews.
     """
     status: Optional[IncidentStatus] = None
+    severity: Optional[IncidentSeverity] = None
     assigned_to: Optional[str] = None
+    assignment_type: Optional[AssignmentType] = None
+    assigned_team_id: Optional[str] = None
+    assigned_worker_id: Optional[str] = None
     municipal_notes: Optional[str] = None
+    internal_notes: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    verified_by: Optional[str] = None
     photos: Optional[list[str]] = None
 
 
@@ -363,38 +376,149 @@ class IncidentResponseContract(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     assigned_to: Optional[str] = None
+    assignment_type: AssignmentType = AssignmentType.NONE
+    assigned_team_id: Optional[str] = None
+    assigned_worker_id: Optional[str] = None
     municipal_notes: Optional[str] = ""
+    internal_notes: Optional[str] = None
     reporter_name: Optional[str] = "Citizen Anonymous"
     photos: list[str] = Field(default_factory=list, description="List of uploaded photo references")
+    verified_at: Optional[datetime] = None
+    verified_by: Optional[str] = None
+    rejection_reason: Optional[str] = None
+
+
+class FieldTeamContract(BaseModel):
+    """
+    Authoritative field crew and maintenance unit representation.
+    Distinguishes demonstration/simulated crews from genuine municipal crews.
+    """
+    team_id: str
+    name: str
+    zone: str
+    is_active: bool = True
+    is_demo: bool = True
+    is_verified_municipal_crew: bool = False
+    capacity: int = 4
+    contact_phone: Optional[str] = None
+
+
+class IncidentAuditContract(BaseModel):
+    """
+    Durable, tamper-evident audit record capturing municipal triage,
+    rejection, assignment, reassignment, and status transitions.
+    """
+    audit_id: str = Field(default_factory=lambda: f"AUD-{uuid.uuid4().hex[:8].upper()}")
+    incident_id: str
+    actor_id: str
+    actor_role: str
+    action: str  # REPORTED, VERIFIED, ASSIGNED, REASSIGNED, UNASSIGNED, PRIORITIZED, REJECTED, RESOLVED, STATUS_CHANGE
+    previous_status: Optional[str] = None
+    new_status: Optional[str] = None
+    previous_assigned_to: Optional[str] = None
+    new_assigned_to: Optional[str] = None
+    previous_assignment_type: Optional[str] = None
+    new_assignment_type: Optional[str] = None
+    previous_assigned_team_id: Optional[str] = None
+    new_assigned_team_id: Optional[str] = None
+    previous_assigned_worker_id: Optional[str] = None
+    new_assigned_worker_id: Optional[str] = None
+    previous_severity: Optional[str] = None
+    new_severity: Optional[str] = None
+    reason: Optional[str] = None
+    internal_notes: Optional[str] = None
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
+class IncidentVerifyRequest(BaseModel):
+    notes: Optional[str] = Field(default=None, max_length=1000)
+    severity: Optional[IncidentSeverity] = None
+    internal_notes: Optional[str] = Field(default=None, max_length=1000)
+
+
+class IncidentAssignRequest(BaseModel):
+    assigned_to: str = Field(..., min_length=2, max_length=128)
+    assignment_type: Optional[AssignmentType] = None
+    assigned_worker_id: Optional[str] = Field(default=None, max_length=128)
+    reason: Optional[str] = Field(default="Municipal dispatch assignment", max_length=500)
+    internal_notes: Optional[str] = Field(default=None, max_length=1000)
+    is_demo_assignment: Optional[bool] = None
+
+
+class IncidentReassignRequest(BaseModel):
+    assigned_to: str = Field(..., min_length=2, max_length=128)
+    assignment_type: Optional[AssignmentType] = None
+    assigned_worker_id: Optional[str] = Field(default=None, max_length=128)
+    reason: str = Field(..., min_length=3, max_length=500)
+    internal_notes: Optional[str] = Field(default=None, max_length=1000)
+    is_demo_assignment: Optional[bool] = None
+
+
+class IncidentUnassignRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+    internal_notes: Optional[str] = Field(default=None, max_length=1000)
+
+
+class IncidentRejectRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+    internal_notes: Optional[str] = Field(default=None, max_length=1000)
+
+
+class MunicipalKpiResponseContract(BaseModel):
+    """
+    Server-side aggregated KPIs for municipal operational dashboard.
+    Calculated strictly across the entire authoritative incident population.
+    Clearly separates genuine field records from simulated demo seeds.
+    """
+    total_incidents: int
+    open_incidents: int
+    critical_or_high_incidents: int
+    unassigned_incidents: int
+    assigned_incidents: int
+    investigating_incidents: int
+    resolved_incidents: int
+    rejected_incidents: int
+    demo_incidents_count: int = 0
+    genuine_incidents_count: int = 0
+    by_category: dict[str, int] = Field(default_factory=dict)
+    by_severity: dict[str, int] = Field(default_factory=dict)
+    by_status: dict[str, int] = Field(default_factory=dict)
+    by_source: dict[str, int] = Field(default_factory=dict)
+
+
+class MunicipalQueueResponseContract(BaseModel):
+    """
+    Paginated operational incident queue response.
+    """
+    items: list[IncidentResponseContract]
+    total_count: int
+    limit: int
+    offset: int
+    has_more: bool
 
 
 VALID_STATUS_TRANSITIONS: dict[IncidentStatus, set[IncidentStatus]] = {
     IncidentStatus.REPORTED: {
         IncidentStatus.VERIFIED,
         IncidentStatus.ASSIGNED,
-        IncidentStatus.INVESTIGATING,
         IncidentStatus.REJECTED,
     },
     IncidentStatus.VERIFIED: {
         IncidentStatus.ASSIGNED,
-        IncidentStatus.INVESTIGATING,
         IncidentStatus.REJECTED,
     },
     IncidentStatus.ASSIGNED: {
         IncidentStatus.INVESTIGATING,
-        IncidentStatus.RESOLVED,
+        IncidentStatus.VERIFIED,
         IncidentStatus.REJECTED,
     },
     IncidentStatus.INVESTIGATING: {
         IncidentStatus.RESOLVED,
+        IncidentStatus.ASSIGNED,
         IncidentStatus.REJECTED,
     },
-    IncidentStatus.RESOLVED: {
-        IncidentStatus.INVESTIGATING,
-    },
-    IncidentStatus.REJECTED: {
-        IncidentStatus.REPORTED,
-    },
+    IncidentStatus.RESOLVED: set(),
+    IncidentStatus.REJECTED: set(),
 }
 
 

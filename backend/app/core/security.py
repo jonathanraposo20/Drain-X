@@ -191,7 +191,7 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
     - Cryptographic signature check (JWKS for ES256, SUPABASE_JWT_SECRET for HS256).
     - Audience validation (if aud is present, must be in ALLOWED_AUDIENCES).
     - Expiration (exp) validation.
-    - Issuer validation (if iss is present and SUPABASE_URL configured, must match).
+    - Mandatory exact issuer validation against configured Supabase auth issuer.
     - Anti-privilege escalation (app_metadata only, never user_metadata).
     """
     try:
@@ -200,7 +200,7 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
         logger.warning(f"Malformed JWT header: {exc}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Malformed authentication token.",
+            detail="Malformed authentication token or invalid signature.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -293,24 +293,11 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Production configuration error: Token validation secret is missing for HS256.",
                 )
-            logger.debug("[DEV_MODE_SECURITY_BYPASS] Decoded unverified HS256 token; SUPABASE_JWT_SECRET is not set.")
-            try:
-                payload = jwt.decode(
-                    token,
-                    options={"verify_signature": False, "verify_exp": True, "verify_aud": False, "verify_iss": False},
-                )
-            except ExpiredSignatureError:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authentication token has expired.",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail=f"Malformed token: {exc}",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
+            logger.error("HS256 token rejected: SUPABASE_JWT_SECRET is not configured.")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Authentication configuration error: JWT verification secret is unavailable.",
+            )
         else:
             try:
                 payload = jwt.decode(
@@ -353,30 +340,51 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-    # 4. Issuer validation (if present and SUPABASE_URL configured)
+    # 4. Mandatory exact issuer validation (fail closed)
+    configured_supabase_url = settings.SUPABASE_URL
     iss = payload.get("iss")
-    if iss and settings.SUPABASE_URL:
-        expected_iss = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1"
-        if iss != expected_iss and not iss.startswith("https://"):
-            logger.warning(f"Rejected JWT with invalid issuer: {iss}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Token issuer '{iss}' does not match expected Supabase auth issuer.",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    if not isinstance(configured_supabase_url, str) or not configured_supabase_url.strip():
+        logger.error("JWT issuer validation failed: SUPABASE_URL is not configured.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication configuration error: Supabase URL is missing.",
+        )
 
-    # 5. Role Integrity Check (Anti-Privilege Escalation)
+    expected_iss = f"{configured_supabase_url.rstrip('/')}/auth/v1"
+    if not isinstance(iss, str) or not iss.strip() or iss != expected_iss:
+        logger.warning("Rejected JWT with missing, malformed, or mismatched issuer.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token issuer does not match the configured Supabase auth issuer.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 5. Required Subject Claim Validation
+    subject = payload.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        logger.warning("Rejected JWT without a valid subject claim.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing required subject claim.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 6. Role Integrity Check (Anti-Privilege Escalation)
     # Strictly reject inspecting user_metadata: end-users can edit user_metadata!
     if payload.get("role") == "service_role":
         trusted_role = "service_role"
+        trusted_team = None
     else:
         app_meta = payload.get("app_metadata")
         if isinstance(app_meta, dict):
             trusted_role = app_meta.get("role", "citizen")
+            trusted_team = app_meta.get("team") or app_meta.get("assigned_team")
         else:
             trusted_role = "citizen"
+            trusted_team = None
 
     payload["extracted_role"] = trusted_role
+    payload["extracted_team"] = trusted_team
     return payload
 
 
@@ -389,21 +397,11 @@ async def get_current_user_claims(
     is_prod = (settings.ENVIRONMENT == "production")
 
     if not settings.SUPABASE_AUTH_ENABLED:
-        if is_prod:
-            logger.error("FATAL: SUPABASE_AUTH_ENABLED cannot be False in production.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Production configuration error: Authentication must be enabled.",
-            )
-        # Development mode bypass
-        logger.debug("[DEV_MODE_SECURITY_BYPASS] Serving request with default dev-operator identity.")
-        return {
-            "sub": "dev-operator",
-            "role": "admin",
-            "extracted_role": "admin",
-            "email": "operator@drainx.local",
-            "is_dev_bypass": True,
-        }
+        logger.error("Authentication is disabled; protected endpoint access denied.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is disabled. Protected endpoints are unavailable.",
+        )
 
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -416,14 +414,40 @@ async def get_current_user_claims(
     return verify_supabase_jwt(token)
 
 
+async def get_optional_user_claims(
+    authorization: Optional[str] = Header(default=None)
+) -> Optional[Dict[str, Any]]:
+    """
+    Extracts and validates Supabase JWT token claims if Authorization header is provided.
+    Returns None for unauthenticated public clients.
+    Raises HTTPException 401 if Authorization header is present but malformed, expired, or invalid.
+    """
+    if not authorization:
+        return None
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header. Expected Bearer token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header. Expected Bearer token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return verify_supabase_jwt(token)
+
+
 def require_roles(allowed_roles: List[str]):
     """
     FastAPI dependency factory enforcing role-based access control.
     """
     async def role_checker(claims: Dict[str, Any] = Depends(get_current_user_claims)) -> Dict[str, Any]:
-        if claims.get("is_dev_bypass") and settings.ENVIRONMENT != "production":
-            return claims
-
         user_role = claims.get("extracted_role", "citizen")
         if user_role not in allowed_roles:
             logger.warning(

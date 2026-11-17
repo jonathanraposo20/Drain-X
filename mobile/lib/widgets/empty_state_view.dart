@@ -8,13 +8,13 @@ class EmptyStateView extends StatelessWidget {
   final VoidCallback? onAction;
 
   const EmptyStateView({
-    Key? key,
+    super.key,
     required this.icon,
     required this.title,
     required this.description,
     this.actionLabel,
     this.onAction,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {

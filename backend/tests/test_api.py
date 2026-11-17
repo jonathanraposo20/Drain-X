@@ -18,14 +18,14 @@ def test_system_status(client: TestClient):
     assert data["mode"] in ("SIMULATION", "HARDWARE")
 
 
-def test_mode_switch(client: TestClient):
+def test_mode_switch(admin_client: TestClient):
     # Switch to HARDWARE (canonically normalizes to PHYSICAL)
-    response = client.post("/api/v1/status/mode", json={"mode": "HARDWARE"})
+    response = admin_client.post("/api/v1/status/mode", json={"mode": "HARDWARE"})
     assert response.status_code == 200
     assert response.json()["mode"] == "PHYSICAL"
 
     # Switch back to SIMULATION
-    response = client.post("/api/v1/status/mode", json={"mode": "SIMULATION"})
+    response = admin_client.post("/api/v1/status/mode", json={"mode": "SIMULATION"})
     assert response.status_code == 200
     assert response.json()["mode"] == "SIMULATION"
 

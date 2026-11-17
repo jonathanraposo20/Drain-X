@@ -37,13 +37,14 @@ void main() {
       expect(allowedFromReported, contains('REPORTED'));
       expect(allowedFromReported, contains('VERIFIED'));
       expect(allowedFromReported, contains('ASSIGNED'));
-      expect(allowedFromReported, contains('INVESTIGATING'));
       expect(allowedFromReported, contains('REJECTED'));
-      // Direct jump from REPORTED to RESOLVED is NOT allowed
+      // Direct jump from REPORTED to INVESTIGATING or RESOLVED is NOT allowed
+      expect(allowedFromReported.contains('INVESTIGATING'), isFalse);
       expect(allowedFromReported.contains('RESOLVED'), isFalse);
 
       final allowedFromInvestigating = IncidentConstants.getAllowedNextStatuses('INVESTIGATING');
       expect(allowedFromInvestigating, contains('RESOLVED'));
+      expect(allowedFromInvestigating, contains('ASSIGNED'));
       expect(allowedFromInvestigating, contains('REJECTED'));
     });
 

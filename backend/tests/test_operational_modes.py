@@ -36,10 +36,10 @@ def test_initial_mode_is_simulation(client: TestClient):
     assert data["is_safe_hold"] is False
 
 
-def test_explicit_mode_transitions_and_audit(client: TestClient):
+def test_explicit_mode_transitions_and_audit(admin_client: TestClient):
     """Verify explicit transitions across SIMULATION, PHYSICAL, SAFE_HOLD, and HARDWARE alias."""
     # 1. Switch to PHYSICAL
-    resp = client.post(
+    resp = admin_client.post(
         "/api/v1/status/mode",
         json={"mode": "PHYSICAL", "reason": "Connecting physical bench flume ESP32"},
     )
@@ -49,7 +49,7 @@ def test_explicit_mode_transitions_and_audit(client: TestClient):
     assert state_store.is_simulation() is False
 
     # 2. Switch to SAFE_HOLD
-    resp = client.post(
+    resp = admin_client.post(
         "/api/v1/status/mode",
         json={"mode": "SAFE_HOLD", "reason": "Operator maintenance on downstream screen"},
     )
@@ -64,7 +64,7 @@ def test_explicit_mode_transitions_and_audit(client: TestClient):
     assert directive.emergency_stop is True
 
     # 3. Switch to HARDWARE (legacy alias canonicalized to PHYSICAL)
-    resp = client.post(
+    resp = admin_client.post(
         "/api/v1/status/mode",
         json={"mode": "HARDWARE", "reason": "Frontend legacy switch trigger"},
     )
@@ -74,7 +74,7 @@ def test_explicit_mode_transitions_and_audit(client: TestClient):
     assert state_store.is_physical() is True
 
     # 4. Switch back to SIMULATION
-    resp = client.post(
+    resp = admin_client.post(
         "/api/v1/status/mode",
         json={"mode": "SIMULATION", "reason": "Returning to digital twin benchmark"},
     )
@@ -83,7 +83,7 @@ def test_explicit_mode_transitions_and_audit(client: TestClient):
     assert state_store.is_simulation() is True
 
     # 5. Check auditable history ledger
-    hist_resp = client.get("/api/v1/status/mode/history")
+    hist_resp = admin_client.get("/api/v1/status/mode/history")
     assert hist_resp.status_code == 200
     history = hist_resp.json()["history"]
     assert len(history) >= 4
@@ -92,33 +92,33 @@ def test_explicit_mode_transitions_and_audit(client: TestClient):
     assert "Operator maintenance on downstream screen" in reasons
 
 
-def test_hardware_canonicalization(client: TestClient):
+def test_hardware_canonicalization(admin_client: TestClient):
     """
     Verify HARDWARE is canonically normalized to PHYSICAL across stored mode,
     API response, status response, and mode history.
     """
-    resp = client.post("/api/v1/status/mode", json={"mode": "HARDWARE"})
+    resp = admin_client.post("/api/v1/status/mode", json={"mode": "HARDWARE"})
     assert resp.status_code == 200
     assert resp.json()["mode"] == "PHYSICAL"
     assert state_store.mode == "PHYSICAL"
 
     # GET /status/mode
-    mode_resp = client.get("/api/v1/status/mode")
+    mode_resp = admin_client.get("/api/v1/status/mode")
     assert mode_resp.json()["mode"] == "PHYSICAL"
 
     # GET /status
-    status_resp = client.get("/api/v1/status")
+    status_resp = admin_client.get("/api/v1/status")
     assert status_resp.json()["mode"] == "PHYSICAL"
 
     # GET /status/mode/history
-    hist_resp = client.get("/api/v1/status/mode/history")
+    hist_resp = admin_client.get("/api/v1/status/mode/history")
     last_record = hist_resp.json()["history"][-1]
     assert last_record["to_mode"] == "PHYSICAL"
 
 
-def test_invalid_mode_transition_rejected(client: TestClient):
+def test_invalid_mode_transition_rejected(admin_client: TestClient):
     """Verify transitions to invalid modes are rejected with 400 Bad Request."""
-    resp = client.post(
+    resp = admin_client.post(
         "/api/v1/status/mode",
         json={"mode": "UNSUPPORTED_MODE", "reason": "Invalid transition attempt"},
     )
@@ -304,7 +304,7 @@ def test_safe_hold_directive_invariant_cannot_be_overwritten():
     assert active_directive.emergency_stop is True
 
 
-def test_concurrent_ingestion_and_safe_hold_transition(client: TestClient):
+def test_concurrent_ingestion_and_safe_hold_transition(admin_client: TestClient):
     """
     Verify concurrency safety: hammer telemetry ingestion and mode transition
     to SAFE_HOLD concurrently to ensure SAFE_HOLD_LOCK is never overwritten.
@@ -325,13 +325,13 @@ def test_concurrent_ingestion_and_safe_hold_transition(client: TestClient):
     def do_ingest():
         for _ in range(20):
             try:
-                client.post("/api/v1/telemetry", json=payload)
+                admin_client.post("/api/v1/telemetry", json=payload)
             except Exception:
                 pass
 
     def do_transition():
         # Transition to SAFE_HOLD during concurrent ingestion
-        client.post("/api/v1/status/mode", json={"mode": "SAFE_HOLD", "reason": "Concurrent safe hold test"})
+        admin_client.post("/api/v1/status/mode", json={"mode": "SAFE_HOLD", "reason": "Concurrent safe hold test"})
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         f_ingest = [executor.submit(do_ingest) for _ in range(4)]

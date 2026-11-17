@@ -9,6 +9,7 @@ import { AlertsPanel } from './components/AlertsPanel';
 import { TelemetrySimulator } from './components/TelemetrySimulator';
 import { UrbanGisDashboard } from './components/gis/UrbanGisDashboard';
 import { HistoricalPlaybackDashboard } from './components/playback/HistoricalPlaybackDashboard';
+import { MunicipalOperationsDashboard } from './components/municipal/MunicipalOperationsDashboard';
 import {
   apiClient,
   SimulationStateResponse,
@@ -21,7 +22,11 @@ import {
   StreamConnectionStatus,
 } from './types/contracts';
 
+import { useAuth } from './auth/AuthContext';
+import { LoginPanel } from './auth/LoginPanel';
+
 export const App: React.FC = () => {
+  const { session, user, role, loading, signOut } = useAuth();
   const [simState, setSimState] = useState<SimulationStateResponse | null>(null);
   const [readings, setReadings] = useState<Record<string, SensorReadingContract>>({});
   const [alerts, setAlerts] = useState<AlertContract[]>([]);
@@ -29,7 +34,7 @@ export const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [isTogglingMode, setIsTogglingMode] = useState(false);
   const [resolvingAlertId, setResolvingAlertId] = useState<string | null>(null);
-  const [dashboardView, setDashboardView] = useState<'SCADA_TWIN' | 'HISTORICAL_PLAYBACK' | 'GIS_FLOOD_MAP'>('SCADA_TWIN');
+  const [dashboardView, setDashboardView] = useState<'SCADA_TWIN' | 'HISTORICAL_PLAYBACK' | 'GIS_FLOOD_MAP' | 'MUNICIPAL_OPERATIONS'>('SCADA_TWIN');
   const [streamStatus, setStreamStatus] = useState<StreamConnectionStatus>('DISCONNECTED');
   const [lastEventTime, setLastEventTime] = useState<Date | null>(null);
   const [dataFreshnessSec, setDataFreshnessSec] = useState<number | null>(null);
@@ -215,13 +220,51 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* Operational KPI Matrix (Hidden in historical playback to avoid live metrics confusion) */}
-        {dashboardView !== 'HISTORICAL_PLAYBACK' && (
+        {/* Operational KPI Matrix (Hidden in historical playback and municipal operations to avoid metrics collision) */}
+        {dashboardView !== 'HISTORICAL_PLAYBACK' && dashboardView !== 'MUNICIPAL_OPERATIONS' && (
           <KpiCards status={simState?.system || null} />
         )}
 
-        {/* Dynamic View Switch: GIS Map vs Historical Playback vs SCADA Twin */}
-        {dashboardView === 'GIS_FLOOD_MAP' ? (
+        {/* Dynamic View Switch: GIS Map vs Historical Playback vs Municipal Queue vs SCADA Twin */}
+       
+{dashboardView === 'MUNICIPAL_OPERATIONS' ? (
+  loading ? (
+    <div className="p-8 text-center text-slate-400">
+      Checking authentication...
+    </div>
+  ) : !session ? (
+    <LoginPanel />
+  ) : role !== 'municipality' && role !== 'admin' ? (
+    <div className="p-8 text-center">
+      <h2 className="text-xl font-bold text-red-400">
+        Access Denied
+      </h2>
+      <p className="text-slate-400 mt-2">
+        Your account does not have municipal permissions.
+      </p>
+      <button
+        onClick={() => signOut()}
+        className="mt-4 px-4 py-2 rounded-lg bg-slate-800 text-white hover:bg-slate-700"
+      >
+        Sign Out
+      </button>
+    </div>
+  ) : (
+    <div>
+      <div className="flex justify-end items-center gap-3 mb-4 text-sm text-slate-400">
+        <span>{user?.email} · {role}</span>
+        <button
+          onClick={() => signOut()}
+          className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-white"
+        >
+          Sign Out
+        </button>
+      </div>
+      <MunicipalOperationsDashboard />
+    </div>
+  )
+
+        ) : dashboardView === 'GIS_FLOOD_MAP' ? (
           <UrbanGisDashboard
             systemStatus={simState?.system || null}
             readings={readings}

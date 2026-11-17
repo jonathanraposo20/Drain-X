@@ -6,10 +6,10 @@ class SeverityBadge extends StatelessWidget {
   final bool isCompact;
 
   const SeverityBadge({
-    Key? key,
+    super.key,
     required this.severity,
     this.isCompact = false,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {

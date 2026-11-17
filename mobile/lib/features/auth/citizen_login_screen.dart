@@ -1,15 +1,19 @@
 import 'package:flutter/material.dart';
+import '../../core/auth/auth_service.dart';
 import '../../core/theme/app_theme.dart';
+import '../../models/user_session.dart';
 import '../citizen/citizen_dashboard_screen.dart';
 
 class CitizenLoginScreen extends StatefulWidget {
-  const CitizenLoginScreen({Key? key}) : super(key: key);
+  const CitizenLoginScreen({super.key});
 
   @override
   State<CitizenLoginScreen> createState() => _CitizenLoginScreenState();
 }
 
 class _CitizenLoginScreenState extends State<CitizenLoginScreen> {
+  static const String _customIdentityMarker = '__CUSTOM__';
+
   final List<String> _demoIdentities = [
     'P. Fernandes (St. Inez Resident)',
     'R. Naik (Patto Plaza Commuter)',
@@ -17,20 +21,24 @@ class _CitizenLoginScreenState extends State<CitizenLoginScreen> {
     'Citizen Anonymous',
   ];
 
-  late String _selectedIdentity;
+  late String _selectedOption;
   final TextEditingController _customNameController = TextEditingController();
-  bool _useCustom = false;
 
   @override
   void initState() {
     super.initState();
-    _selectedIdentity = _demoIdentities[0];
+    _selectedOption = _demoIdentities[0];
   }
 
   void _proceedToCitizenDashboard() {
-    final reporterName = _useCustom
+    final reporterName = (_selectedOption == _customIdentityMarker)
         ? (_customNameController.text.trim().isEmpty ? 'Citizen Anonymous' : _customNameController.text.trim())
-        : _selectedIdentity;
+        : _selectedOption;
+
+    AuthService().loginDemo(
+      role: UserRole.citizen,
+      displayName: reporterName,
+    );
 
     Navigator.pushReplacement(
       context,
@@ -113,79 +121,80 @@ class _CitizenLoginScreenState extends State<CitizenLoginScreen> {
               ),
               const SizedBox(height: 8),
 
-              ..._demoIdentities.map((identity) {
-                final isSelected = !_useCustom && _selectedIdentity == identity;
-                return Container(
-                  margin: const EdgeInsets.only(bottom: 8),
-                  decoration: BoxDecoration(
-                    color: isSelected ? const Color(0xFFECFEFF) : Colors.white,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(
-                      color: isSelected ? const Color(0xFF06B6D4) : const Color(0xFFE2E8F0),
-                      width: isSelected ? 1.5 : 1,
-                    ),
-                  ),
-                  child: RadioListTile<String>(
-                    title: Text(
-                      identity,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                        color: const Color(0xFF0F172A),
-                      ),
-                    ),
-                    value: identity,
-                    groupValue: _useCustom ? null : _selectedIdentity,
-                    activeColor: AppTheme.accentTeal,
-                    onChanged: (val) {
-                      setState(() {
-                        _useCustom = false;
-                        _selectedIdentity = val!;
-                      });
-                    },
-                  ),
-                );
-              }),
-
-              const SizedBox(height: 12),
-
-              // Custom Name Input Toggle
-              Container(
-                decoration: BoxDecoration(
-                  color: _useCustom ? const Color(0xFFECFEFF) : Colors.white,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: _useCustom ? const Color(0xFF06B6D4) : const Color(0xFFE2E8F0),
-                    width: _useCustom ? 1.5 : 1,
-                  ),
-                ),
+              RadioGroup<String>(
+                groupValue: _selectedOption,
+                onChanged: (val) {
+                  if (val != null) {
+                    setState(() {
+                      _selectedOption = val;
+                    });
+                  }
+                },
                 child: Column(
                   children: [
-                    RadioListTile<bool>(
-                      title: const Text(
-                        'Custom Reporter Name',
-                        style: TextStyle(fontSize: 13, color: Color(0xFF0F172A)),
-                      ),
-                      value: true,
-                      groupValue: _useCustom,
-                      activeColor: AppTheme.accentTeal,
-                      onChanged: (val) {
-                        setState(() {
-                          _useCustom = true;
-                        });
-                      },
-                    ),
-                    if (_useCustom)
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                        child: TextField(
-                          controller: _customNameController,
-                          decoration: const InputDecoration(
-                            labelText: 'Your Name or Resident Handle',
-                            hintText: 'e.g. Maria Fernandes',
+                    ..._demoIdentities.map((identity) {
+                      final isSelected = _selectedOption == identity;
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Material(
+                          color: isSelected ? const Color(0xFFECFEFF) : Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            side: BorderSide(
+                              color: isSelected ? const Color(0xFF06B6D4) : const Color(0xFFE2E8F0),
+                              width: isSelected ? 1.5 : 1,
+                            ),
+                          ),
+                          child: RadioListTile<String>(
+                            title: Text(
+                              identity,
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                color: const Color(0xFF0F172A),
+                              ),
+                            ),
+                            value: identity,
+                            activeColor: AppTheme.accentTeal,
                           ),
                         ),
+                      );
+                    }),
+                    const SizedBox(height: 12),
+                    // Custom Name Input Toggle
+                    Material(
+                      color: (_selectedOption == _customIdentityMarker) ? const Color(0xFFECFEFF) : Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        side: BorderSide(
+                          color: (_selectedOption == _customIdentityMarker) ? const Color(0xFF06B6D4) : const Color(0xFFE2E8F0),
+                          width: (_selectedOption == _customIdentityMarker) ? 1.5 : 1,
+                        ),
                       ),
+                      child: Column(
+                        children: [
+                          const RadioListTile<String>(
+                            title: Text(
+                              'Custom Reporter Name',
+                              style: TextStyle(fontSize: 13, color: Color(0xFF0F172A)),
+                            ),
+                            value: _customIdentityMarker,
+                            activeColor: AppTheme.accentTeal,
+                          ),
+                          if (_selectedOption == _customIdentityMarker)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                              child: TextField(
+                                controller: _customNameController,
+                                decoration: const InputDecoration(
+                                  labelText: 'Your Name or Resident Handle',
+                                  hintText: 'e.g. Maria Fernandes',
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   ],
                 ),
               ),

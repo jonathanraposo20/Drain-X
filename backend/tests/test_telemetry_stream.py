@@ -146,13 +146,13 @@ def test_disconnect_cleanup(client: TestClient):
     assert telemetry_stream_manager.active_connections_count == initial_clients
 
 
-def test_source_isolation_filtering(client: TestClient):
+def test_source_isolation_filtering(client: TestClient, admin_client: TestClient):
     """
     Test 5: Verify source filtering (PHYSICAL vs SIMULATED).
     A client subscribed to PHYSICAL should not receive SIMULATED readings.
     """
     # Switch mode to PHYSICAL
-    client.post("/api/v1/status/mode", json={"mode": "PHYSICAL"})
+    admin_client.post("/api/v1/status/mode", json={"mode": "PHYSICAL"})
 
     with client.websocket_connect("/api/v1/telemetry/stream?source=PHYSICAL") as ws_physical:
         init_phys = ws_physical.receive_json()
@@ -232,13 +232,13 @@ def test_fault_telemetry_broadcast(client: TestClient):
         assert evt["fault_code"] == "SENSOR_DISCONNECTED"
 
 
-def test_safe_hold_mode_behavior_and_actuation_rejection(client: TestClient):
+def test_safe_hold_mode_behavior_and_actuation_rejection(client: TestClient, admin_client: TestClient):
     """
     Test 9: Verify SAFE_HOLD operational mode is indicated and actuation commands
     sent over the stream are strictly rejected.
     """
     # Transition to SAFE_HOLD
-    client.post("/api/v1/status/mode", json={"mode": "SAFE_HOLD", "reason": "Test fail-safe"})
+    admin_client.post("/api/v1/status/mode", json={"mode": "SAFE_HOLD", "reason": "Test fail-safe"})
 
     with client.websocket_connect("/api/v1/telemetry/stream") as ws:
         init_data = ws.receive_json()

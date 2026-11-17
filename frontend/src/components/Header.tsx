@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, Radio, AlertTriangle, ShieldCheck, MapPin, Clock } from 'lucide-react';
+import { Activity, Radio, AlertTriangle, ShieldCheck, MapPin, Clock, Building2 } from 'lucide-react';
 import { StreamConnectionStatus } from '../types/contracts';
 
 interface HeaderProps {
@@ -8,8 +8,8 @@ interface HeaderProps {
   activeAlertsCount: number;
   onToggleMode: () => void;
   isToggling: boolean;
-  activeView?: 'SCADA_TWIN' | 'HISTORICAL_PLAYBACK' | 'GIS_FLOOD_MAP';
-  onChangeView?: (view: 'SCADA_TWIN' | 'HISTORICAL_PLAYBACK' | 'GIS_FLOOD_MAP') => void;
+  activeView?: 'SCADA_TWIN' | 'HISTORICAL_PLAYBACK' | 'GIS_FLOOD_MAP' | 'MUNICIPAL_OPERATIONS';
+  onChangeView?: (view: 'SCADA_TWIN' | 'HISTORICAL_PLAYBACK' | 'GIS_FLOOD_MAP' | 'MUNICIPAL_OPERATIONS') => void;
   streamStatus?: StreamConnectionStatus;
   dataFreshnessSec?: number | null;
 }
@@ -83,6 +83,17 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <MapPin className="w-3.5 h-3.5" />
               <span>GIS FLOOD INTELLIGENCE</span>
+            </button>
+            <button
+              onClick={() => onChangeView('MUNICIPAL_OPERATIONS')}
+              className={`px-3 py-1 rounded transition-colors flex items-center gap-1.5 ${
+                activeView === 'MUNICIPAL_OPERATIONS'
+                  ? 'bg-indigo-950 text-indigo-300 font-bold border border-indigo-700 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Building2 className="w-3.5 h-3.5" />
+              <span>MUNICIPAL QUEUE</span>
             </button>
           </div>
         )}

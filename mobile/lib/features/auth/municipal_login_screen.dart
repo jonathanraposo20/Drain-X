@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import '../../core/auth/auth_service.dart';
+import '../../models/user_session.dart';
 import '../municipal/municipal_dashboard_screen.dart';
 
 class MunicipalLoginScreen extends StatefulWidget {
-  const MunicipalLoginScreen({Key? key}) : super(key: key);
+  const MunicipalLoginScreen({super.key});
 
   @override
   State<MunicipalLoginScreen> createState() => _MunicipalLoginScreenState();
@@ -24,6 +26,11 @@ class _MunicipalLoginScreenState extends State<MunicipalLoginScreen> {
   }
 
   void _proceedToMunicipalDashboard() {
+    AuthService().loginDemo(
+      role: UserRole.municipality,
+      displayName: _selectedOfficer,
+    );
+
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(
@@ -105,38 +112,46 @@ class _MunicipalLoginScreenState extends State<MunicipalLoginScreen> {
               ),
               const SizedBox(height: 8),
 
-              ..._demoOfficers.map((officer) {
-                final isSelected = _selectedOfficer == officer;
-                return Container(
-                  margin: const EdgeInsets.only(bottom: 8),
-                  decoration: BoxDecoration(
-                    color: isSelected ? const Color(0xFFEEF2FF) : Colors.white,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(
-                      color: isSelected ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
-                      width: isSelected ? 1.5 : 1,
-                    ),
-                  ),
-                  child: RadioListTile<String>(
-                    title: Text(
-                      officer,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                        color: const Color(0xFF0F172A),
+              RadioGroup<String>(
+                groupValue: _selectedOfficer,
+                onChanged: (val) {
+                  if (val != null) {
+                    setState(() {
+                      _selectedOfficer = val;
+                    });
+                  }
+                },
+                child: Column(
+                  children: _demoOfficers.map((officer) {
+                    final isSelected = _selectedOfficer == officer;
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Material(
+                        color: isSelected ? const Color(0xFFEEF2FF) : Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          side: BorderSide(
+                            color: isSelected ? const Color(0xFF4F46E5) : const Color(0xFFE2E8F0),
+                            width: isSelected ? 1.5 : 1,
+                          ),
+                        ),
+                        child: RadioListTile<String>(
+                          title: Text(
+                            officer,
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                              color: const Color(0xFF0F172A),
+                            ),
+                          ),
+                          value: officer,
+                          activeColor: const Color(0xFF4F46E5),
+                        ),
                       ),
-                    ),
-                    value: officer,
-                    groupValue: _selectedOfficer,
-                    activeColor: const Color(0xFF4F46E5),
-                    onChanged: (val) {
-                      setState(() {
-                        _selectedOfficer = val!;
-                      });
-                    },
-                  ),
-                );
-              }),
+                    );
+                  }).toList(),
+                ),
+              ),
 
               const SizedBox(height: 32),
 

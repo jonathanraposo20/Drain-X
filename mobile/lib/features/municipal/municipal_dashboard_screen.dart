@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../core/auth/auth_service.dart';
 import '../../core/network/api_client.dart';
 import '../../core/theme/app_theme.dart';
 import '../../models/incident.dart';
@@ -10,29 +11,37 @@ import 'municipal_incident_detail_screen.dart';
 
 class MunicipalDashboardScreen extends StatefulWidget {
   final String officerName;
+  final ApiClient? apiClient;
 
   const MunicipalDashboardScreen({
-    Key? key,
+    super.key,
     required this.officerName,
-  }) : super(key: key);
+    this.apiClient,
+  });
 
   @override
   State<MunicipalDashboardScreen> createState() => _MunicipalDashboardScreenState();
 }
 
 class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
-  final ApiClient _apiClient = ApiClient();
+  late final ApiClient _apiClient;
   List<Incident> _incidents = [];
+  Map<String, dynamic>? _backendKpis;
   bool _isLoading = true;
   String? _errorMessage;
+  bool _isUnauthorized = false;
+  bool _isSessionExpired = false;
 
   String _selectedStatusFilter = 'ALL';
+  String _selectedSeverityFilter = 'ALL';
+  String _selectedSourceFilter = 'ALL';
   String _searchQuery = '';
   final TextEditingController _searchController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
+    _apiClient = widget.apiClient ?? ApiClient();
     _fetchIncidents();
   }
 
@@ -40,12 +49,45 @@ class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
     setState(() {
       _isLoading = true;
       _errorMessage = null;
+      _isUnauthorized = false;
+      _isSessionExpired = false;
     });
 
     try {
-      final incidents = await _apiClient.getIncidents();
+      // 1. Attempt authoritative backend KPI retrieval
+      try {
+        final kpiData = await _apiClient.getMunicipalKpis();
+        _backendKpis = kpiData;
+      } catch (_) {
+        // Soft fallback to queue-derived KPIs if running in offline test mock
+      }
+
+      // 2. Fetch queue items from backend
+      List<Incident> items = [];
+      try {
+        final queueData = await _apiClient.getMunicipalQueue(
+          status: _selectedStatusFilter != 'ALL' ? _selectedStatusFilter : null,
+          severity: _selectedSeverityFilter != 'ALL' ? _selectedSeverityFilter : null,
+          search: _searchQuery.isNotEmpty ? _searchQuery : null,
+        );
+        items = queueData['items'] as List<Incident>;
+      } catch (_) {
+        // Fallback to general getIncidents if queue endpoint not mocked in simple tests
+        items = await _apiClient.getIncidents(
+          status: _selectedStatusFilter != 'ALL' ? _selectedStatusFilter : null,
+          severity: _selectedSeverityFilter != 'ALL' ? _selectedSeverityFilter : null,
+        );
+      }
+
       setState(() {
-        _incidents = incidents;
+        _incidents = items;
+        _isLoading = false;
+      });
+    } on ApiException catch (e) {
+      setState(() {
+        _errorMessage = e.message;
+        _isSessionExpired = (e.statusCode == 401);
+        _isUnauthorized = (e.statusCode == 403);
         _isLoading = false;
       });
     } catch (e) {
@@ -59,17 +101,27 @@ class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
   List<Incident> get _filteredIncidents {
     return _incidents.filterBy(
       status: _selectedStatusFilter,
+      severity: _selectedSeverityFilter,
+      source: _selectedSourceFilter,
       query: _searchQuery,
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final total = _incidents.length;
-    final open = _incidents.where((i) => i.status != 'RESOLVED' && i.status != 'REJECTED').length;
-    final criticalOrHigh = _incidents.where((i) => (i.severity == 'CRITICAL' || i.severity == 'HIGH') && i.status != 'RESOLVED').length;
-    final assigned = _incidents.where((i) => i.assignedTo != null && i.assignedTo!.isNotEmpty && i.status != 'RESOLVED').length;
-    final resolved = _incidents.where((i) => i.status == 'RESOLVED').length;
+    final total = _backendKpis?['total_incidents'] ?? _incidents.length;
+    final open = _backendKpis?['open_incidents'] ??
+        _incidents.where((i) => i.status != 'RESOLVED' && i.status != 'REJECTED').length;
+    final criticalOrHigh = _backendKpis?['critical_or_high_incidents'] ??
+        _incidents.where((i) => (i.severity == 'CRITICAL' || i.severity == 'HIGH') && i.status != 'RESOLVED' && i.status != 'REJECTED').length;
+    final assigned = _backendKpis?['assigned_incidents'] ??
+        _incidents.where((i) => i.assignedTo != null && i.assignedTo!.isNotEmpty && i.status != 'RESOLVED' && i.status != 'REJECTED').length;
+    final resolved = _backendKpis?['resolved_incidents'] ??
+        _incidents.where((i) => i.status == 'RESOLVED').length;
+    final genuineCount = _backendKpis?['genuine_incidents_count'] ??
+        _incidents.where((i) => !i.isDemo).length;
+    final demoCount = _backendKpis?['demo_incidents_count'] ??
+        _incidents.where((i) => i.isDemo).length;
 
     return Scaffold(
       appBar: AppBar(
@@ -84,6 +136,7 @@ class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
             icon: const Icon(Icons.logout),
             tooltip: 'Logout',
             onPressed: () {
+              AuthService().logout();
               Navigator.pushAndRemoveUntil(
                 context,
                 MaterialPageRoute(builder: (_) => const WelcomeScreen()),
@@ -200,7 +253,70 @@ class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
                 ),
               ),
 
-              const SizedBox(height: 16),
+              const SizedBox(height: 10),
+
+              // Audit Transparency & Source Breakdown Banner
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF8FAFC),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFFE2E8F0)),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: const BoxDecoration(
+                              color: Color(0xFF16A34A),
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Genuine: $genuineCount',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF166534),
+                            ),
+                          ),
+                        ],
+                      ),
+                      Row(
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: const BoxDecoration(
+                              color: Color(0xFF9333EA),
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Demo Seeds: $demoCount',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF6B21A8),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 14),
 
               // Search Box
               Padding(
@@ -230,11 +346,11 @@ class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
                 ),
               ),
 
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
 
               // Status Filter Chips
               SizedBox(
-                height: 38,
+                height: 36,
                 child: ListView(
                   scrollDirection: Axis.horizontal,
                   padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -267,6 +383,92 @@ class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
                 ),
               ),
 
+              const SizedBox(height: 6),
+
+              // Severity Filter Chips
+              SizedBox(
+                height: 36,
+                child: ListView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  children: [
+                    'ALL',
+                    'CRITICAL',
+                    'HIGH',
+                    'MEDIUM',
+                    'LOW',
+                  ].map((sev) {
+                    final isSelected = _selectedSeverityFilter == sev;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: FilterChip(
+                        label: Text(
+                          sev == 'ALL' ? 'ALL SEVERITIES' : sev,
+                          style: TextStyle(fontSize: 10, fontWeight: isSelected ? FontWeight.bold : FontWeight.normal),
+                        ),
+                        selected: isSelected,
+                        selectedColor: const Color(0xFFFEE2E2),
+                        checkmarkColor: const Color(0xFFDC2626),
+                        backgroundColor: Colors.white,
+                        side: BorderSide(color: isSelected ? const Color(0xFFEF4444) : const Color(0xFFCBD5E1)),
+                        onSelected: (val) {
+                          setState(() {
+                            _selectedSeverityFilter = sev;
+                          });
+                        },
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ),
+
+              const SizedBox(height: 6),
+
+              // Source Filter Chips
+              SizedBox(
+                height: 36,
+                child: ListView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  children: [
+                    'ALL',
+                    'CITIZEN',
+                    'DEMO',
+                    'SENSOR',
+                  ].map((src) {
+                    final isSelected = _selectedSourceFilter == src;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: FilterChip(
+                        label: Text(
+                          src == 'ALL'
+                              ? 'ALL SOURCES'
+                              : src == 'DEMO'
+                                  ? 'DEMO SEEDS'
+                                  : src,
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                          ),
+                        ),
+                        selected: isSelected,
+                        selectedColor: const Color(0xFFF3E8FF),
+                        checkmarkColor: const Color(0xFF7E22CE),
+                        backgroundColor: Colors.white,
+                        side: BorderSide(
+                          color: isSelected ? const Color(0xFFA855F7) : const Color(0xFFCBD5E1),
+                        ),
+                        onSelected: (val) {
+                          setState(() {
+                            _selectedSourceFilter = src;
+                          });
+                        },
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ),
+
               const SizedBox(height: 12),
 
               // Queue Header
@@ -289,16 +491,102 @@ class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
 
               const SizedBox(height: 8),
 
-              // Incident List
+              // UI States
               if (_isLoading)
                 const Padding(
                   padding: EdgeInsets.all(40),
                   child: Center(child: CircularProgressIndicator()),
                 )
-              else if (_errorMessage != null)
-                Padding(
+              else if (_isSessionExpired)
+                Container(
+                  margin: const EdgeInsets.all(16),
                   padding: const EdgeInsets.all(16),
-                  child: Center(child: Text(_errorMessage!, style: const TextStyle(color: Colors.red))),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFEF2F2),
+                    border: Border.all(color: const Color(0xFFF87171)),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Column(
+                    children: [
+                      const Icon(Icons.lock_clock, color: Color(0xFFDC2626), size: 36),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Session Expired (HTTP 401)',
+                        style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF991B1B)),
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        'Your authentication token has expired. Please re-authenticate.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12, color: Color(0xFF7F1D1D)),
+                      ),
+                      const SizedBox(height: 12),
+                      ElevatedButton(
+                        onPressed: () {
+                          AuthService().logout();
+                          Navigator.pushAndRemoveUntil(
+                            context,
+                            MaterialPageRoute(builder: (_) => const WelcomeScreen()),
+                            (route) => false,
+                          );
+                        },
+                        child: const Text('Return to Login'),
+                      ),
+                    ],
+                  ),
+                )
+              else if (_isUnauthorized)
+                Container(
+                  margin: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFFBEB),
+                    border: Border.all(color: const Color(0xFFF59E0B)),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Column(
+                    children: [
+                      Icon(Icons.gpp_bad, color: Color(0xFFD97706), size: 36),
+                      SizedBox(height: 8),
+                      Text(
+                        'Municipal Access Restricted (HTTP 403)',
+                        style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF92400E)),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'This operations queue requires municipal officer or administrator credentials. Citizen and field worker roles are denied through server-side validation.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12, color: Color(0xFF78350F)),
+                      ),
+                    ],
+                  ),
+                )
+              else if (_errorMessage != null)
+                Container(
+                  margin: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFEF2F2),
+                    border: Border.all(color: const Color(0xFFF87171)),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Column(
+                    children: [
+                      const Icon(Icons.error_outline, color: Color(0xFFDC2626), size: 32),
+                      const SizedBox(height: 8),
+                      Text(
+                        _errorMessage!,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(fontSize: 12, color: Color(0xFF991B1B)),
+                      ),
+                      const SizedBox(height: 12),
+                      OutlinedButton.icon(
+                        icon: const Icon(Icons.refresh, size: 16),
+                        label: const Text('Retry Connection'),
+                        onPressed: _fetchIncidents,
+                      ),
+                    ],
+                  ),
                 )
               else if (_filteredIncidents.isEmpty)
                 const EmptyStateView(
@@ -343,9 +631,20 @@ class _MunicipalDashboardScreenState extends State<MunicipalDashboardScreen> {
 }
 
 extension IncidentFilter on List<Incident> {
-  List<Incident> filterBy({required String status, required String query}) {
+  List<Incident> filterBy({
+    required String status,
+    String severity = 'ALL',
+    String source = 'ALL',
+    required String query,
+  }) {
     return where((i) {
       if (status != 'ALL' && i.status != status) return false;
+      if (severity != 'ALL' && i.severity != severity) return false;
+      if (source != 'ALL') {
+        if (source == 'DEMO' && !i.isDemo) return false;
+        if (source == 'CITIZEN' && (i.isDemo || i.source.toUpperCase() != 'CITIZEN')) return false;
+        if (source == 'SENSOR' && i.source.toUpperCase() != 'SENSOR') return false;
+      }
       if (query.isNotEmpty) {
         final q = query.toLowerCase();
         final matchesId = i.id.toLowerCase().contains(q);

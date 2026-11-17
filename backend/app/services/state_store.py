@@ -1,8 +1,9 @@
 import time
+import logging
 from collections import deque
 from datetime import datetime, timezone
 import threading
-from typing import Optional
+from typing import Optional, Any
 
 from app.models.contracts import (
     SensorReadingContract,
@@ -18,16 +19,120 @@ from app.models.contracts import (
     ActuatorDirectiveContract,
     IncidentResponseContract,
     IncidentUpdateContract,
+    IncidentAuditContract,
+    FieldTeamContract,
     IncidentStatus,
     IncidentCategory,
     IncidentSeverity,
     IncidentSource,
+    AssignmentType,
     OperationalMode,
     ModeTransitionRecord,
     DataSource,
     validate_incident_status_transition,
 )
 from app.core.config import settings
+from app.services.audit_durability import AuditDurabilityManager
+
+logger = logging.getLogger("drainx.state_store")
+
+# Directory of registered field response crews (explicitly classified as DEMO or MUNICIPAL)
+AUTHORITATIVE_FIELD_TEAMS: list[FieldTeamContract] = [
+    FieldTeamContract(
+        team_id="TEAM-ALPHA",
+        name="Team Alpha — St. Inez Drainage Crew",
+        zone="St. Inez / Panaji Central",
+        is_active=True,
+        is_demo=True,
+        is_verified_municipal_crew=False,
+        capacity=4,
+        contact_phone="+91-832-2420001",
+    ),
+    FieldTeamContract(
+        team_id="TEAM-BETA",
+        name="Team Beta — Patto Rapid Response",
+        zone="Patto Commercial Plaza",
+        is_active=True,
+        is_demo=True,
+        is_verified_municipal_crew=False,
+        capacity=4,
+        contact_phone="+91-832-2420002",
+    ),
+    FieldTeamContract(
+        team_id="TEAM-GAMMA",
+        name="Team Gamma — Fontainhas Heritage Maintenance",
+        zone="Fontainhas Conservation Zone",
+        is_active=True,
+        is_demo=True,
+        is_verified_municipal_crew=False,
+        capacity=3,
+        contact_phone="+91-832-2420003",
+    ),
+    FieldTeamContract(
+        team_id="TEAM-DELTA",
+        name="Team Delta — Miramar Outfall Sluice Unit",
+        zone="Miramar Beach Outfall",
+        is_active=True,
+        is_demo=True,
+        is_verified_municipal_crew=False,
+        capacity=5,
+        contact_phone="+91-832-2420004",
+    ),
+]
+
+
+def validate_and_normalize_field_team(identifier: Optional[str]) -> Optional[FieldTeamContract]:
+    """
+    Validates an assignee or crew string against the authoritative field team directory.
+    Rejects nonexistent, inactive, or unauthorized teams.
+    Does NOT use substring matching.
+    Returns the canonical FieldTeamContract, or None if unassigned.
+    """
+    if not identifier or not identifier.strip():
+        return None
+
+    raw = identifier.strip().lower()
+    cleaned = raw.replace("[demo]", "").strip()
+
+    # Exact check against team_id or canonical name (with or without [demo])
+    for team in AUTHORITATIVE_FIELD_TEAMS:
+        clean_team_name = team.name.lower().replace("[demo]", "").strip()
+        if (
+            raw == team.team_id.lower()
+            or raw == team.name.lower()
+            or cleaned == clean_team_name
+            or raw == clean_team_name
+        ):
+            if not team.is_active:
+                raise ValueError(f"Field team '{team.name}' is currently inactive and cannot receive assignments.")
+            return team
+
+    # Canonical short names ("team alpha", "team beta", "team gamma", "team delta")
+    canonical_aliases = {
+        "team alpha": "TEAM-ALPHA",
+        "team beta": "TEAM-BETA",
+        "team gamma": "TEAM-GAMMA",
+        "team delta": "TEAM-DELTA",
+    }
+    # Check if raw matches prefix before em-dash or explicit canonical alias
+    for alias, tid in canonical_aliases.items():
+        if (
+            cleaned == alias
+            or cleaned.startswith(f"{alias} —")
+            or cleaned.startswith(f"{alias} -")
+            or raw == alias
+            or raw.startswith(f"{alias} —")
+            or raw.startswith(f"{alias} -")
+        ):
+            for team in AUTHORITATIVE_FIELD_TEAMS:
+                if team.team_id == tid:
+                    if not team.is_active:
+                        raise ValueError(f"Field team '{team.name}' is currently inactive.")
+                    return team
+
+    raise ValueError(
+        f"Invalid assignee '{identifier}'. Must match an authoritative registered field crew from the municipal directory."
+    )
 
 
 class StateStore:
@@ -93,7 +198,30 @@ class StateStore:
 
         # Municipal & Citizen Incidents
         self._incidents: dict[str, IncidentResponseContract] = {}
+        self._audit_durability = AuditDurabilityManager()
+        self._incident_audits: dict[str, list[IncidentAuditContract]] = self._audit_durability.load_all_audits()
         self.seed_demo_incidents()
+        self.recover_incidents_from_cloud()
+
+    def recover_incidents_from_cloud(self) -> None:
+        """
+        Loads persisted incidents from Supabase Cloud on backend startup.
+        Ensures cloud-persisted incidents and assignments survive process restart.
+        """
+        try:
+            from app.services.persistence_repository import persistence_repo
+            if persistence_repo.is_configured:
+                records = persistence_repo.query_all_incidents_sync()
+                for rec in records:
+                    try:
+                        inc = IncidentResponseContract(**rec)
+                        self._incidents[inc.id] = inc
+                    except Exception as parse_err:
+                        logger.warning(f"Failed to parse cloud incident record {rec.get('id')}: {parse_err}")
+                if records:
+                    logger.info(f"Recovered {len(records)} authoritative incidents from Supabase Cloud.")
+        except Exception as exc:
+            logger.warning(f"Could not recover incidents from Supabase Cloud on startup: {exc}")
 
     def is_simulation(self) -> bool:
         return self.mode in (OperationalMode.SIMULATION, "SIMULATION")
@@ -515,23 +643,174 @@ class StateStore:
             for item in demo_items:
                 if item.id not in self._incidents:
                     self._incidents[item.id] = item
+                    # Seed corresponding audit history for demo inspection
+                    self._incident_audits[item.id] = [
+                        IncidentAuditContract(
+                            incident_id=item.id,
+                            actor_id=item.reporter_name or "panaji-citizen-seed",
+                            actor_role="citizen",
+                            action="REPORTED",
+                            new_status=IncidentStatus.REPORTED.value,
+                            new_severity=item.severity.value,
+                            reason="Initial citizen hazard report submission",
+                        )
+                    ]
+                    if item.status != IncidentStatus.REPORTED:
+                        self._incident_audits[item.id].append(
+                            IncidentAuditContract(
+                                incident_id=item.id,
+                                actor_id="muni-dispatcher-seed",
+                                actor_role="municipality",
+                                action="ASSIGNED" if item.assigned_to else "STATUS_CHANGE",
+                                previous_status=IncidentStatus.REPORTED.value,
+                                new_status=item.status.value,
+                                new_assigned_to=item.assigned_to,
+                                reason=item.municipal_notes or "Operational state progression",
+                            )
+                        )
 
     def create_incident(self, incident: IncidentResponseContract) -> IncidentResponseContract:
         with self._lock:
+            audit = IncidentAuditContract(
+                incident_id=incident.id,
+                actor_id=incident.reporter_name or "citizen",
+                actor_role="citizen",
+                action="REPORTED",
+                new_status=incident.status.value,
+                new_severity=incident.severity.value,
+                reason="Initial hazard report submission",
+            )
+
+            # In configured cloud mode, execute atomic cloud RPC
+            from app.services.persistence_repository import persistence_repo
+            if persistence_repo.is_configured:
+                cloud_res = persistence_repo.execute_citizen_incident_creation_sync(
+                    incident_id=incident.id,
+                    category=incident.category.value if hasattr(incident.category, "value") else str(incident.category),
+                    description=incident.description,
+                    latitude=incident.latitude,
+                    longitude=incident.longitude,
+                    severity=incident.severity.value if hasattr(incident.severity, "value") else str(incident.severity),
+                    source=incident.source.value if hasattr(incident.source, "value") else str(incident.source),
+                    reporter_name=incident.reporter_name or "Citizen Anonymous",
+                    photos=incident.photos,
+                    audit_id=audit.audit_id,
+                )
+                if not cloud_res:
+                    # Fallback to direct PostgREST table insert if RPC migration not yet applied
+                    inc_dict = incident.model_dump(mode="json")
+                    p_ok = persistence_repo.persist_incident_sync(inc_dict)
+                    persistence_repo.persist_incident_audit_sync(audit.model_dump(mode="json"))
+                    if not p_ok and self._audit_durability.is_cloud_environment():
+                        raise RuntimeError(f"Cloud persistence failed for citizen incident '{incident.id}'.")
+
+            # Local durable journaling
+            self._audit_durability.append_audit(audit)
             self._incidents[incident.id] = incident
+            self._incident_audits[incident.id] = [audit]
+
             return incident
 
     def get_incident(self, incident_id: str) -> Optional[IncidentResponseContract]:
         with self._lock:
             return self._incidents.get(incident_id)
 
-    def get_incidents(
+    def get_incident_kpis(self) -> dict[str, Any]:
+        """
+        Calculates authoritative municipal incident KPIs across the entire incident population.
+        Guarantees server-side consistency without relying on paginated client slices.
+        """
+        with self._lock:
+            all_incidents = list(self._incidents.values())
+            # Terminal states: both RESOLVED and REJECTED incidents are terminal
+            # and MUST be excluded from active operational queues and open metrics.
+            terminal_statuses = {
+                IncidentStatus.RESOLVED,
+                IncidentStatus.REJECTED,
+                IncidentStatus.RESOLVED.value,
+                IncidentStatus.REJECTED.value,
+            }
+            open_items = [
+                i for i in all_incidents
+                if i.status not in terminal_statuses
+            ]
+
+            by_cat: dict[str, int] = {cat.value: 0 for cat in IncidentCategory}
+            for i in open_items:
+                cat_val = i.category.value if hasattr(i.category, "value") else str(i.category)
+                by_cat[cat_val] = by_cat.get(cat_val, 0) + 1
+
+            by_sev: dict[str, int] = {sev.value: 0 for sev in IncidentSeverity}
+            for i in open_items:
+                sev_val = i.severity.value if hasattr(i.severity, "value") else str(i.severity)
+                by_sev[sev_val] = by_sev.get(sev_val, 0) + 1
+
+            by_st: dict[str, int] = {st.value: 0 for st in IncidentStatus}
+            for i in all_incidents:
+                st_val = i.status.value if hasattr(i.status, "value") else str(i.status)
+                by_st[st_val] = by_st.get(st_val, 0) + 1
+
+            demo_count = len([i for i in all_incidents if i.source == IncidentSource.DEMO or i.id.startswith("INC-DEMO")])
+            genuine_count = len([i for i in all_incidents if i.source != IncidentSource.DEMO and not i.id.startswith("INC-DEMO")])
+
+            by_src: dict[str, int] = {src.value: 0 for src in IncidentSource}
+            for i in all_incidents:
+                src_val = i.source.value if hasattr(i.source, "value") else str(i.source)
+                by_src[src_val] = by_src.get(src_val, 0) + 1
+
+            return {
+                "total_incidents": len(all_incidents),
+                "open_incidents": len(open_items),
+                "critical_or_high_incidents": len([
+                    i for i in open_items
+                    if i.severity in (IncidentSeverity.CRITICAL, IncidentSeverity.HIGH, "CRITICAL", "HIGH")
+                ]),
+                "unassigned_incidents": len([
+                    i for i in open_items
+                    if not i.assigned_to or not i.assigned_to.strip()
+                ]),
+                "assigned_incidents": len([
+                    i for i in open_items
+                    if i.assigned_to and i.assigned_to.strip()
+                ]),
+                "investigating_incidents": len([
+                    i for i in open_items
+                    if i.status in (IncidentStatus.INVESTIGATING, IncidentStatus.INVESTIGATING.value)
+                ]),
+                "resolved_incidents": len([
+                    i for i in all_incidents
+                    if i.status in (IncidentStatus.RESOLVED, IncidentStatus.RESOLVED.value)
+                ]),
+                "rejected_incidents": len([
+                    i for i in all_incidents
+                    if i.status in (IncidentStatus.REJECTED, IncidentStatus.REJECTED.value)
+                ]),
+                "demo_incidents_count": demo_count,
+                "genuine_incidents_count": genuine_count,
+                "by_category": by_cat,
+                "by_severity": by_sev,
+                "by_status": by_st,
+                "by_source": by_src,
+            }
+
+    def get_incidents_paginated(
         self,
         status: Optional[IncidentStatus] = None,
         category: Optional[IncidentCategory] = None,
         severity: Optional[IncidentSeverity] = None,
         source: Optional[IncidentSource] = None,
-    ) -> list[IncidentResponseContract]:
+        assigned_to: Optional[str] = None,
+        search: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        limit: int = 50,
+        offset: int = 0,
+        is_staff_search: bool = False,
+    ) -> tuple[list[IncidentResponseContract], int]:
+        """
+        Retrieves filtered and paginated incidents with total matching count.
+        Enforces privacy-bounded search to eliminate side-channel reconnaissance.
+        """
         with self._lock:
             incidents = list(self._incidents.values())
 
@@ -544,35 +823,287 @@ class StateStore:
             if source:
                 incidents = [i for i in incidents if i.source == source]
 
-            # Return sorted by created_at descending
-            return sorted(incidents, key=lambda x: x.created_at, reverse=True)
+            if assigned_to:
+                norm_assigned = assigned_to.strip().upper()
+                if norm_assigned == "UNASSIGNED":
+                    incidents = [i for i in incidents if not i.assigned_to or not i.assigned_to.strip()]
+                elif norm_assigned == "ASSIGNED":
+                    incidents = [i for i in incidents if i.assigned_to and i.assigned_to.strip()]
+                else:
+                    target = assigned_to.strip().lower()
+                    incidents = [i for i in incidents if target in (i.assigned_to or "").lower()]
+
+            if search and search.strip():
+                query = search.strip().lower()
+                if is_staff_search:
+                    # Authorized staff search across queue fields, but NEVER internal_notes
+                    incidents = [
+                        i for i in incidents
+                        if query in i.id.lower()
+                        or query in i.description.lower()
+                        or query in (i.assigned_to or "").lower()
+                        or query in (i.municipal_notes or "").lower()
+                    ]
+                else:
+                    # Public / Citizen search: Strictly restricted to public ID and description
+                    # Prevents side-channel reconnaissance on municipal notes or staff assignments
+                    incidents = [
+                        i for i in incidents
+                        if query in i.id.lower()
+                        or query in i.description.lower()
+                    ]
+
+            if start_date:
+                sd = start_date if start_date.tzinfo else start_date.replace(tzinfo=timezone.utc)
+                incidents = [i for i in incidents if i.created_at >= sd]
+
+            if end_date:
+                ed = end_date if end_date.tzinfo else end_date.replace(tzinfo=timezone.utc)
+                incidents = [i for i in incidents if i.created_at <= ed]
+
+            sorted_incidents = sorted(incidents, key=lambda x: x.created_at, reverse=True)
+            total_count = len(sorted_incidents)
+            paged = sorted_incidents[offset : offset + limit] if limit > 0 else sorted_incidents[offset:]
+            return paged, total_count
+
+    def get_incidents(
+        self,
+        status: Optional[IncidentStatus] = None,
+        category: Optional[IncidentCategory] = None,
+        severity: Optional[IncidentSeverity] = None,
+        source: Optional[IncidentSource] = None,
+        assigned_to: Optional[str] = None,
+        search: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        is_staff_search: bool = False,
+    ) -> list[IncidentResponseContract]:
+        with self._lock:
+            paged, _ = self.get_incidents_paginated(
+                status=status,
+                category=category,
+                severity=severity,
+                source=source,
+                assigned_to=assigned_to,
+                search=search,
+                start_date=start_date,
+                end_date=end_date,
+                limit=limit if limit is not None else len(self._incidents),
+                offset=offset,
+                is_staff_search=is_staff_search,
+            )
+            return paged
 
     def update_incident(
-        self, incident_id: str, update: IncidentUpdateContract
+        self,
+        incident_id: str,
+        update: IncidentUpdateContract,
+        actor_id: str = "system",
+        actor_role: str = "system",
+        action_reason: Optional[str] = None,
+        action_type: Optional[str] = None,
     ) -> Optional[IncidentResponseContract]:
         with self._lock:
             incident = self._incidents.get(incident_id)
             if not incident:
                 return None
 
-            if update.status is not None:
+            prev_status = incident.status.value
+            prev_severity = incident.severity.value
+            prev_assigned = incident.assigned_to
+            prev_assignment_type = incident.assignment_type.value
+            prev_assigned_team_id = incident.assigned_team_id
+            prev_assigned_worker_id = incident.assigned_worker_id
+
+            # Snapshot incident for atomic rollback in case of audit persistence failure
+            incident_snapshot = incident.model_copy(deep=True)
+
+            # 1. Terminal State Lockdown: Resolved and Rejected tickets cannot be mutated
+            if incident.status in (IncidentStatus.RESOLVED, IncidentStatus.REJECTED):
+                if update.status is not None and update.status != incident.status:
+                    raise ValueError(f"Cannot transition terminal incident '{incident.id}' in status '{incident.status.value}'.")
+                if update.assigned_to is not None and update.assigned_to != incident.assigned_to:
+                    raise ValueError(f"Cannot modify assignment for terminal incident '{incident.id}' in status '{incident.status.value}'.")
+
+            # 2. Pre-validate status transition before applying ANY field mutations (Atomic Protection)
+            if update.status is not None and update.status != incident.status:
                 if not validate_incident_status_transition(incident.status, update.status):
                     raise ValueError(
                         f"Illegal status transition from {incident.status.value} to {update.status.value}"
                     )
-                incident.status = update.status
 
-            if update.assigned_to is not None:
-                incident.assigned_to = update.assigned_to
+            status_changed = False
+            severity_changed = False
+            assignment_changed = False
+
+            if update.severity is not None and update.severity != incident.severity:
+                incident.severity = update.severity
+                severity_changed = True
+
+            if update.status is not None and update.status != incident.status:
+                incident.status = update.status
+                status_changed = True
+
+            if update.assigned_to is not None and update.assigned_to != incident.assigned_to:
+                incident.assigned_to = update.assigned_to if update.assigned_to.strip() else None
+                assignment_changed = True
+
+            if update.assignment_type is not None:
+                incident.assignment_type = update.assignment_type
+
+            if update.assigned_team_id is not None:
+                incident.assigned_team_id = update.assigned_team_id if update.assigned_team_id.strip() else None
+
+            if update.assigned_worker_id is not None:
+                incident.assigned_worker_id = update.assigned_worker_id if update.assigned_worker_id.strip() else None
+
+            # Unassignment clearing invariants:
+            if update.assigned_to == "" or update.assigned_to is None and assignment_changed:
+                incident.assignment_type = AssignmentType.NONE
+                incident.assigned_team_id = None
+                incident.assigned_worker_id = None
+
+            if update.rejection_reason is not None:
+                incident.rejection_reason = update.rejection_reason
+
+            if update.verified_by is not None:
+                incident.verified_by = update.verified_by
+                incident.verified_at = datetime.now(timezone.utc)
 
             if update.municipal_notes is not None:
                 incident.municipal_notes = update.municipal_notes
+
+            if update.internal_notes is not None:
+                incident.internal_notes = update.internal_notes
 
             if update.photos is not None:
                 incident.photos = update.photos[:3]
 
             incident.updated_at = datetime.now(timezone.utc)
+
+            # Record durable operational audit entry
+            resolved_action = action_type
+            if not resolved_action:
+                if assignment_changed:
+                    if not incident.assigned_to:
+                        resolved_action = "UNASSIGNED"
+                    elif prev_assigned:
+                        resolved_action = "REASSIGNED"
+                    else:
+                        resolved_action = "ASSIGNED"
+                elif update.status == IncidentStatus.VERIFIED and status_changed:
+                    resolved_action = "VERIFIED"
+                elif update.status == IncidentStatus.REJECTED and status_changed:
+                    resolved_action = "REJECTED"
+                elif update.status == IncidentStatus.RESOLVED and status_changed:
+                    resolved_action = "RESOLVED"
+                elif severity_changed:
+                    resolved_action = "PRIORITIZED"
+                elif status_changed:
+                    resolved_action = f"STATUS_TO_{incident.status.value}"
+                else:
+                    resolved_action = "UPDATE"
+
+            audit_entry = IncidentAuditContract(
+                incident_id=incident.id,
+                actor_id=actor_id,
+                actor_role=actor_role,
+                action=resolved_action,
+                previous_status=prev_status if status_changed else None,
+                new_status=incident.status.value if status_changed else None,
+                previous_assigned_to=prev_assigned if assignment_changed else None,
+                new_assigned_to=incident.assigned_to if assignment_changed else None,
+                previous_assignment_type=prev_assignment_type if assignment_changed else None,
+                new_assignment_type=incident.assignment_type.value if assignment_changed else None,
+                previous_assigned_team_id=prev_assigned_team_id if assignment_changed else None,
+                new_assigned_team_id=incident.assigned_team_id if assignment_changed else None,
+                previous_assigned_worker_id=prev_assigned_worker_id if assignment_changed else None,
+                new_assigned_worker_id=incident.assigned_worker_id if assignment_changed else None,
+                previous_severity=prev_severity if severity_changed else None,
+                new_severity=incident.severity.value if severity_changed else None,
+                reason=action_reason or update.rejection_reason or update.municipal_notes,
+                internal_notes=update.internal_notes,
+                timestamp=incident.updated_at,
+            )
+
+            # In configured cloud mode, execute atomic PostgreSQL RPC transaction
+            from app.services.persistence_repository import persistence_repo
+            if persistence_repo.is_configured:
+                rpc_result = persistence_repo.execute_municipal_incident_transaction_sync(
+                    incident_id=incident.id,
+                    new_status=incident.status.value if status_changed else None,
+                    new_severity=incident.severity.value if severity_changed else None,
+                    assigned_to=incident.assigned_to,
+                    assignment_type=incident.assignment_type.value,
+                    assigned_team_id=incident.assigned_team_id,
+                    assigned_worker_id=incident.assigned_worker_id,
+                    municipal_notes=incident.municipal_notes,
+                    internal_notes=incident.internal_notes,
+                    rejection_reason=incident.rejection_reason,
+                    verified_by=incident.verified_by,
+                    actor_id=actor_id,
+                    actor_role=actor_role,
+                    action=resolved_action,
+                    reason=action_reason or update.rejection_reason or update.municipal_notes,
+                    audit_id=audit_entry.audit_id,
+                )
+                if not rpc_result:
+                    # Direct PostgREST synchronization fallback
+                    inc_persisted = persistence_repo.persist_incident_sync(incident.model_dump(mode="json"))
+                    audit_persisted = persistence_repo.persist_incident_audit_sync(audit_entry.model_dump(mode="json"))
+                    if self._audit_durability.is_cloud_environment() and (not inc_persisted or not audit_persisted):
+                        # Fail closed in true cloud environment
+                        self._incidents[incident_id] = incident_snapshot
+                        raise RuntimeError(f"Cloud transaction failed for municipal mutation on incident '{incident_id}'. Operation aborted.")
+
+            # Atomicity guarantee: Attempt durable local journal append
+            append_ok = self._audit_durability.append_audit(audit_entry)
+            if not append_ok:
+                # Rollback incident state in memory so incident mutation and audit never diverge
+                self._incidents[incident_id] = incident_snapshot
+                logger.error(f"Audit append failed for incident {incident_id}. Rolled back in-memory mutation.")
+                raise RuntimeError(f"Failed to record durable audit event for incident '{incident_id}'. Incident mutation was rolled back.")
+
+            self._incident_audits.setdefault(incident.id, []).append(audit_entry)
             return incident
+
+    def record_incident_audit(self, entry: IncidentAuditContract) -> None:
+        """Appends a custom operational audit record to the incident's ledger and durable store."""
+        with self._lock:
+            self._incident_audits.setdefault(entry.incident_id, []).append(entry)
+            self._audit_durability.append_audit(entry)
+
+    def clear_audits_for_testing(self) -> None:
+        """Cleanly wipes audit history for isolated unit testing."""
+        with self._lock:
+            self._incident_audits.clear()
+            self._audit_durability.clear_for_testing()
+
+    def get_incident_audits(self, incident_id: str) -> list[IncidentAuditContract]:
+        """
+        Returns chronological audit ledger for an incident.
+        In cloud mode with configured Supabase, fetches authoritative records from Supabase Cloud.
+        Falls back seamlessly to local in-memory/journal records.
+        """
+        with self._lock:
+            from app.services.persistence_repository import persistence_repo
+            if persistence_repo.is_configured:
+                try:
+                    cloud_records = persistence_repo.query_incident_audits_sync(incident_id)
+                    if cloud_records:
+                        parsed_audits = [IncidentAuditContract(**rec) for rec in cloud_records]
+                        return sorted(parsed_audits, key=lambda a: a.timestamp)
+                except Exception as exc:
+                    logger.warning(f"Error querying cloud audits from Supabase: {exc}. Using local ledger fallback.")
+
+            audits = self._incident_audits.get(incident_id, [])
+            return sorted(audits, key=lambda a: a.timestamp)
+
+    def get_field_teams(self) -> list[FieldTeamContract]:
+        """Returns registered authoritative field response crews."""
+        return [t for t in AUTHORITATIVE_FIELD_TEAMS if t.is_active]
 
     def attach_incident_photos(
         self, incident_id: str, new_photos: list[str]
@@ -588,6 +1119,15 @@ class StateStore:
                     incident.photos.append(p)
             incident.updated_at = datetime.now(timezone.utc)
             return incident
+
+    def is_photo_registered(self, filename: str) -> bool:
+        """Checks if a photo filename is associated with any incident in the store."""
+        target = f"/api/v1/incidents/photos/{filename}"
+        with self._lock:
+            for inc in self._incidents.values():
+                if target in inc.photos or any(p.endswith(filename) for p in inc.photos):
+                    return True
+        return False
 
 
     def clear_scenario_outputs(self) -> None:

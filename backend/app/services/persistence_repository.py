@@ -507,6 +507,270 @@ class PersistenceRepository:
             logger.warning(f"List devices network error: {exc}")
             return list(self._in_memory_devices.values())
 
+    async def persist_incident_audit(self, audit_dict: Dict[str, Any]) -> bool:
+        """
+        Persist an incident operational audit record to Supabase incident_audits table.
+        Gracefully degrades if table does not exist or Supabase is unconfigured in development.
+        In cloud environments, logs explicit operational alerts on persistence failures.
+        """
+        if not self._is_configured:
+            return True
+
+        endpoint = f"{self._supabase_url}/rest/v1/incident_audits"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
+                resp = await client.post(
+                    endpoint,
+                    json=[audit_dict],
+                    headers=self._get_headers(prefer="resolution=merge-duplicates"),
+                )
+                if resp.status_code in (200, 201):
+                    return True
+                logger.warning(f"Supabase audit persistence response HTTP {resp.status_code}: {resp.text}")
+                return False
+        except Exception as exc:
+            logger.warning(f"Failed to persist audit to Supabase Cloud: {exc}")
+            return False
+
+    def persist_incident_audit_sync(self, audit_dict: Dict[str, Any]) -> bool:
+        """
+        Synchronous variant of persist_incident_audit for atomic coordination in synchronous state store.
+        Uses idempotency resolution merge-duplicates to guarantee crash-safe retry.
+        """
+        if not self._is_configured:
+            return True
+
+        endpoint = f"{self._supabase_url}/rest/v1/incident_audits"
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.post(
+                    endpoint,
+                    json=[audit_dict],
+                    headers=self._get_headers(prefer="resolution=merge-duplicates"),
+                )
+                if resp.status_code in (200, 201):
+                    return True
+                logger.warning(f"Supabase synchronous audit persistence HTTP {resp.status_code}: {resp.text}")
+                return False
+        except Exception as exc:
+            logger.warning(f"Supabase synchronous audit persistence network error: {exc}")
+            return False
+
+    async def query_incident_audits(self, incident_id: str) -> List[Dict[str, Any]]:
+        """
+        Query incident audit ledger from Supabase Cloud.
+        """
+        if not self._is_configured:
+            return []
+
+        endpoint = f"{self._supabase_url}/rest/v1/incident_audits"
+        params = {"incident_id": f"eq.{incident_id}", "order": "timestamp.asc"}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
+                resp = await client.get(
+                    endpoint,
+                    params=params,
+                    headers=self._get_headers(),
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                return []
+        except Exception as exc:
+            logger.warning(f"Supabase incident audit query error: {exc}")
+            return []
+
+    def query_incident_audits_sync(self, incident_id: str) -> List[Dict[str, Any]]:
+        """
+        Synchronously query authoritative incident audit ledger from Supabase Cloud.
+        """
+        if not self._is_configured:
+            return []
+
+        endpoint = f"{self._supabase_url}/rest/v1/incident_audits"
+        params = {"incident_id": f"eq.{incident_id}", "order": "timestamp.asc"}
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.get(
+                    endpoint,
+                    params=params,
+                    headers=self._get_headers(),
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                return []
+        except Exception as exc:
+            logger.warning(f"Supabase synchronous incident audit query error: {exc}")
+            return []
+
+
+    def persist_incident_sync(self, incident_dict: Dict[str, Any]) -> bool:
+        """
+        Synchronously persists a newly reported or updated incident to Supabase PostgreSQL table.
+        Uses HTTP Prefer: resolution=merge-duplicates for crash-safe idempotency.
+        """
+        if not self._is_configured:
+            return True
+
+        endpoint = f"{self._supabase_url}/rest/v1/incidents"
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.post(
+                    endpoint,
+                    json=[incident_dict],
+                    headers=self._get_headers(prefer="resolution=merge-duplicates"),
+                )
+                if resp.status_code in (200, 201):
+                    return True
+                logger.warning(f"Supabase incident persistence HTTP {resp.status_code}: {resp.text}")
+                return False
+        except Exception as exc:
+            logger.warning(f"Supabase incident persistence network error: {exc}")
+            return False
+
+    def query_all_incidents_sync(self, page_size: int = 1000) -> List[Dict[str, Any]]:
+        """
+        Loads all persisted incidents from Supabase Cloud on backend startup.
+        Uses Range header pagination to safely recover all records without silent truncation.
+        """
+        if not self._is_configured:
+            return []
+
+        all_records: List[Dict[str, Any]] = []
+        offset = 0
+        endpoint = f"{self._supabase_url}/rest/v1/incidents?order=created_at.desc"
+
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                while True:
+                    headers = self._get_headers()
+                    headers["Range"] = f"{offset}-{offset + page_size - 1}"
+                    resp = client.get(endpoint, headers=headers)
+                    if resp.status_code not in (200, 206):
+                        if resp.status_code != 416:  # 416 Range Not Satisfiable (end of dataset)
+                            logger.warning(f"Supabase incident query returned HTTP {resp.status_code}")
+                        break
+                    page = resp.json()
+                    if not page:
+                        break
+                    all_records.extend(page)
+                    if len(page) < page_size:
+                        break
+                    offset += page_size
+
+            return all_records
+        except Exception as exc:
+            logger.warning(f"Supabase all incidents paginated query network error: {exc}")
+            return []
+
+    def execute_municipal_incident_transaction_sync(
+        self,
+        incident_id: str,
+        new_status: Optional[str],
+        new_severity: Optional[str],
+        assigned_to: Optional[str],
+        assignment_type: Optional[str],
+        assigned_team_id: Optional[str],
+        assigned_worker_id: Optional[str],
+        municipal_notes: Optional[str],
+        internal_notes: Optional[str],
+        rejection_reason: Optional[str],
+        verified_by: Optional[str],
+        actor_id: str,
+        actor_role: str,
+        action: str,
+        reason: Optional[str],
+        audit_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Executes atomic server-side PostgreSQL stored procedure municipal_incident_transaction_rpc via Supabase RPC.
+        Atomically updates the incident, inserts the audit entry, and returns the updated incident.
+        """
+        if not self._is_configured:
+            return None
+
+        endpoint = f"{self._supabase_url}/rest/v1/rpc/municipal_incident_transaction_rpc"
+        payload = {
+            "p_incident_id": incident_id,
+            "p_new_status": new_status,
+            "p_new_severity": new_severity,
+            "p_assigned_to": assigned_to,
+            "p_assignment_type": assignment_type,
+            "p_assigned_team_id": assigned_team_id,
+            "p_assigned_worker_id": assigned_worker_id,
+            "p_municipal_notes": municipal_notes,
+            "p_internal_notes": internal_notes,
+            "p_rejection_reason": rejection_reason,
+            "p_verified_by": verified_by,
+            "p_actor_id": actor_id,
+            "p_actor_role": actor_role,
+            "p_action": action,
+            "p_reason": reason,
+            "p_audit_id": audit_id,
+        }
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.post(
+                    endpoint,
+                    json=payload,
+                    headers=self._get_headers(),
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                logger.warning(f"Supabase RPC incident transaction failed with HTTP {resp.status_code}: {resp.text}")
+                return None
+        except Exception as exc:
+            logger.warning(f"Supabase RPC incident transaction network error: {exc}")
+            return None
+
+
+    def execute_citizen_incident_creation_sync(
+        self,
+        incident_id: str,
+        category: str,
+        description: str,
+        latitude: float,
+        longitude: float,
+        severity: str,
+        source: str,
+        reporter_name: str,
+        photos: List[str],
+        audit_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Executes atomic server-side PostgreSQL stored procedure citizen_incident_creation_rpc via Supabase RPC.
+        Atomically inserts the citizen incident and initial REPORTED audit event.
+        """
+        if not self._is_configured:
+            return None
+
+        endpoint = f"{self._supabase_url}/rest/v1/rpc/citizen_incident_creation_rpc"
+        payload = {
+            "p_incident_id": incident_id,
+            "p_category": category,
+            "p_description": description,
+            "p_latitude": latitude,
+            "p_longitude": longitude,
+            "p_severity": severity,
+            "p_source": source,
+            "p_reporter_name": reporter_name,
+            "p_photos": photos,
+            "p_audit_id": audit_id,
+        }
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.post(
+                    endpoint,
+                    json=payload,
+                    headers=self._get_headers(),
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                logger.warning(f"Supabase RPC citizen creation failed with HTTP {resp.status_code}: {resp.text}")
+                return None
+        except Exception as exc:
+            logger.warning(f"Supabase RPC citizen creation network error: {exc}")
+            return None
+
 
 # Global persistence client instance
 persistence_repo = PersistenceRepository()
