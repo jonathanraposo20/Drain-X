@@ -146,7 +146,7 @@ class StateStore:
         self._lock = threading.RLock()
         self._start_time = time.time()
         self._max_history = max_history_per_sensor
-        
+
         # Mode & State
         raw_mode = settings.SYSTEM_MODE
         self.mode = "PHYSICAL" if raw_mode == "HARDWARE" else raw_mode
@@ -242,7 +242,7 @@ class StateStore:
         valid_modes = {"SIMULATION", "PHYSICAL", "SAFE_HOLD", "HARDWARE"}
         if new_mode not in valid_modes:
             raise ValueError(f"Invalid operational mode '{new_mode}'. Allowed modes: {sorted(list(valid_modes))}")
-        
+
         # Canonicalize HARDWARE alias to PHYSICAL
         if new_mode == "HARDWARE":
             new_mode = "PHYSICAL"
@@ -597,6 +597,8 @@ class StateStore:
                 source=IncidentSource.DEMO,
                 reporter_name="St. Inez Ward Committee",
                 assigned_to="Team Alpha — St. Inez Drainage Crew",
+                assignment_type=AssignmentType.TEAM,
+                assigned_team_id="TEAM-ALPHA",
                 municipal_notes="High-capacity dewatering pump dispatched to site.",
             ),
             IncidentResponseContract(
@@ -610,6 +612,8 @@ class StateStore:
                 source=IncidentSource.DEMO,
                 reporter_name="Patto Commercial Association",
                 assigned_to="Team Beta — Patto Rapid Response",
+                assignment_type=AssignmentType.TEAM,
+                assigned_team_id="TEAM-BETA",
                 municipal_notes="Suction tanker scheduled for 14:00 drain vacuuming.",
             ),
             IncidentResponseContract(
@@ -623,6 +627,8 @@ class StateStore:
                 source=IncidentSource.DEMO,
                 reporter_name="Fontainhas Heritage Watch",
                 assigned_to="Team Gamma — Fontainhas Heritage Maintenance",
+                assignment_type=AssignmentType.TEAM,
+                assigned_team_id="TEAM-GAMMA",
                 municipal_notes="Verified by municipal field inspector. Manual clearing required.",
             ),
             IncidentResponseContract(
@@ -636,6 +642,8 @@ class StateStore:
                 source=IncidentSource.DEMO,
                 reporter_name="Panaji Municipal Patrol",
                 assigned_to="Team Delta — Miramar Outfall Sluice Unit",
+                assignment_type=AssignmentType.TEAM,
+                assigned_team_id="TEAM-DELTA",
                 municipal_notes="Grating slab repositioned and secured with structural steel anchors.",
             ),
         ]
@@ -665,9 +673,13 @@ class StateStore:
                                 previous_status=IncidentStatus.REPORTED.value,
                                 new_status=item.status.value,
                                 new_assigned_to=item.assigned_to,
+                                new_assignment_type=item.assignment_type.value,
+                                new_assigned_team_id=item.assigned_team_id,
+                                new_assigned_worker_id=item.assigned_worker_id,
                                 reason=item.municipal_notes or "Operational state progression",
                             )
                         )
+
 
     def create_incident(self, incident: IncidentResponseContract) -> IncidentResponseContract:
         with self._lock:
@@ -681,8 +693,8 @@ class StateStore:
                 reason="Initial hazard report submission",
             )
 
-            # In configured cloud mode, execute atomic cloud RPC
             from app.services.persistence_repository import persistence_repo
+
             if persistence_repo.is_configured:
                 cloud_res = persistence_repo.execute_citizen_incident_creation_sync(
                     incident_id=incident.id,
@@ -696,13 +708,30 @@ class StateStore:
                     photos=incident.photos,
                     audit_id=audit.audit_id,
                 )
-                if not cloud_res:
-                    # Fallback to direct PostgREST table insert if RPC migration not yet applied
+
+                if cloud_res is None:
+                    # Controlled fallback only when the RPC is confirmed missing.
                     inc_dict = incident.model_dump(mode="json")
-                    p_ok = persistence_repo.persist_incident_sync(inc_dict)
-                    persistence_repo.persist_incident_audit_sync(audit.model_dump(mode="json"))
-                    if not p_ok and self._audit_durability.is_cloud_environment():
-                        raise RuntimeError(f"Cloud persistence failed for citizen incident '{incident.id}'.")
+                    audit_dict = audit.model_dump(mode="json")
+
+                    incident_persisted = persistence_repo.persist_incident_sync(
+                        inc_dict
+                    )
+
+                    if not incident_persisted:
+                        if self._audit_durability.is_cloud_environment():
+                            raise RuntimeError(
+                                f"Cloud incident persistence failed for '{incident.id}'."
+                            )
+                    else:
+                        audit_persisted = persistence_repo.persist_incident_audit_sync(
+                            audit_dict
+                        )
+
+                        if not audit_persisted and self._audit_durability.is_cloud_environment():
+                            raise RuntimeError(
+                                f"Cloud audit persistence failed for incident '{incident.id}'."
+                            )
 
             # Local durable journaling
             self._audit_durability.append_audit(audit)
@@ -710,6 +739,8 @@ class StateStore:
             self._incident_audits[incident.id] = [audit]
 
             return incident
+
+
 
     def get_incident(self, incident_id: str) -> Optional[IncidentResponseContract]:
         with self._lock:

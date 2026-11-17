@@ -311,7 +311,7 @@ class PersistenceRepository:
 
         endpoint = f"{self._supabase_url}/rest/v1/sensor_readings"
         order_direction = "asc" if chronological else "desc"
-        
+
         # Build query params as list of tuples to support multiple timestamp constraints
         query_params: List[Tuple[str, str]] = [
             ("order", f"timestamp.{order_direction}"),
@@ -532,10 +532,11 @@ class PersistenceRepository:
             logger.warning(f"Failed to persist audit to Supabase Cloud: {exc}")
             return False
 
+
     def persist_incident_audit_sync(self, audit_dict: Dict[str, Any]) -> bool:
         """
         Synchronous variant of persist_incident_audit for atomic coordination in synchronous state store.
-        Uses idempotency resolution merge-duplicates to guarantee crash-safe retry.
+        Uses ignore-duplicates so retries cannot modify existing audit records.
         """
         if not self._is_configured:
             return True
@@ -546,7 +547,7 @@ class PersistenceRepository:
                 resp = client.post(
                     endpoint,
                     json=[audit_dict],
-                    headers=self._get_headers(prefer="resolution=merge-duplicates"),
+                    headers=self._get_headers(prefer="resolution=ignore-duplicates"),
                 )
                 if resp.status_code in (200, 201):
                     return True
@@ -555,7 +556,6 @@ class PersistenceRepository:
         except Exception as exc:
             logger.warning(f"Supabase synchronous audit persistence network error: {exc}")
             return False
-
     async def query_incident_audits(self, incident_id: str) -> List[Dict[str, Any]]:
         """
         Query incident audit ledger from Supabase Cloud.
@@ -565,6 +565,7 @@ class PersistenceRepository:
 
         endpoint = f"{self._supabase_url}/rest/v1/incident_audits"
         params = {"incident_id": f"eq.{incident_id}", "order": "timestamp.asc"}
+
         try:
             async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
                 resp = await client.get(
@@ -723,6 +724,7 @@ class PersistenceRepository:
             return None
 
 
+
     def execute_citizen_incident_creation_sync(
         self,
         incident_id: str,
@@ -737,8 +739,11 @@ class PersistenceRepository:
         audit_id: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        Executes atomic server-side PostgreSQL stored procedure citizen_incident_creation_rpc via Supabase RPC.
-        Atomically inserts the citizen incident and initial REPORTED audit event.
+        Executes the atomic citizen incident creation RPC.
+
+        Returns None only when Supabase explicitly reports that the RPC
+        does not exist (PGRST202), allowing a controlled legacy fallback.
+        All other failures abort creation.
         """
         if not self._is_configured:
             return None
@@ -756,6 +761,7 @@ class PersistenceRepository:
             "p_photos": photos,
             "p_audit_id": audit_id,
         }
+
         try:
             with httpx.Client(timeout=self._timeout_sec) as client:
                 resp = client.post(
@@ -763,13 +769,37 @@ class PersistenceRepository:
                     json=payload,
                     headers=self._get_headers(),
                 )
+
                 if resp.status_code == 200:
                     return resp.json()
-                logger.warning(f"Supabase RPC citizen creation failed with HTTP {resp.status_code}: {resp.text}")
-                return None
-        except Exception as exc:
-            logger.warning(f"Supabase RPC citizen creation network error: {exc}")
-            return None
+
+                try:
+                    error_body = resp.json()
+                except ValueError:
+                    error_body = {}
+
+                error_code = error_body.get("code")
+
+                if resp.status_code == 404 and error_code == "PGRST202":
+                    logger.warning(
+                        "Citizen incident RPC is missing. "
+                        "Controlled direct-insert fallback may be used."
+                    )
+                    return None
+
+                logger.error(
+                    "Supabase citizen creation RPC failed: "
+                    f"HTTP {resp.status_code}, response: {resp.text}"
+                )
+                raise RuntimeError(
+                    f"Citizen incident RPC failed with HTTP {resp.status_code}."
+                )
+
+        except httpx.RequestError as exc:
+            logger.error(f"Citizen incident RPC network error: {exc}")
+            raise RuntimeError(
+                "Citizen incident RPC could not be reached."
+            ) from exc
 
 
 # Global persistence client instance
