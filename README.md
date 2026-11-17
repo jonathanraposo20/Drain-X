@@ -51,21 +51,19 @@ DRAIN-X transforms urban drainage into a proactive, intelligent, closed-loop cyb
 
 ## 📍 Current Development Status
 
-The codebase is currently at **Milestone P1.2 (Backend & Telemetry Architecture Audit Baseline)**, building directly upon **P1.0.5 (Digital Twin Presentation Cleanup)** and **P1.1 (Digital Twin Integration & Reliability)**.
+The current repository checkpoint includes the backend incident-security and municipal-operations expansion, a React municipal operations dashboard, and active citizen, municipality, and worker workflows in the Flutter application.
 
 | Component / Layer | Status | Implementation Details |
 | :--- | :--- | :--- |
-| **Physical Sheet-Metal Digital Twin** | **Implemented** | $140 \times 80 \times 50\text{ cm}$ canonical model with Top, Isometric, and Side views; hinged door rotation; debris screening grid; radar beam standby states. |
-| **Telemetry Ingestion & State Store** | **Implemented** | Partitioned in-memory store (`SIMULATED`, `PHYSICAL`, `SAFE_HOLD`); zero-flow vs fault discrimination; circular rolling buffers (maxlen=300). |
-| **Telemetry Abstraction & Reliability** | **Implemented** | Strict source classification (`SIMULATED`, `LIVE`, `OFFLINE`, `STALE`, `FAULT`); no substitution of 0 for missing values; `(CMD)` vs `ACTUAL` actuator separation. |
-| **Backend API Core & Probes** | **Implemented** | FastAPI modular monolith; zero circular dependencies; `/health`, `/health/liveness`, `/health/ready` probes. |
-| **Security & JWT Verification** | **Implemented** | Modern asymmetric ES256 via trusted JWKS; legacy HS256 secret fallback; anti-privilege escalation; `X-Device-Key` edge authentication. |
-| **Cloud Persistence (Supabase)** | **Implemented** | PostgREST asynchronous adapter with graceful local in-memory fallback; RLS policies; time-series indexes. |
-| **SCADA Web Dashboard** | **Implemented** | React 18 + Vite + TypeScript; Leaflet GIS mapping; historical telemetry scrubber; incident management modals. |
-| **Mobile Application (Flutter)** | **Planned / In Progress** | Application contracts and initial views defined in `mobile/`; full mobile deployment under development. |
-| **Physical ESP32 Hardware** | **Prototype In Assembly** | Physical sheet-metal flume is being assembled; ESP32 is **not** connected; firmware runs unit tests only; no live water testing performed. |
-
----
+| **Hydraulic Digital Twin & Simulation** | **Implemented** | React-based drainage twin, operational modes, simulated telemetry, hydraulic indicators, and fail-safe software behavior. |
+| **Telemetry Ingestion & State Store** | **Implemented** | FastAPI ingestion, partitioned state, source classification, stale/fault handling, and historical telemetry interfaces. |
+| **Backend API & Health Probes** | **Implemented** | FastAPI modular backend with health, liveness, and readiness endpoints. |
+| **Authentication & Authorization** | **Implemented** | Supabase JWT verification, trusted app_metadata.role extraction, role-aware API access, and protected municipal operations. |
+| **Incident Privacy & Media Handling** | **Implemented** | Server-side response redaction, image validation/re-encoding, and EXIF metadata removal for supported uploads. |
+| **Municipal Operations Dashboard** | **Implemented** | KPI cards, incident queue, filtering, pagination, incident inspection, triage actions, field-team assignment, and audit-history views. |
+| **Durable Incident Auditing** | **Implemented in Application; Cloud Migration Prepared** | Append-only local JSONL journal, Supabase persistence integration, and SQL migration for audit records and transactional triage. Migration 004 is prepared locally and is not represented as applied to production. |
+| **Flutter Mobile Application** | **Active Implementation** | Citizen, municipality, and worker entry flows; authentication/session handling; route guards; citizen reporting and incident views; municipal and worker dashboards; API, location, and media services. |
+| **Physical Prototype** | **Mechanical Preparation Complete; Electronics Integration Pending** | Chassis assembly, component placement, and mounting-hole preparation are complete. Sensors, ESP32, and actuator are not yet fully mounted, wired, and integrated with the backend. |
 
 ## 🏗 System Architecture
 
@@ -115,7 +113,7 @@ flowchart TD
     subgraph PresentationTier["Presentation & Mobile Ecosystem"]
         ReactDashboard["React 18 + Vite Municipal Dashboard (GIS + 3D SCADA Twin)"]
         DigitalTwinComponent["LongitudinalSideDrainTwin (Top, Isometric, Side Views)"]
-        FlutterApp["Unified Flutter Mobile App (In Development)"]
+        FlutterApp["Flutter Mobile App (Citizen, Municipality, Worker)"]
 
         ReactDashboard --> DigitalTwinComponent
     end
@@ -234,16 +232,21 @@ DRAIN-X establishes an unambiguous telemetry source and connection status abstra
 
 ## 🔒 Security Architecture & Governance
 
-- **Edge Device Authentication:** Telemetry ingestion requires `X-Device-Key` header authentication, strictly enforced (fail-closed) in production environments.
+- **Edge Device Authentication:** Telemetry ingestion requires X-Device-Key header authentication, strictly enforced (fail-closed) in production environments.
 - **Cryptographic JWT Verification:**
-  - Modern Supabase Auth asymmetric tokens verified using ECDSA P-256 (`ES256`) against public JWKS fetched exclusively from `{SUPABASE_URL}/auth/v1/.well-known/jwks.json`.
-  - Symmetric HMAC-SHA256 (`HS256`) verification with minimum secret length enforcement ($\ge 16$ characters).
-  - Strict algorithm allowlist: only `ES256` and `HS256` permitted; tokens using `none`, `RS256`, or `RS512` are rejected immediately with 401.
-- **Anti-Privilege Escalation:** Trusted roles (`admin`, `municipality`, `worker`, `service_role`) are extracted strictly from `app_metadata.role` or PostgreSQL role. User-controlled `user_metadata` is explicitly rejected for authorization decisions.
-- **WebSocket Safety Invariant:** Telemetry WebSockets are strictly read-only monitoring channels; any actuation commands attempted over WebSocket frames are rejected with security warning logs and error responses.
+  - Modern Supabase Auth asymmetric tokens verified using ECDSA P-256 (ES256) against the trusted Supabase JWKS endpoint.
+  - Symmetric HMAC-SHA256 (HS256) verification is supported for configured legacy environments.
+  - Strict algorithm allowlisting prevents acceptance of unsupported JWT algorithms.
+- **Trusted Role Claims:** Authorization roles are extracted from trusted app_metadata.role claims (or the relevant PostgreSQL role), not user-editable user_metadata.
+- **Role-Aware Incident Privacy:** Public, citizen, and worker responses redact reporter identity and internal staff notes; privileged municipal roles receive the operational fields required for triage.
+- **Photo Privacy:** Supported JPEG, PNG, and WebP uploads are validated and re-encoded server-side to remove EXIF and other embedded metadata, with image-size safeguards.
+- **Municipal Workflow Authorization:** Incident verification, assignment, reassignment, unassignment, rejection, and status changes are protected by backend role and workflow checks.
+- **Durable Audit Trail:** Municipal workflow actions create incident audit records. The database migration defines append-only audit protection and transactional incident/audit updates.
+- **RPC Privileges:** The prepared migration restricts municipal and citizen incident RPC execution to the backend service_role; clients are expected to use the FastAPI boundary rather than calling these RPCs directly.
+- **WebSocket Safety Invariant:** Telemetry WebSockets are read-only monitoring channels; actuation commands are not accepted over WebSocket frames.
 - **CORS & Origin Isolation:** Dynamic origin validation prevents unauthorized cross-origin requests.
 
----
+> **Database migration status:** database/migrations/004_incident_audits_and_triage.sql is a prepared migration file. It has not been applied to production as part of this repository update. Review and test it against the target Supabase project before applying it.
 
 ## 📖 API Reference
 
@@ -296,21 +299,26 @@ All backend API endpoints are versioned under prefix `/api/v1`:
 
 ## 🗄 Database & Persistence
 
-DRAIN-X uses Supabase PostgreSQL 15 with declarative SQL migrations:
+DRAIN-X uses Supabase PostgreSQL with backend-mediated persistence and role-aware database access.
 
 ### Migration Inventory:
-1. `database/migrations/001_initial_schema.sql`: Core schema for `drainage_sections`, `sensor_metadata`, `sensor_readings`, `sensor_readings_rollup`, `alerts`, `blockage_events`, and `predictions`.
-2. `database/migrations/002_devices_and_mode_history.sql`: Edge `devices` registry, foreign key linkage to `sensor_readings`, operational mode history audit table, and time-series composite indexes.
-3. `database/migrations/003_supabase_rls_and_security.sql`: Row Level Security policies across all 10 tables, least-privilege role boundaries, and composite lookup indexes.
+1. database/migrations/001_initial_schema.sql: Core drainage, sensor, telemetry, alert, blockage, and prediction schema.
+2. database/migrations/002_devices_and_mode_history.sql: Edge-device registry, operational-mode history, and related indexes.
+3. database/migrations/003_supabase_rls_and_security.sql: Row Level Security policies and database security foundations.
+4. database/migrations/004_incident_audits_and_triage.sql: Prepared schema and policy changes for field teams, incidents, append-only incident audits, and municipal triage transactions. **Prepared locally; not yet applied to production.**
 
-### Key Database Indexes:
-- `idx_sensor_readings_sensor_ts`: `(sensor_id, timestamp DESC)`
-- `idx_sensor_readings_source_ts`: `(source, timestamp DESC)`
-- `idx_sensor_readings_composite_lookup`: `(sensor_id, source, timestamp DESC)`
-- `idx_sensor_readings_device_ts`: `(device_id, timestamp DESC)`
-- `idx_mode_history_timestamp`: `(timestamp DESC)`
+### Incident Persistence & Audit Design:
+- The FastAPI backend mediates incident access and municipal workflow operations.
+- Incident audit events are persisted through the application persistence layer, with a local append-only JSONL journal as a durability fallback.
+- The migration defines an append-only audit table and a transaction RPC for incident state changes and corresponding audit insertion.
+- The prepared migration grants direct execution of the incident RPCs to service_role, keeping client access behind the backend API.
 
----
+### Key Telemetry Indexes:
+- idx_sensor_readings_sensor_ts: (sensor_id, timestamp DESC)
+- idx_sensor_readings_source_ts: (source, timestamp DESC)
+- idx_sensor_readings_composite_lookup: (sensor_id, source, timestamp DESC)
+- idx_sensor_readings_device_ts: (device_id, timestamp DESC)
+- idx_mode_history_timestamp: (timestamp DESC)
 
 ## 🚀 Installation & Local Setup
 
@@ -364,42 +372,23 @@ SUPABASE_JWT_SECRET=your-hs256-secret-min-16-chars
 
 ## 🧪 Automated Testing & Quality Verification
 
-DRAIN-X enforces strict quality gates through comprehensive automated test suites across all layers. All testing is conducted software-only without hardware dependencies.
+DRAIN-X includes automated tests across the backend, web frontend, and Flutter application.
 
-### Verified Test Summary (P1.2 Baseline):
-- **Backend Test Suite (Pytest):** **161 passed** in 3.2s
-  - `test_api.py`: 5 passed
-  - `test_authenticated_rls.py`: 6 passed
-  - `test_contracts.py`: 7 passed
-  - `test_esp32_integration.py`: 7 passed
-  - `test_hardware_telemetry_pipeline.py`: 8 passed
-  - `test_hydraulic_and_prediction.py`: 5 passed
-  - `test_incidents_api.py`: 12 passed
-  - `test_jwt_verification.py`: 12 passed
-  - `test_operational_modes.py`: 16 passed
-  - `test_persistence_repository.py`: 5 passed
-  - `test_scenario_benchmark.py`: 5 passed
-  - `test_screening_mechanism.py`: 3 passed
-  - `test_simulation_api.py`: 5 passed
-  - `test_sit_comprehensive.py`: 26 passed
-  - `test_supabase_cloud_integration.py`: 19 passed
-  - `test_telemetry_stream.py`: 13 passed
-  - `test_time_series_analytics.py`: 7 passed
-- **Frontend Test Suite (Vitest):** **77 passed across 10 test suites** in 11.9s
-  - `src/tests/contracts.test.ts`: 5 passed
-  - `src/tests/playbackEngine.test.ts`: 4 passed
-  - `src/tests/client.test.ts`: 9 passed
-  - `src/tests/streamClient.test.ts`: 10 passed
-  - `src/tests/diversionGateTwin.test.tsx`: 7 passed
-  - `src/tests/streamIntegration.test.tsx`: 3 passed
-  - `src/tests/gisDashboard.test.tsx`: 8 passed
-  - `src/tests/citizenAndMunicipal.test.tsx`: 8 passed
-  - `src/tests/historicalPlayback.test.tsx`: 4 passed
-  - `src/tests/longitudinalSideDrainTwin.test.tsx`: 19 passed (including 10 P1.1 regression scenarios)
-- **Frontend Production Build:** Successful compilation with TypeScript check; 1653 modules transformed into 530 kB JS bundle (144 kB gzip).
-- **Total System Test Count:** **238 automated tests passed**.
+### Existing Recorded Baseline:
+The previously documented P1.2 baseline recorded:
+- **Backend:** 161 passing tests.
+- **Frontend:** 77 passing tests across 10 suites.
+- **Combined recorded baseline:** 238 passing tests.
+- **Frontend production build:** Previously verified successfully.
 
----
+### Coverage Added in the Latest Repository Update:
+- Backend incident authorization and privacy tests.
+- Municipal triage, assignment, and dashboard API tests.
+- Photo validation and metadata-sanitization tests.
+- Frontend municipal operations dashboard tests.
+- Flutter authentication, route-guard, session-reliability, citizen-reporting, municipal-dashboard, and triage workflow tests.
+
+> The 238-test figure is the previously recorded baseline, not a fresh total for the latest expanded test suite. Re-run the backend, frontend, and Flutter test commands before publishing a new aggregate test count.
 
 ## ☁️ Deployment Architecture
 
@@ -419,41 +408,36 @@ DRAIN-X is configured for staging hosting across independent cloud tiers:
 - **Frontend SPA:** Deployed on Vercel (`https://drain-x.vercel.app`). Configured via `frontend/vercel.json` with SPA route rewrites and security headers.
 - **Database & Auth:** Supabase Cloud PostgreSQL with connection pooling and automated RLS enforcement.
 
-> [!NOTE]
-> The public URLs above represent the previously staged application baseline. The latest local P1.0.5, P1.1, and P1.2 enhancements are currently held as a local release candidate pending operator synchronization.
-
 ---
 
 ## 🛠 Hardware Status & Prototype Boundary
 
-The physical counterpart of DRAIN-X is an indoor sheet-metal flume modeling an urban drainage channel with a longitudinal side-drain diversion.
+The physical prototype is being prepared as a controlled drainage-channel demonstration model. Software simulation and the physical prototype are treated as separate operating contexts until the edge hardware is fully integrated.
 
 ### Current Physical Boundary:
-- **Assembly State:** Physical sheet-metal flume is currently being fabricated and assembled.
-- **Microcontroller Connection:** The ESP32 is **not** connected to the running backend.
-- **Sensors:** Ultrasonic sensors and Hall-effect flow meters are **not** calibrated on live water channels.
-- **Actuators:** Servomotor gates are **not** executing physical movement under live load.
-- **Testing Standard:** All tests and demonstration workflows run purely in software using synthetic physics, mathematical hydraulic models, and software mocks.
-- **Competition Demonstration:** Hackathon demonstrations operate in software **Demonstration Mode** without requiring live water circulation.
-
----
+- **Mechanical Preparation:** Chassis assembly, component-position planning, and mounting-hole preparation are complete.
+- **Electronics Integration:** Components are not yet all mounted and wired; the ESP32 is not yet connected to the running backend.
+- **Planned Edge Components:** ESP32 DevKit, JSN-SR04T ultrasonic sensor, YF-S201 water-flow sensor, and SG90 servo actuator.
+- **Calibration & Live Validation:** Sensor calibration, end-to-end telemetry verification, and actuator testing under physical operating conditions remain pending.
+- **Demonstration Boundary:** The software can be demonstrated in simulation without circulating water. Simulation output must not be presented as live hardware telemetry.
 
 ## 🗺 Development Roadmap
 
 ```text
-[ COMPLETED ] ================================> P1.0.5, P1.1, P1.2 (Twin Fidelity, Reliability, Backend Audit)
-[ NEXT PHASE ] ===============================> P1.3 (Mock Edge Adapter & Standby Actuator Directives)
-[ PLANNED ] ==================================> P1.4 to P1.5 (Flutter Mobile Suite, Physical Bench Wiring)
-[ FUTURE / EXPLORATORY ] =====================> Post-P2.0 (Computer Vision Silt Classification, Edge SLM)
+[ IMPLEMENTED ] ==============================> Core backend, telemetry, digital twin, and operational modes
+[ IMPLEMENTED ] ==============================> Incident privacy, municipal triage, audit workflows, and role-aware dashboards
+[ ACTIVE DEVELOPMENT ] =======================> Flutter citizen, municipality, and worker application workflows
+[ NEXT ] ======================================> Complete mobile workflow verification and refine API integration
+[ NEXT ] ======================================> Mount, wire, calibrate, and integrate ESP32 sensors and diversion actuator
+[ FUTURE / EXPLORATORY ] ======================> Field validation, computer-vision debris estimation, and edge AI
 ```
 
-### Next Phases:
-1. **P1.3 — Edge Adapter & Mock Ingestion Test Harness:** Standalone Python client simulating ESP32 telemetry with realistic sensor noise and polling actuator directives.
-2. **P1.4 — Unified Flutter Mobile Application:** Completing mobile interfaces for citizen geotagged reporting and municipal worker remediation updates.
-3. **P1.5 — Physical ESP32 Hardware Integration:** Wiring bench sensors, flashing verified PlatformIO firmware, and conducting end-to-end hardware ingestion.
-4. **P2.0 — Edge Vision & AI:** Computer vision debris volume estimation and on-device Small Language Models (SLMs) for municipal field queries.
-
----
+### Next Priorities:
+1. **Mobile Workflow Completion:** Verify end-to-end citizen reporting, municipal triage, and worker task updates against the deployed backend.
+2. **Physical Edge Integration:** Complete component mounting and wiring, validate sensor readings, and connect ESP32 telemetry to the FastAPI ingestion endpoint.
+3. **Hardware Safety & Calibration:** Verify actuator fail-safe behavior and calibrate sensor readings before any live-water or field testing.
+4. **Field Validation:** Evaluate the system under controlled, measured conditions before making claims about real-world municipal deployment.
+5. **Future AI Capabilities:** Explore computer-vision debris estimation and edge inference after the sensing and operational foundations are validated.
 
 ## ⚠️ Project Limitations
 
