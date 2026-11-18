@@ -103,11 +103,30 @@ class PersistenceRepository:
             service_key_from_settings = False
 
         # Cross-project mixing protection:
-        if (not key_from_settings and supabase_key != settings.SUPABASE_KEY) and url_from_settings:
+        # Only non-empty credential overrides should trigger this guard.
+        # Explicit None/empty values disable a credential; they must not
+        # accidentally disable the URL or another valid credential.
+        settings_anon_key = (settings.SUPABASE_KEY or "").strip()
+        settings_service_key = (
+            settings.SUPABASE_SERVICE_ROLE_KEY or ""
+        ).strip()
+
+        if (
+            not key_from_settings
+            and resolved_key
+            and resolved_key != settings_anon_key
+            and url_from_settings
+        ):
             resolved_url = ""
             if service_key_from_settings:
                 resolved_service_key = ""
-        if (not service_key_from_settings and service_role_key != settings.SUPABASE_SERVICE_ROLE_KEY) and url_from_settings:
+
+        if (
+            not service_key_from_settings
+            and resolved_service_key
+            and resolved_service_key != settings_service_key
+            and url_from_settings
+        ):
             resolved_url = ""
             if key_from_settings:
                 resolved_key = ""

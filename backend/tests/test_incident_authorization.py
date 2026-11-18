@@ -662,3 +662,23 @@ def test_supabase_constructor_fallback_scenarios(monkeypatch):
     assert repo7._supabase_url == "https://custom.supabase.co"
     assert repo7._supabase_key == "custom-key-123"
     assert repo7.is_configured is True
+        # 8. Disabling service-role key preserves default anon credentials.
+    repo8 = PersistenceRepository(service_role_key=None)
+    assert repo8._supabase_url == "https://default-project.supabase.co"
+    assert repo8._supabase_key == "default-anon-key"
+    assert repo8._supabase_service_role_key == ""
+    assert repo8.is_configured is True
+
+    # 9. Disabling anon key preserves default service-role credentials.
+    repo9 = PersistenceRepository(supabase_key=None)
+    assert repo9._supabase_url == "https://default-project.supabase.co"
+    assert repo9._supabase_key == ""
+    assert repo9._supabase_service_role_key == "default-service-role-key"
+    assert repo9.is_configured is True
+
+    # 10. Whitespace-normalized matching credentials retain the default URL.
+    repo10 = PersistenceRepository(supabase_key=" default-anon-key ")
+    assert repo10._supabase_url == "https://default-project.supabase.co"
+    assert repo10._supabase_key == "default-anon-key"
+    assert repo10._supabase_service_role_key == "default-service-role-key"
+    assert repo10.is_configured is True

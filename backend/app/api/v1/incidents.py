@@ -658,14 +658,6 @@ def update_incident(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident with ID '{incident_id}' not found",
         )
-
-    # Terminal incidents are immutable for every role.
-    if existing.status in (IncidentStatus.RESOLVED, IncidentStatus.REJECTED):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Resolved or rejected incidents cannot be modified.",
-        )
-
     # Server-side authorization.
     user_role = claims.get("extracted_role", "citizen")
     is_dev_bypass = (
@@ -736,6 +728,12 @@ def update_incident(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Role '{user_role}' is not authorized to update incidents.",
             )
+    # Terminal incidents are immutable for authorized roles too.
+    if existing.status in (IncidentStatus.RESOLVED, IncidentStatus.REJECTED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resolved or rejected incidents cannot be modified.",
+        )
 
     try:
         actor_id = claims.get("sub", "unknown") if claims else "unknown"
