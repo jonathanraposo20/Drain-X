@@ -687,22 +687,33 @@ def update_incident(
                     detail="Field workers may only update incidents assigned to their crew.",
                 )
 
-            # Reject assignment fields even when explicitly supplied as null.
-            protected_assignment_fields = {
+            # Reject assignment, internal notes, and supervisory fields even when explicitly supplied as null.
+            protected_worker_fields = {
                 "assigned_to",
                 "assignment_type",
                 "assigned_team_id",
                 "assigned_worker_id",
+                "internal_notes",
+                "verified_by",
+                "rejection_reason",
             }
 
-            submitted_assignment_fields = (
-                payload.model_fields_set & protected_assignment_fields
+            submitted_protected_fields = (
+                payload.model_fields_set & protected_worker_fields
             )
 
-            if submitted_assignment_fields:
+            if submitted_protected_fields:
+                violating_field = sorted(submitted_protected_fields)[0]
+                if violating_field == "internal_notes":
+                    detail_msg = "Field workers are not permitted to set internal municipal notes."
+                elif violating_field in ("verified_by", "rejection_reason"):
+                    detail_msg = f"Field workers are not permitted to modify supervisory field '{violating_field}'."
+                else:
+                    detail_msg = "Field workers are not permitted to reassign incidents or modify assignment metadata."
+
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Field workers are not permitted to reassign incidents or modify assignment metadata.",
+                    detail=detail_msg,
                 )
 
             if payload.status == IncidentStatus.RESOLVED:
@@ -715,12 +726,6 @@ def update_incident(
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Incident rejection requires municipal supervisor or administrator authorization.",
-                )
-
-            if payload.internal_notes is not None:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Field workers are not permitted to set internal municipal notes.",
                 )
 
         elif user_role in ["municipality", "admin", "service_role"]:

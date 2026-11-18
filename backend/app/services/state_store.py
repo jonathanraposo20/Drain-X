@@ -960,24 +960,33 @@ class StateStore:
                     f"Cannot modify terminal incident '{incident.id}' "
                     f"in status '{incident.status.value}'."
                 )
-            # Workers cannot modify assignment metadata through direct store calls.
+            # Workers cannot modify assignment metadata, internal notes, or supervisory fields through direct store calls.
             if actor_role == "worker":
-                protected_assignment_fields = {
+                protected_worker_fields = {
                     "assigned_to",
                     "assignment_type",
                     "assigned_team_id",
                     "assigned_worker_id",
+                    "internal_notes",
+                    "verified_by",
+                    "rejection_reason",
                 }
 
-                submitted_assignment_fields = (
-                    update.model_fields_set & protected_assignment_fields
+                submitted_protected_fields = (
+                    update.model_fields_set & protected_worker_fields
                 )
 
-                if submitted_assignment_fields:
-                    raise ValueError(
-                        "Field workers are not permitted to reassign incidents "
-                        "or modify assignment metadata."
-                    )
+                if submitted_protected_fields:
+                    violating = sorted(submitted_protected_fields)[0]
+                    if violating in ("assigned_to", "assignment_type", "assigned_team_id", "assigned_worker_id"):
+                        raise ValueError(
+                            "Field workers are not permitted to reassign incidents "
+                            "or modify assignment metadata."
+                        )
+                    elif violating == "internal_notes":
+                        raise ValueError("Field workers are not permitted to set internal municipal notes.")
+                    else:
+                        raise ValueError(f"Field workers are not permitted to modify supervisory field '{violating}'.")
             # 2. Pre-validate status transition before applying ANY field mutations (Atomic Protection)
             if update.status is not None and update.status != incident.status:
                 if not validate_incident_status_transition(incident.status, update.status):
@@ -1026,7 +1035,7 @@ class StateStore:
             if update.municipal_notes is not None:
                 incident.municipal_notes = update.municipal_notes
 
-            if update.internal_notes is not None:
+            if "internal_notes" in update.model_fields_set:
                 incident.internal_notes = update.internal_notes
 
             if update.photos is not None:

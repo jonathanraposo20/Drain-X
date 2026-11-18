@@ -27,7 +27,14 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.core.config import settings
-from app.models.contracts import IncidentCategory, IncidentSeverity, IncidentStatus
+from app.models.contracts import (
+    AssignmentType,
+    IncidentCategory,
+    IncidentResponseContract,
+    IncidentSeverity,
+    IncidentStatus,
+    IncidentUpdateContract,
+)
 from app.services.state_store import state_store
 
 
@@ -371,3 +378,287 @@ def test_auth_disabled_protected_mutation_fails_closed(dev_client: TestClient):
     )
     assert patch_resp.status_code == 503
     assert "Authentication is disabled" in patch_resp.json()["detail"]
+
+
+# ============================================================================
+# P1.3.6.2.4 Hardening & Regression Test Suite
+# ============================================================================
+
+def _worker_headers(sub="worker-alpha-01", team="Team Alpha"):
+    token = _craft_token({
+        "sub": sub,
+        "exp": time.time() + 3600,
+        "app_metadata": {"role": "worker", "team": team},
+        "aud": "authenticated",
+    })
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _muni_headers(sub="muni-supervisor-01"):
+    token = _craft_token({
+        "sub": sub,
+        "exp": time.time() + 3600,
+        "app_metadata": {"role": "municipality"},
+        "aud": "authenticated",
+    })
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_worker_submitting_null_internal_notes_rejected_403(auth_client: TestClient):
+    """TASK 1: Worker submitting {"internal_notes": null} must be rejected with 403."""
+    headers = _worker_headers()
+    response = auth_client.patch(
+        "/api/v1/incidents/INC-DEMO-01",
+        headers=headers,
+        json={"internal_notes": None},
+    )
+    assert response.status_code == 403
+    assert "Field workers are not permitted to set internal municipal notes." in response.json()["detail"]
+
+
+def test_worker_submitting_string_internal_notes_rejected_403(auth_client: TestClient):
+    """TASK 1: Worker submitting {"internal_notes": "..."} must be rejected with 403."""
+    headers = _worker_headers()
+    response = auth_client.patch(
+        "/api/v1/incidents/INC-DEMO-01",
+        headers=headers,
+        json={"internal_notes": "Worker unauthorized internal note."},
+    )
+    assert response.status_code == 403
+    assert "Field workers are not permitted to set internal municipal notes." in response.json()["detail"]
+
+
+def test_worker_submitting_verified_by_null_or_string_rejected_403(auth_client: TestClient):
+    """TASK 1: Worker submitting verified_by (null or string) must be rejected with 403."""
+    headers = _worker_headers()
+    for val in (None, "Worker Self-Verification"):
+        response = auth_client.patch(
+            "/api/v1/incidents/INC-DEMO-01",
+            headers=headers,
+            json={"verified_by": val},
+        )
+        assert response.status_code == 403
+        assert "verified_by" in response.json()["detail"]
+
+
+def test_worker_submitting_rejection_reason_null_or_string_rejected_403(auth_client: TestClient):
+    """TASK 1: Worker submitting rejection_reason (null or string) must be rejected with 403."""
+    headers = _worker_headers()
+    for val in (None, "Worker unauthorized rejection reason"):
+        response = auth_client.patch(
+            "/api/v1/incidents/INC-DEMO-01",
+            headers=headers,
+            json={"rejection_reason": val},
+        )
+        assert response.status_code == 403
+        assert "rejection_reason" in response.json()["detail"]
+
+
+def test_worker_submitting_assignment_fields_null_or_value_rejected_403(auth_client: TestClient):
+    """TASK 1: Worker submitting any assignment field (null or non-null) must be rejected with 403."""
+    headers = _worker_headers()
+    test_cases = [
+        ("assigned_to", None),
+        ("assigned_to", "Team Beta"),
+        ("assignment_type", None),
+        ("assignment_type", "NONE"),
+        ("assigned_team_id", None),
+        ("assigned_team_id", "team-beta"),
+        ("assigned_worker_id", None),
+        ("assigned_worker_id", "worker-rogue"),
+    ]
+    for field_name, value in test_cases:
+        response = auth_client.patch(
+            "/api/v1/incidents/INC-DEMO-01",
+            headers=headers,
+            json={field_name: value},
+        )
+        assert response.status_code == 403
+        assert "Field workers are not permitted to reassign incidents or modify assignment metadata." in response.json()["detail"]
+
+
+def test_worker_omitting_protected_fields_legitimate_update_succeeds(auth_client: TestClient):
+    """TASK 1: Legitimate worker operational update without protected fields succeeds with 200."""
+    headers = _worker_headers()
+    response = auth_client.patch(
+        "/api/v1/incidents/INC-DEMO-01",
+        headers=headers,
+        json={
+            "status": "INVESTIGATING",
+            "municipal_notes": "Crew arrived on scene with jetting machine.",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "INVESTIGATING"
+    assert "Crew arrived" in data["municipal_notes"]
+
+
+def test_direct_statestore_worker_protected_fields_rejected():
+    """TASK 2: Direct StateStore calls with actor_role='worker' reject all protected fields."""
+    protected_cases = [
+        {"assigned_to": None},
+        {"assigned_to": "TEAM-OTHER"},
+        {"assignment_type": AssignmentType.NONE},
+        {"assigned_team_id": None},
+        {"assigned_worker_id": None},
+        {"internal_notes": None},
+        {"internal_notes": "Direct worker internal note"},
+        {"verified_by": None},
+        {"verified_by": "Worker Self"},
+        {"rejection_reason": None},
+        {"rejection_reason": "Worker direct reject"},
+    ]
+    for kwargs in protected_cases:
+        update_contract = IncidentUpdateContract(**kwargs)
+        with pytest.raises(ValueError, match="Field workers are not permitted"):
+            state_store.update_incident(
+                incident_id="INC-DEMO-01",
+                update=update_contract,
+                actor_id="worker-01",
+                actor_role="worker",
+            )
+
+
+def test_municipality_admin_can_update_and_clear_internal_notes(auth_client: TestClient):
+    """TASK 2 & 5: Municipality can update and explicitly clear internal notes."""
+    headers = _muni_headers()
+
+    # Step 1: Set internal note
+    resp1 = auth_client.patch(
+        "/api/v1/incidents/INC-DEMO-01",
+        headers=headers,
+        json={"internal_notes": "Confidential supervisor notes #1234"},
+    )
+    assert resp1.status_code == 200
+    assert resp1.json()["internal_notes"] == "Confidential supervisor notes #1234"
+
+    # Step 2: Clear internal note explicitly by submitting null
+    resp2 = auth_client.patch(
+        "/api/v1/incidents/INC-DEMO-01",
+        headers=headers,
+        json={"internal_notes": None},
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["internal_notes"] is None
+
+
+def test_terminal_incident_immutability_api_and_store(auth_client: TestClient):
+    """TASK 2 & 5: Resolved and rejected incidents are immutable via API (409) and StateStore (ValueError)."""
+    muni = _muni_headers()
+
+    # Create an incident
+    create_resp = auth_client.post("/api/v1/incidents", json={
+        "category": "DRAIN_BLOCKAGE",
+        "description": "Terminal immutability test incident",
+        "latitude": 15.495,
+        "longitude": 73.819,
+    })
+    inc_id = create_resp.json()["id"]
+
+    # Transition to REJECTED (terminal state) via supervisory endpoint
+    rej_resp = auth_client.post(
+        f"/api/v1/incidents/{inc_id}/reject",
+        headers=muni,
+        json={"reason": "Invalid or duplicate complaint"},
+    )
+    assert rej_resp.status_code == 200
+    assert rej_resp.json()["status"] == "REJECTED"
+
+    # Subsequent API PATCH must return 409 Conflict
+    patch_resp = auth_client.patch(
+        f"/api/v1/incidents/{inc_id}",
+        headers=muni,
+        json={"municipal_notes": "Attempt modification after reject"},
+    )
+    assert patch_resp.status_code == 409
+    assert "Resolved or rejected incidents cannot be modified." in patch_resp.json()["detail"]
+
+    # Direct StateStore call must raise ValueError
+    with pytest.raises(ValueError, match="Cannot modify terminal incident"):
+        state_store.update_incident(
+            incident_id=inc_id,
+            update=IncidentUpdateContract(municipal_notes="Store bypass attempt"),
+            actor_id="supervisor-01",
+            actor_role="municipality",
+        )
+
+
+def test_audit_and_persistence_state_isolation():
+    """TASK 3 & 5: Verify autouse fixture cleanly isolates audit ledger and persistence counters."""
+    from app.services.persistence_repository import persistence_repo
+
+    # Check repository counters are cleanly reset at test start
+    assert persistence_repo._total_persisted_count == 0
+    assert persistence_repo._failed_persistence_count == 0
+    assert persistence_repo._last_persistence_error is None
+    assert persistence_repo._connection_status == "UNCONFIGURED"
+
+    # Check device registry retains default device
+    assert "DRAINX-ESP32-NODE-01" in persistence_repo._in_memory_devices
+
+    # Check audit ledger in state store contains only the 4 freshly seeded demo incidents
+    # and no leaked custom test incident IDs from previous tests.
+    assert set(state_store._incident_audits.keys()) == {"INC-DEMO-01", "INC-DEMO-02", "INC-DEMO-03", "INC-DEMO-04"}
+    assert len(state_store.get_incident_audits("INC-CUSTOM-LEAKED-TEST")) == 0
+
+
+def test_supabase_constructor_fallback_scenarios(monkeypatch):
+    """TASK 4 & 5: Verify all 6 constructor scenarios and cross-project credential protection."""
+    from app.services.persistence_repository import PersistenceRepository
+
+    # Configure mock settings
+    monkeypatch.setattr(settings, "SUPABASE_URL", "https://default-project.supabase.co")
+    monkeypatch.setattr(settings, "SUPABASE_KEY", "default-anon-key")
+    monkeypatch.setattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "default-service-role-key")
+
+    # 1. No arguments: falls back to settings
+    repo1 = PersistenceRepository()
+    assert repo1._supabase_url == "https://default-project.supabase.co"
+    assert repo1._supabase_key == "default-anon-key"
+    assert repo1._supabase_service_role_key == "default-service-role-key"
+    assert repo1.is_configured is True
+
+    # 2. All arguments explicitly None: all disabled
+    repo2 = PersistenceRepository(None, None, None)
+    assert repo2._supabase_url == ""
+    assert repo2._supabase_key == ""
+    assert repo2._supabase_service_role_key == ""
+    assert repo2.is_configured is False
+
+    # 3. URL only (custom project): does NOT leak default project keys to custom URL
+    repo3 = PersistenceRepository(supabase_url="https://custom-project.supabase.co")
+    assert repo3._supabase_url == "https://custom-project.supabase.co"
+    assert repo3._supabase_key == ""
+    assert repo3._supabase_service_role_key == ""
+    assert repo3.is_configured is False
+
+    # 4. Public key only (custom key): does NOT attach custom key to default URL
+    repo4 = PersistenceRepository(supabase_key="custom-anon-key")
+    assert repo4._supabase_url == ""
+    assert repo4._supabase_key == "custom-anon-key"
+    assert repo4._supabase_service_role_key == ""
+    assert repo4.is_configured is False
+
+    # 5. Service-role key only (custom key): does NOT attach custom service key to default URL
+    repo5 = PersistenceRepository(service_role_key="custom-service-role-key")
+    assert repo5._supabase_url == ""
+    assert repo5._supabase_key == ""
+    assert repo5._supabase_service_role_key == "custom-service-role-key"
+    assert repo5.is_configured is False
+
+    # 6. Explicit empty strings
+    repo6 = PersistenceRepository("", "")
+    assert repo6._supabase_url == ""
+    assert repo6._supabase_key == ""
+    assert repo6._supabase_service_role_key == ""
+    assert repo6.is_configured is False
+
+    # 7. Coherent custom pairing: custom URL + custom key works properly
+    repo7 = PersistenceRepository(
+        supabase_url="https://custom.supabase.co",
+        supabase_key="custom-key-123",
+    )
+    assert repo7._supabase_url == "https://custom.supabase.co"
+    assert repo7._supabase_key == "custom-key-123"
+    assert repo7.is_configured is True

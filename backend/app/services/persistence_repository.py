@@ -61,37 +61,60 @@ class PersistenceRepository:
         service_role_key: Any = _UNSET,
         timeout_sec: Optional[float] = None,
     ):
-        # Distinguish omitted arguments from explicitly supplied None values.
-        explicit_config = any(
-            value is not _UNSET
-            for value in (supabase_url, supabase_key, service_role_key)
-        )
-
-        if explicit_config:
-            self._supabase_url = (
-                "" if supabase_url is _UNSET or supabase_url is None
-                else str(supabase_url)
-            ).rstrip("/")
-
-            self._supabase_key = (
-                "" if supabase_key is _UNSET or supabase_key is None
-                else str(supabase_key)
-            ).strip()
-
-            self._supabase_service_role_key = (
-                "" if service_role_key is _UNSET or service_role_key is None
-                else str(service_role_key)
-            ).strip()
+        # Resolve each configuration property independently:
+        # - If argument is omitted (_UNSET), fall back to settings.
+        # - If argument is explicitly None or empty string, treat as disabled/empty.
+        # - Guard against cross-project mixing: if a custom URL is provided, do not
+        #   implicitly leak default settings keys to that foreign URL; and vice-versa.
+        if supabase_url is _UNSET:
+            resolved_url = (settings.SUPABASE_URL or "").rstrip("/")
+            url_from_settings = True
+        elif supabase_url is None:
+            resolved_url = ""
+            url_from_settings = False
         else:
-            self._supabase_url = (
-                settings.SUPABASE_URL or ""
-            ).rstrip("/")
-            self._supabase_key = (
-                settings.SUPABASE_KEY or ""
-            ).strip()
-            self._supabase_service_role_key = (
-                settings.SUPABASE_SERVICE_ROLE_KEY or ""
-            ).strip()
+            resolved_url = str(supabase_url).rstrip("/")
+            url_from_settings = False
+
+        if supabase_key is _UNSET:
+            if url_from_settings or resolved_url == (settings.SUPABASE_URL or "").rstrip("/"):
+                resolved_key = (settings.SUPABASE_KEY or "").strip()
+            else:
+                resolved_key = ""
+            key_from_settings = True
+        elif supabase_key is None:
+            resolved_key = ""
+            key_from_settings = False
+        else:
+            resolved_key = str(supabase_key).strip()
+            key_from_settings = False
+
+        if service_role_key is _UNSET:
+            if url_from_settings or resolved_url == (settings.SUPABASE_URL or "").rstrip("/"):
+                resolved_service_key = (settings.SUPABASE_SERVICE_ROLE_KEY or "").strip()
+            else:
+                resolved_service_key = ""
+            service_key_from_settings = True
+        elif service_role_key is None:
+            resolved_service_key = ""
+            service_key_from_settings = False
+        else:
+            resolved_service_key = str(service_role_key).strip()
+            service_key_from_settings = False
+
+        # Cross-project mixing protection:
+        if (not key_from_settings and supabase_key != settings.SUPABASE_KEY) and url_from_settings:
+            resolved_url = ""
+            if service_key_from_settings:
+                resolved_service_key = ""
+        if (not service_key_from_settings and service_role_key != settings.SUPABASE_SERVICE_ROLE_KEY) and url_from_settings:
+            resolved_url = ""
+            if key_from_settings:
+                resolved_key = ""
+
+        self._supabase_url = resolved_url
+        self._supabase_key = resolved_key
+        self._supabase_service_role_key = resolved_service_key
 
         self._timeout_sec = timeout_sec or settings.PERSISTENCE_TIMEOUT_SEC
 
