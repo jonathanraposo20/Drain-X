@@ -1,4 +1,4 @@
-"""
+﻿"""
 DRAIN-X Database Persistence Layer Interface & Supabase Cloud Client Adapter.
 
 Milestone: P0.6 Supabase Cloud Integration.
@@ -33,7 +33,7 @@ from app.core.config import settings
 from app.models.contracts import SensorReadingContract, DataSource
 
 logger = logging.getLogger("drainx.persistence")
-
+_UNSET = object()
 
 class DatabaseConfigStatus(BaseModel):
     configured: bool
@@ -54,26 +54,54 @@ class PersistenceRepository:
     Modular persistence client interfacing FastAPI with Supabase Cloud PostgREST.
     Operates in fallback/mock mode when unconfigured.
     """
-
     def __init__(
         self,
-        supabase_url: Optional[str] = None,
-        supabase_key: Optional[str] = None,
-        service_role_key: Optional[str] = None,
+        supabase_url: Any = _UNSET,
+        supabase_key: Any = _UNSET,
+        service_role_key: Any = _UNSET,
         timeout_sec: Optional[float] = None,
     ):
-        self._supabase_url = (supabase_url or settings.SUPABASE_URL or "").rstrip("/")
-        self._supabase_key = (supabase_key or settings.SUPABASE_KEY or "").strip()
-        self._supabase_service_role_key = (
-            service_role_key or settings.SUPABASE_SERVICE_ROLE_KEY or ""
-        ).strip()
+        # Distinguish omitted arguments from explicitly supplied None values.
+        explicit_config = any(
+            value is not _UNSET
+            for value in (supabase_url, supabase_key, service_role_key)
+        )
+
+        if explicit_config:
+            self._supabase_url = (
+                "" if supabase_url is _UNSET or supabase_url is None
+                else str(supabase_url)
+            ).rstrip("/")
+
+            self._supabase_key = (
+                "" if supabase_key is _UNSET or supabase_key is None
+                else str(supabase_key)
+            ).strip()
+
+            self._supabase_service_role_key = (
+                "" if service_role_key is _UNSET or service_role_key is None
+                else str(service_role_key)
+            ).strip()
+        else:
+            self._supabase_url = (
+                settings.SUPABASE_URL or ""
+            ).rstrip("/")
+            self._supabase_key = (
+                settings.SUPABASE_KEY or ""
+            ).strip()
+            self._supabase_service_role_key = (
+                settings.SUPABASE_SERVICE_ROLE_KEY or ""
+            ).strip()
+
         self._timeout_sec = timeout_sec or settings.PERSISTENCE_TIMEOUT_SEC
 
-        # Active authentication key: prefer service_role_key for backend if available
-        self._active_key = self._supabase_service_role_key or self._supabase_key
-        self._is_configured = bool(self._supabase_url and self._active_key)
+        self._active_key = (
+            self._supabase_service_role_key or self._supabase_key
+        )
+        self._is_configured = bool(
+            self._supabase_url and self._active_key
+        )
 
-        # In-memory storage buffers for fallback / local development
         self._in_memory_records: List[Dict[str, Any]] = []
         self._mode_history_records: List[Dict[str, Any]] = []
         self._in_memory_devices: Dict[str, Dict[str, Any]] = {
@@ -93,8 +121,14 @@ class PersistenceRepository:
         self._last_persistence_error: Optional[str] = None
         self._total_persisted_count: int = 0
         self._failed_persistence_count: int = 0
-        self._connection_status: str = "UNCONFIGURED" if not self._is_configured else "CONFIGURED_UNCHECKED"
+        self._connection_status: str = (
+            "UNCONFIGURED"
+            if not self._is_configured
+            else "CONFIGURED_UNCHECKED"
+        )
         self._last_ping_ms: Optional[float] = None
+
+
 
     @property
     def is_configured(self) -> bool:

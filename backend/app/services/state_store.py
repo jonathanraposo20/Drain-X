@@ -951,13 +951,33 @@ class StateStore:
             # Snapshot incident for atomic rollback in case of audit persistence failure
             incident_snapshot = incident.model_copy(deep=True)
 
-            # 1. Terminal State Lockdown: Resolved and Rejected tickets cannot be mutated
-            if incident.status in (IncidentStatus.RESOLVED, IncidentStatus.REJECTED):
-                if update.status is not None and update.status != incident.status:
-                    raise ValueError(f"Cannot transition terminal incident '{incident.id}' in status '{incident.status.value}'.")
-                if update.assigned_to is not None and update.assigned_to != incident.assigned_to:
-                    raise ValueError(f"Cannot modify assignment for terminal incident '{incident.id}' in status '{incident.status.value}'.")
+            # Terminal incidents are completely immutable through ordinary updates.
+            if incident.status in (
+                IncidentStatus.RESOLVED,
+                IncidentStatus.REJECTED,
+            ):
+                raise ValueError(
+                    f"Cannot modify terminal incident '{incident.id}' "
+                    f"in status '{incident.status.value}'."
+                )
+            # Workers cannot modify assignment metadata through direct store calls.
+            if actor_role == "worker":
+                protected_assignment_fields = {
+                    "assigned_to",
+                    "assignment_type",
+                    "assigned_team_id",
+                    "assigned_worker_id",
+                }
 
+                submitted_assignment_fields = (
+                    update.model_fields_set & protected_assignment_fields
+                )
+
+                if submitted_assignment_fields:
+                    raise ValueError(
+                        "Field workers are not permitted to reassign incidents "
+                        "or modify assignment metadata."
+                    )
             # 2. Pre-validate status transition before applying ANY field mutations (Atomic Protection)
             if update.status is not None and update.status != incident.status:
                 if not validate_incident_status_transition(incident.status, update.status):

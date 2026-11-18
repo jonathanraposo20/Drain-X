@@ -571,7 +571,49 @@ def test_atomic_status_transition_prevents_partial_mutation(auth_client: TestCli
     current = state_store.get_incident(inc_id)
     assert current.status == IncidentStatus.REPORTED
     assert current.severity == orig_severity
+def test_worker_cannot_modify_assignment_through_state_store(
+    isolated_state_store,
+):
+    """Direct StateStore calls must also reject worker assignment changes."""
+    from app.models.contracts import IncidentResponseContract
 
+    incident = IncidentResponseContract(
+        id="INC-STORE-WORKER-001",
+        category=IncidentCategory.DRAIN_BLOCKAGE,
+        description="Direct StateStore worker authorization test.",
+        latitude=15.491,
+        longitude=73.820,
+        severity=IncidentSeverity.MEDIUM,
+        assigned_to="TEAM-ALPHA",
+        assignment_type=AssignmentType.INDIVIDUAL,
+        assigned_team_id="TEAM-ALPHA",
+        assigned_worker_id="worker-lead-01",
+    )
+
+    isolated_state_store.create_incident(incident)
+
+    protected_updates = [
+        IncidentUpdateContract(assigned_to=None),
+        IncidentUpdateContract(assignment_type=AssignmentType.NONE),
+        IncidentUpdateContract(assigned_team_id=None),
+        IncidentUpdateContract(assigned_worker_id=None),
+        IncidentUpdateContract(assigned_worker_id="worker-other-99"),
+    ]
+
+    for update in protected_updates:
+        with pytest.raises(ValueError, match="not permitted to reassign"):
+            isolated_state_store.update_incident(
+                incident_id=incident.id,
+                update=update,
+                actor_id="worker-lead-01",
+                actor_role="worker",
+            )
+
+    unchanged = isolated_state_store.get_incident(incident.id)
+    assert unchanged.assigned_to == "TEAM-ALPHA"
+    assert unchanged.assignment_type == AssignmentType.INDIVIDUAL
+    assert unchanged.assigned_team_id == "TEAM-ALPHA"
+    assert unchanged.assigned_worker_id == "worker-lead-01"
 
 def test_terminal_incidents_strictly_reject_reassignment_or_unassignment(auth_client: TestClient):
     """P1.3.6.2.1 Phase C: Terminal states (RESOLVED, REJECTED) reject assign/reassign/unassign with 400."""
@@ -671,6 +713,33 @@ def test_individual_worker_assignment_authorization(auth_client: TestClient):
     )
     assert update_1.status_code == 200
     assert update_1.json()["status"] == "INVESTIGATING"
+
+        # Assigned worker cannot modify any assignment field, even with explicit null.
+    protected_fields = [
+        "assigned_to",
+        "assignment_type",
+        "assigned_team_id",
+        "assigned_worker_id",
+    ]
+
+    for field in protected_fields:
+        response = auth_client.patch(
+            f"/api/v1/incidents/{inc_id}",
+            headers=worker_1_headers,
+            json={field: None},
+        )
+
+        assert response.status_code == 403, (
+            f"Worker unexpectedly modified assignment field: {field}"
+        )
+
+    # Worker cannot change assignment metadata to another non-null value either.
+    response = auth_client.patch(
+        f"/api/v1/incidents/{inc_id}",
+        headers=worker_1_headers,
+        json={"assigned_worker_id": "worker-other-99"},
+    )
+    assert response.status_code == 403
 
     # Unauthorized worker 2 from Team Beta cannot update (403 Forbidden)
     update_2 = auth_client.patch(

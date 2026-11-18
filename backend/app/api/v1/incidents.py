@@ -308,6 +308,7 @@ def verify_incident(
     Transitions incident status to VERIFIED, optionally re-prioritizes severity,
     and logs durable municipal triage verification notes.
     """
+
     existing = state_store.get_incident(incident_id)
     if not existing:
         raise HTTPException(
@@ -637,6 +638,7 @@ def get_incident_audit_trail(
     return audits
 
 
+
 @router.patch("/{incident_id}", response_model=IncidentResponseContract)
 def update_incident(
     incident_id: str,
@@ -644,13 +646,11 @@ def update_incident(
     claims: Dict[str, Any] = Depends(get_current_user_claims),
 ) -> IncidentResponseContract:
     """
-    Update an incident status, assignment, or municipal dispatch notes.
-    Enforces server-side role and assignment authorization:
-    - Citizen: Denied all mutations (403 Forbidden).
-    - Municipality / Admin: Full triage, assignment, and resolution permissions.
-    - Worker: May only update incidents assigned to their specific crew/identity;
-              cannot reassign teams or perform final resolution.
-    Rejects invalid state machine transitions with 400 Bad Request.
+    Update an incident through the ordinary PATCH endpoint.
+
+    Resolved and rejected incidents are immutable.
+    Workers may update permitted operational fields but cannot modify
+    assignment metadata, resolve/reject incidents, or set internal notes.
     """
     existing = state_store.get_incident(incident_id)
     if not existing:
@@ -659,9 +659,19 @@ def update_incident(
             detail=f"Incident with ID '{incident_id}' not found",
         )
 
-    # Server-Side Authorization Check
+    # Terminal incidents are immutable for every role.
+    if existing.status in (IncidentStatus.RESOLVED, IncidentStatus.REJECTED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resolved or rejected incidents cannot be modified.",
+        )
+
+    # Server-side authorization.
     user_role = claims.get("extracted_role", "citizen")
-    is_dev_bypass = claims.get("is_dev_bypass", False) and settings.ENVIRONMENT != "production"
+    is_dev_bypass = (
+        claims.get("is_dev_bypass", False)
+        and settings.ENVIRONMENT != "production"
+    )
 
     if not is_dev_bypass:
         if user_role == "citizen":
@@ -669,44 +679,53 @@ def update_incident(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Citizens are not authorized to triage, assign, or update incidents.",
             )
+
         elif user_role == "worker":
-            # 1. Crew tenancy / assignment validation
             if not _is_worker_assigned_to_incident(claims, existing):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Field workers may only update incidents assigned to their crew.",
                 )
 
-            # 2. Reassignment restriction: Worker cannot reassign incident
-            if payload.assigned_to is not None and payload.assigned_to != existing.assigned_to:
+            # Reject assignment fields even when explicitly supplied as null.
+            protected_assignment_fields = {
+                "assigned_to",
+                "assignment_type",
+                "assigned_team_id",
+                "assigned_worker_id",
+            }
+
+            submitted_assignment_fields = (
+                payload.model_fields_set & protected_assignment_fields
+            )
+
+            if submitted_assignment_fields:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Field workers are not permitted to reassign incidents.",
+                    detail="Field workers are not permitted to reassign incidents or modify assignment metadata.",
                 )
 
-            # 3. Resolution restriction: Only municipality/admin can resolve
             if payload.status == IncidentStatus.RESOLVED:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Incident resolution requires municipal supervisor or administrator authorization.",
                 )
 
-            # 4. Rejection restriction: Only municipality/admin can reject
             if payload.status == IncidentStatus.REJECTED:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Incident rejection requires municipal supervisor or administrator authorization.",
                 )
 
-            # 5. Internal notes restriction: Only municipality/admin can set internal notes
             if payload.internal_notes is not None:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Field workers are not permitted to set internal municipal notes.",
                 )
+
         elif user_role in ["municipality", "admin", "service_role"]:
-            # Authorized for full municipal triage, assignment, and resolution
             pass
+
         else:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -715,23 +734,28 @@ def update_incident(
 
     try:
         actor_id = claims.get("sub", "unknown") if claims else "unknown"
+
         updated = state_store.update_incident(
             incident_id=incident_id,
             update=payload,
             actor_id=actor_id,
             actor_role=user_role,
         )
+
         if not updated:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Incident with ID '{incident_id}' not found",
             )
+
         return _filter_incident_for_role(updated, claims)
+
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         )
+
 
 
 @router.post("/{incident_id}/photos", response_model=IncidentResponseContract)

@@ -56,13 +56,28 @@ def sample_png_bytes():
 
 
 @pytest.fixture(autouse=True)
-def reset_state_store():
-    """Reset global state store between tests for full test isolation."""
+def reset_state_store(monkeypatch):
+    """Reset application state and isolate the global persistence repository."""
+    from app.services.persistence_repository import persistence_repo
+
+    # Prevent tests from contacting Supabase unless they explicitly enable
+    # and mock cloud persistence.
+    monkeypatch.setattr(persistence_repo, "_is_configured", False)
+
+    # Clear repository buffers between tests.
+    persistence_repo._in_memory_records.clear()
+    persistence_repo._mode_history_records.clear()
+
     state_store.clear()
     state_store.set_mode("SIMULATION", reason="Test reset")
+
     yield
+
     state_store.clear()
     state_store.set_mode("SIMULATION", reason="Test teardown")
+
+    persistence_repo._in_memory_records.clear()
+    persistence_repo._mode_history_records.clear()
 
 
 @pytest.fixture

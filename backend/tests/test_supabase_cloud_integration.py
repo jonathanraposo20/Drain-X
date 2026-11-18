@@ -260,7 +260,11 @@ async def test_supabase_historical_query_formatting():
 @pytest.mark.anyio
 async def test_in_memory_pagination_and_truncation():
     """Verify in-memory fallback correctly handles offset and limit pagination."""
-    repo = PersistenceRepository()
+    repo = PersistenceRepository(
+    supabase_url=None,
+    supabase_key=None,
+    service_role_key=None,
+)
 
     t_base = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
     readings = []
