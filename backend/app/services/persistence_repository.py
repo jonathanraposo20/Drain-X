@@ -740,8 +740,8 @@ class PersistenceRepository:
         audit_id: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        Executes atomic server-side PostgreSQL stored procedure municipal_incident_transaction_rpc via Supabase RPC.
-        Atomically updates the incident, inserts the audit entry, and returns the updated incident.
+        Executes the atomic municipal incident and audit transaction.
+        Configured cloud failures raise instead of falling back to separate writes.
         """
         if not self._is_configured:
             return None
@@ -765,6 +765,7 @@ class PersistenceRepository:
             "p_reason": reason,
             "p_audit_id": audit_id,
         }
+
         try:
             with httpx.Client(timeout=self._timeout_sec) as client:
                 resp = client.post(
@@ -772,15 +773,23 @@ class PersistenceRepository:
                     json=payload,
                     headers=self._get_headers(),
                 )
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.warning(f"Supabase RPC incident transaction failed with HTTP {resp.status_code}: {resp.text}")
-                return None
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"Municipal incident RPC failed with HTTP {resp.status_code}: {resp.text}"
+                    )
+
+                result = resp.json()
+                if not isinstance(result, dict) or result.get("id") != incident_id:
+                    raise RuntimeError(
+                        f"Municipal incident RPC returned an invalid response for '{incident_id}'."
+                    )
+
+                return result
         except Exception as exc:
-            logger.warning(f"Supabase RPC incident transaction network error: {exc}")
-            return None
-
-
+            logger.error("Municipal incident RPC failed for %s: %s", incident_id, exc)
+            raise RuntimeError(
+                f"Atomic municipal cloud transaction failed for incident '{incident_id}'."
+            ) from exc
 
     def execute_citizen_incident_creation_sync(
         self,
@@ -798,14 +807,22 @@ class PersistenceRepository:
         """
         Executes the atomic citizen incident creation RPC.
 
-        Returns None only when Supabase explicitly reports that the RPC
-        does not exist (PGRST202), allowing a controlled legacy fallback.
-        All other failures abort creation.
+        The RPC atomically creates the incident and its initial audit record.
+
+        Returns the persisted incident only after validating the response.
+        Never falls back to separate incident and audit writes.
+
+        Returns None only when Supabase is not configured. Callers must
+        handle that case separately as local development mode.
         """
         if not self._is_configured:
             return None
 
-        endpoint = f"{self._supabase_url}/rest/v1/rpc/citizen_incident_creation_rpc"
+        endpoint = (
+            f"{self._supabase_url}/rest/v1/rpc/"
+            "citizen_incident_creation_rpc"
+        )
+
         payload = {
             "p_incident_id": incident_id,
             "p_category": category,
@@ -828,35 +845,77 @@ class PersistenceRepository:
                 )
 
                 if resp.status_code == 200:
-                    return resp.json()
+                    try:
+                        result = resp.json()
+                    except ValueError as exc:
+                        logger.error(
+                            "Citizen incident RPC returned invalid JSON."
+                        )
+                        raise RuntimeError(
+                            "Citizen incident RPC returned invalid JSON."
+                        ) from exc
+
+                    if (
+                        not isinstance(result, dict)
+                        or result.get("id") != incident_id
+                    ):
+                        logger.error(
+                            "Citizen incident RPC returned an invalid "
+                            "incident response for ID %s.",
+                            incident_id,
+                        )
+                        raise RuntimeError(
+                            "Citizen incident RPC did not confirm "
+                            "the requested incident."
+                        )
+
+                    return result
 
                 try:
                     error_body = resp.json()
                 except ValueError:
                     error_body = {}
 
-                error_code = error_body.get("code")
+                error_code = (
+                    error_body.get("code")
+                    if isinstance(error_body, dict)
+                    else None
+                )
 
-                if resp.status_code == 404 and error_code == "PGRST202":
-                    logger.warning(
-                        "Citizen incident RPC is missing. "
-                        "Controlled direct-insert fallback may be used."
+                if (
+                    resp.status_code == 404
+                    and error_code == "PGRST202"
+                ):
+                    logger.error(
+                        "Citizen incident RPC is unavailable. "
+                        "Refusing non-atomic persistence fallback."
                     )
-                    return None
+                    raise RuntimeError(
+                        "Citizen incident creation RPC is unavailable. "
+                        "Check the Supabase function and PostgREST schema cache."
+                    )
 
                 logger.error(
                     "Supabase citizen creation RPC failed: "
-                    f"HTTP {resp.status_code}, response: {resp.text}"
+                    "HTTP %s, response: %s",
+                    resp.status_code,
+                    resp.text,
                 )
+
                 raise RuntimeError(
-                    f"Citizen incident RPC failed with HTTP {resp.status_code}."
+                    f"Citizen incident RPC failed with HTTP "
+                    f"{resp.status_code}."
                 )
 
         except httpx.RequestError as exc:
-            logger.error(f"Citizen incident RPC network error: {exc}")
+            logger.error(
+                "Citizen incident RPC network error: %s",
+                exc,
+            )
             raise RuntimeError(
                 "Citizen incident RPC could not be reached."
             ) from exc
+
 
 
 # Global persistence client instance

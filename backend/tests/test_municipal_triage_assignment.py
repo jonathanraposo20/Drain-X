@@ -873,20 +873,15 @@ def test_atomic_cloud_citizen_creation_rpc(auth_client: TestClient):
     """P1.3.6.2.3.1 Phase 3: Citizen incident creation calls atomic cloud creation RPC."""
     from app.services.persistence_repository import persistence_repo
 
-    mock_rpc_return = {
-        "id": "INC-CITIZEN-ATOMIC-01",
-        "category": "DRAIN_BLOCKAGE",
-        "description": "Blockage for citizen RPC atomicity test.",
-        "latitude": 15.498,
-        "longitude": 73.821,
-        "severity": "MEDIUM",
-        "status": "REPORTED",
-        "source": "CITIZEN",
-        "reporter_name": "Goa Citizen",
-    }
+    def mock_citizen_rpc(**kwargs):
+        return {"id": kwargs["incident_id"]}
 
     with patch.object(persistence_repo, "_is_configured", True), \
-         patch.object(persistence_repo, "execute_citizen_incident_creation_sync", return_value=mock_rpc_return) as mock_rpc:
+         patch.object(
+             persistence_repo,
+             "execute_citizen_incident_creation_sync",
+             side_effect=mock_citizen_rpc,
+         ) as mock_rpc:
         create_resp = auth_client.post("/api/v1/incidents", json={
             "category": "DRAIN_BLOCKAGE",
             "description": "Blockage for citizen RPC atomicity test.",
@@ -895,13 +890,14 @@ def test_atomic_cloud_citizen_creation_rpc(auth_client: TestClient):
             "source": "CITIZEN",
             "reporter_name": "Goa Citizen",
         })
+
         assert create_resp.status_code == 201
         assert mock_rpc.called
+
         call_kwargs = mock_rpc.call_args.kwargs
         assert call_kwargs["category"] == "DRAIN_BLOCKAGE"
         assert call_kwargs["reporter_name"] == "Goa Citizen"
         assert call_kwargs["audit_id"].startswith("AUD-")
-
 
 def test_atomic_cloud_municipal_transaction_rpc(auth_client: TestClient):
     """P1.3.6.2.3.1 Phase 2: Municipal assignment invokes municipal_incident_transaction_rpc atomically."""

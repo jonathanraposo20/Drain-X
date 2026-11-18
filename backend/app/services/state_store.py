@@ -681,6 +681,7 @@ class StateStore:
                         )
 
 
+
     def create_incident(self, incident: IncidentResponseContract) -> IncidentResponseContract:
         with self._lock:
             audit = IncidentAuditContract(
@@ -695,50 +696,51 @@ class StateStore:
 
             from app.services.persistence_repository import persistence_repo
 
+            # Configured cloud persistence must use the atomic RPC.
+            # Never fall back to separate incident and audit writes.
             if persistence_repo.is_configured:
                 cloud_res = persistence_repo.execute_citizen_incident_creation_sync(
                     incident_id=incident.id,
-                    category=incident.category.value if hasattr(incident.category, "value") else str(incident.category),
+                    category=(
+                        incident.category.value
+                        if hasattr(incident.category, "value")
+                        else str(incident.category)
+                    ),
                     description=incident.description,
                     latitude=incident.latitude,
                     longitude=incident.longitude,
-                    severity=incident.severity.value if hasattr(incident.severity, "value") else str(incident.severity),
-                    source=incident.source.value if hasattr(incident.source, "value") else str(incident.source),
+                    severity=(
+                        incident.severity.value
+                        if hasattr(incident.severity, "value")
+                        else str(incident.severity)
+                    ),
+                    source=(
+                        incident.source.value
+                        if hasattr(incident.source, "value")
+                        else str(incident.source)
+                    ),
                     reporter_name=incident.reporter_name or "Citizen Anonymous",
                     photos=incident.photos,
                     audit_id=audit.audit_id,
                 )
 
-                if cloud_res is None:
-                    # Controlled fallback only when the RPC is confirmed missing.
-                    inc_dict = incident.model_dump(mode="json")
-                    audit_dict = audit.model_dump(mode="json")
-
-                    incident_persisted = persistence_repo.persist_incident_sync(
-                        inc_dict
+                if (
+                    not isinstance(cloud_res, dict)
+                    or cloud_res.get("id") != incident.id
+                ):
+                    raise RuntimeError(
+                        "Citizen incident creation was not confirmed "
+                        "by Supabase. Local incident creation aborted."
                     )
 
-                    if not incident_persisted:
-                        if self._audit_durability.is_cloud_environment():
-                            raise RuntimeError(
-                                f"Cloud incident persistence failed for '{incident.id}'."
-                            )
-                    else:
-                        audit_persisted = persistence_repo.persist_incident_audit_sync(
-                            audit_dict
-                        )
-
-                        if not audit_persisted and self._audit_durability.is_cloud_environment():
-                            raise RuntimeError(
-                                f"Cloud audit persistence failed for incident '{incident.id}'."
-                            )
-
-            # Local durable journaling
+            # Only update local state after successful cloud persistence,
+            # or when running without Supabase in local development.
             self._audit_durability.append_audit(audit)
             self._incidents[incident.id] = incident
             self._incident_audits[incident.id] = [audit]
 
             return incident
+
 
 
 
@@ -1109,15 +1111,12 @@ class StateStore:
                     reason=action_reason or update.rejection_reason or update.municipal_notes,
                     audit_id=audit_entry.audit_id,
                 )
-                if not rpc_result:
-                    # Direct PostgREST synchronization fallback
-                    inc_persisted = persistence_repo.persist_incident_sync(incident.model_dump(mode="json"))
-                    audit_persisted = persistence_repo.persist_incident_audit_sync(audit_entry.model_dump(mode="json"))
-                    if self._audit_durability.is_cloud_environment() and (not inc_persisted or not audit_persisted):
-                        # Fail closed in true cloud environment
-                        self._incidents[incident_id] = incident_snapshot
-                        raise RuntimeError(f"Cloud transaction failed for municipal mutation on incident '{incident_id}'. Operation aborted.")
-
+                if not isinstance(rpc_result, dict) or rpc_result.get("id") != incident.id:
+                    self._incidents[incident_id] = incident_snapshot
+                    raise RuntimeError(
+                        f"Atomic municipal cloud transaction failed or returned an invalid incident "
+                        f"for '{incident_id}'. Operation aborted."
+                    )
             # Atomicity guarantee: Attempt durable local journal append
             append_ok = self._audit_durability.append_audit(audit_entry)
             if not append_ok:

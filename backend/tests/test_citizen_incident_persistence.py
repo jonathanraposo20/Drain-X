@@ -49,41 +49,41 @@ def configure_repository(monkeypatch):
     monkeypatch.setattr(persistence_repo, "_is_configured", True)
 
 
-def test_missing_rpc_uses_controlled_fallback(
+
+def test_missing_rpc_aborts_without_non_atomic_fallback(
     monkeypatch,
     incident_store,
     citizen_incident,
 ):
     configure_repository(monkeypatch)
 
-    rpc = monkeypatch.setattr(
+    monkeypatch.setattr(
         persistence_repo,
         "execute_citizen_incident_creation_sync",
         lambda **kwargs: None,
     )
 
-    incident_persist = monkeypatch.setattr(
-        persistence_repo,
-        "persist_incident_sync",
-        lambda payload: True,
-    )
-
-    audit_persist = monkeypatch.setattr(
-        persistence_repo,
-        "persist_incident_audit_sync",
-        lambda payload: True,
-    )
+    incident_writes = []
+    audit_writes = []
 
     monkeypatch.setattr(
-        incident_store._audit_durability,
-        "is_cloud_environment",
-        lambda: False,
+        persistence_repo,
+        "persist_incident_sync",
+        lambda payload: incident_writes.append(payload) or True,
+    )
+    monkeypatch.setattr(
+        persistence_repo,
+        "persist_incident_audit_sync",
+        lambda payload: audit_writes.append(payload) or True,
     )
 
-    result = incident_store.create_incident(citizen_incident)
+    with pytest.raises(RuntimeError, match="not confirmed"):
+        incident_store.create_incident(citizen_incident)
 
-    assert result.id == citizen_incident.id
-    assert citizen_incident.id in incident_store._incidents
+    assert incident_writes == []
+    assert audit_writes == []
+    assert citizen_incident.id not in incident_store._incidents
+
 
 
 def test_unexpected_rpc_error_aborts_creation(
@@ -108,82 +108,38 @@ def test_unexpected_rpc_error_aborts_creation(
     assert citizen_incident.id not in incident_store._incidents
 
 
-def test_cloud_incident_persistence_failure_aborts_creation(
+
+def test_cloud_incident_rpc_failure_aborts_creation(
     monkeypatch,
     incident_store,
     citizen_incident,
 ):
     configure_repository(monkeypatch)
 
+    def fail_rpc(**kwargs):
+        raise RuntimeError("Citizen incident RPC unavailable")
+
     monkeypatch.setattr(
         persistence_repo,
         "execute_citizen_incident_creation_sync",
-        lambda **kwargs: None,
+        fail_rpc,
     )
 
     monkeypatch.setattr(
         persistence_repo,
         "persist_incident_sync",
-        lambda payload: False,
+        lambda payload: pytest.fail("Non-atomic incident fallback called"),
     )
-
-    audit_calls = []
-
     monkeypatch.setattr(
         persistence_repo,
         "persist_incident_audit_sync",
-        lambda payload: audit_calls.append(payload) or True,
+        lambda payload: pytest.fail("Non-atomic audit fallback called"),
     )
 
-    monkeypatch.setattr(
-        incident_store._audit_durability,
-        "is_cloud_environment",
-        lambda: True,
-    )
-
-    with pytest.raises(RuntimeError, match="Cloud incident persistence failed"):
-        incident_store.create_incident(citizen_incident)
-
-    assert audit_calls == []
-    assert citizen_incident.id not in incident_store._incidents
-
-
-def test_cloud_audit_persistence_failure_aborts_creation(
-    monkeypatch,
-    incident_store,
-    citizen_incident,
-):
-    configure_repository(monkeypatch)
-
-    monkeypatch.setattr(
-        persistence_repo,
-        "execute_citizen_incident_creation_sync",
-        lambda **kwargs: None,
-    )
-
-    monkeypatch.setattr(
-        persistence_repo,
-        "persist_incident_sync",
-        lambda payload: True,
-    )
-
-    monkeypatch.setattr(
-        persistence_repo,
-        "persist_incident_audit_sync",
-        lambda payload: False,
-    )
-
-    monkeypatch.setattr(
-        incident_store._audit_durability,
-        "is_cloud_environment",
-        lambda: True,
-    )
-
-    with pytest.raises(RuntimeError, match="Cloud audit persistence failed"):
+    with pytest.raises(RuntimeError, match="RPC unavailable"):
         incident_store.create_incident(citizen_incident)
 
     assert citizen_incident.id not in incident_store._incidents
-
 
 from app.services import persistence_repository as persistence_repository_module
 import httpx
@@ -235,13 +191,14 @@ def citizen_rpc_arguments():
     }
 
 
+
 def test_citizen_rpc_http_200_returns_response(monkeypatch):
     class FakeResponse:
         status_code = 200
-        text = '{"success": true}'
+        text = '{"id": "INC-HTTP-TEST"}'
 
         def json(self):
-            return {"success": True}
+            return {"id": "INC-HTTP-TEST"}
 
     mock_rpc_http(monkeypatch, response=FakeResponse())
 
@@ -249,10 +206,12 @@ def test_citizen_rpc_http_200_returns_response(monkeypatch):
         **citizen_rpc_arguments()
     )
 
-    assert result == {"success": True}
+    assert result["id"] == "INC-HTTP-TEST"
 
 
-def test_citizen_rpc_pgrst202_returns_none(monkeypatch):
+
+
+def test_citizen_rpc_pgrst202_raises_runtime_error(monkeypatch):
     class FakeResponse:
         status_code = 404
         text = '{"code": "PGRST202"}'
@@ -262,11 +221,11 @@ def test_citizen_rpc_pgrst202_returns_none(monkeypatch):
 
     mock_rpc_http(monkeypatch, response=FakeResponse())
 
-    result = persistence_repo.execute_citizen_incident_creation_sync(
-        **citizen_rpc_arguments()
-    )
+    with pytest.raises(RuntimeError, match="RPC is unavailable"):
+        persistence_repo.execute_citizen_incident_creation_sync(
+            **citizen_rpc_arguments()
+        )
 
-    assert result is None
 
 
 def test_citizen_rpc_other_404_raises_runtime_error(monkeypatch):
