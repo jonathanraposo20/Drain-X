@@ -43,12 +43,18 @@ def test_persistence_status_unconfigured_default():
     assert status.target_table == "sensor_readings"
 
 
+
 @pytest.mark.anyio
 async def test_persistence_batch_storage_and_source_isolation():
     """Verify that physical and simulated telemetry can be stored and queried independently."""
-    repo = PersistenceRepository()
+    repo = PersistenceRepository(
+        supabase_url=None,
+        supabase_key=None,
+        service_role_key=None,
+    )
 
     t_now = datetime.now(timezone.utc)
+
     sim_reading = SensorReadingContract(
         sensor_id="US_UPSTREAM_01",
         section_id="SEC_SCREENING_01",
@@ -73,25 +79,34 @@ async def test_persistence_batch_storage_and_source_isolation():
         metadata={"device_id": "DRAINX-ESP32-NODE-01"}
     )
 
-    # Persist both
     count = await repo.persist_readings([sim_reading, phys_reading])
     assert count == 2
 
-    # Query filtered by SIMULATED source
-    sim_results = await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01", source="SIMULATED")
+    sim_results = await repo.query_historical_telemetry(
+        sensor_id="US_UPSTREAM_01",
+        source="SIMULATED"
+    )
     assert len(sim_results) >= 1
     assert all(r["source"] == "SIMULATED" for r in sim_results)
 
-    # Query filtered by PHYSICAL source
-    phys_results = await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01", source="PHYSICAL")
+    phys_results = await repo.query_historical_telemetry(
+        sensor_id="US_UPSTREAM_01",
+        source="PHYSICAL"
+    )
     assert len(phys_results) >= 1
     assert all(r["source"] == "PHYSICAL" for r in phys_results)
 
 
+
 @pytest.mark.anyio
+
 async def test_persistence_handles_uninstalled_sensor():
     """Verify that uninstalled sensors are persisted with FAULT status and SENSOR_NOT_INSTALLED code."""
-    repo = PersistenceRepository()
+    repo = PersistenceRepository(
+    supabase_url=None,
+    supabase_key=None,
+    service_role_key=None,
+)
 
     uninstalled_reading = SensorReadingContract(
         sensor_id="FS_FLUME_01",

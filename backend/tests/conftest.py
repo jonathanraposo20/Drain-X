@@ -1,6 +1,7 @@
 ﻿
 import io
 import time
+from datetime import datetime, timezone
 
 import jwt
 import pytest
@@ -56,13 +57,56 @@ def sample_png_bytes():
 
 
 @pytest.fixture(autouse=True)
-def reset_state_store():
-    """Reset global state store between tests for full test isolation."""
+def reset_state_store(monkeypatch, tmp_path):
+    """Reset application state and fully isolate global persistence repository and audit ledger."""
+    from app.services.persistence_repository import persistence_repo
+
+    def _reset_persistence_repo():
+        persistence_repo._in_memory_records.clear()
+        persistence_repo._mode_history_records.clear()
+        persistence_repo._in_memory_devices = {
+            "DRAINX-ESP32-NODE-01": {
+                "device_id": "DRAINX-ESP32-NODE-01",
+                "name": "Primary Flume ESP32 Node",
+                "hardware_model": "ESP32 DevKit V1 (ESP-WROOM-32)",
+                "firmware_version": "0.3.7-p0.3g",
+                "is_active": True,
+                "validation_stage": "CONNECTIVITY_READY",
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "metadata": {"location": "Flume Primary Sump"},
+            }
+        }
+        persistence_repo._total_persisted_count = 0
+        persistence_repo._failed_persistence_count = 0
+        persistence_repo._last_persistence_error = None
+        persistence_repo._connection_status = "UNCONFIGURED"
+        persistence_repo._last_ping_ms = None
+
+    # Prevent tests from contacting Supabase unless they explicitly enable and mock cloud persistence.
+    monkeypatch.setattr(persistence_repo, "_is_configured", False)
+
+    # Isolate durable audit journal to temporary storage so tests never pollute or delete real audit files.
+    test_audit_path = tmp_path / "test_incident_audits.jsonl"
+    monkeypatch.setenv("DRAINX_AUDIT_LOG_PATH", str(test_audit_path))
+    monkeypatch.setattr(state_store._audit_durability, "_file_path", test_audit_path)
+    state_store._audit_durability._known_audit_ids.clear()
+
+    # Clear in-memory state and repository buffers
+    with state_store._lock:
+        state_store._incident_audits.clear()
     state_store.clear()
     state_store.set_mode("SIMULATION", reason="Test reset")
+    _reset_persistence_repo()
+
     yield
+
+    with state_store._lock:
+        state_store._incident_audits.clear()
     state_store.clear()
     state_store.set_mode("SIMULATION", reason="Test teardown")
+    state_store._audit_durability._known_audit_ids.clear()
+    _reset_persistence_repo()
 
 
 @pytest.fixture

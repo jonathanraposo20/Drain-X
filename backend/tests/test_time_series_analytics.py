@@ -184,7 +184,11 @@ def test_flow_trend_calculations_and_zero_flow():
 @pytest.mark.anyio
 async def test_time_range_and_chronological_filtering():
     """Verify start_time, end_time, and chronological query sorting."""
-    repo = PersistenceRepository()
+    repo = PersistenceRepository(
+    supabase_url=None,
+    supabase_key=None,
+    service_role_key=None,
+)
 
     t_base = datetime(2026, 11, 13, 16, 0, 0, tzinfo=timezone.utc)
     readings = []

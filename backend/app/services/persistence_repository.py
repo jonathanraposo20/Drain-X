@@ -1,4 +1,4 @@
-"""
+﻿"""
 DRAIN-X Database Persistence Layer Interface & Supabase Cloud Client Adapter.
 
 Milestone: P0.6 Supabase Cloud Integration.
@@ -33,7 +33,7 @@ from app.core.config import settings
 from app.models.contracts import SensorReadingContract, DataSource
 
 logger = logging.getLogger("drainx.persistence")
-
+_UNSET = object()
 
 class DatabaseConfigStatus(BaseModel):
     configured: bool
@@ -54,26 +54,96 @@ class PersistenceRepository:
     Modular persistence client interfacing FastAPI with Supabase Cloud PostgREST.
     Operates in fallback/mock mode when unconfigured.
     """
-
     def __init__(
         self,
-        supabase_url: Optional[str] = None,
-        supabase_key: Optional[str] = None,
-        service_role_key: Optional[str] = None,
+        supabase_url: Any = _UNSET,
+        supabase_key: Any = _UNSET,
+        service_role_key: Any = _UNSET,
         timeout_sec: Optional[float] = None,
     ):
-        self._supabase_url = (supabase_url or settings.SUPABASE_URL or "").rstrip("/")
-        self._supabase_key = (supabase_key or settings.SUPABASE_KEY or "").strip()
-        self._supabase_service_role_key = (
-            service_role_key or settings.SUPABASE_SERVICE_ROLE_KEY or ""
+        # Resolve each configuration property independently:
+        # - If argument is omitted (_UNSET), fall back to settings.
+        # - If argument is explicitly None or empty string, treat as disabled/empty.
+        # - Guard against cross-project mixing: if a custom URL is provided, do not
+        #   implicitly leak default settings keys to that foreign URL; and vice-versa.
+        if supabase_url is _UNSET:
+            resolved_url = (settings.SUPABASE_URL or "").rstrip("/")
+            url_from_settings = True
+        elif supabase_url is None:
+            resolved_url = ""
+            url_from_settings = False
+        else:
+            resolved_url = str(supabase_url).rstrip("/")
+            url_from_settings = False
+
+        if supabase_key is _UNSET:
+            if url_from_settings or resolved_url == (settings.SUPABASE_URL or "").rstrip("/"):
+                resolved_key = (settings.SUPABASE_KEY or "").strip()
+            else:
+                resolved_key = ""
+            key_from_settings = True
+        elif supabase_key is None:
+            resolved_key = ""
+            key_from_settings = False
+        else:
+            resolved_key = str(supabase_key).strip()
+            key_from_settings = False
+
+        if service_role_key is _UNSET:
+            if url_from_settings or resolved_url == (settings.SUPABASE_URL or "").rstrip("/"):
+                resolved_service_key = (settings.SUPABASE_SERVICE_ROLE_KEY or "").strip()
+            else:
+                resolved_service_key = ""
+            service_key_from_settings = True
+        elif service_role_key is None:
+            resolved_service_key = ""
+            service_key_from_settings = False
+        else:
+            resolved_service_key = str(service_role_key).strip()
+            service_key_from_settings = False
+
+        # Cross-project mixing protection:
+        # Only non-empty credential overrides should trigger this guard.
+        # Explicit None/empty values disable a credential; they must not
+        # accidentally disable the URL or another valid credential.
+        settings_anon_key = (settings.SUPABASE_KEY or "").strip()
+        settings_service_key = (
+            settings.SUPABASE_SERVICE_ROLE_KEY or ""
         ).strip()
+
+        if (
+            not key_from_settings
+            and resolved_key
+            and resolved_key != settings_anon_key
+            and url_from_settings
+        ):
+            resolved_url = ""
+            if service_key_from_settings:
+                resolved_service_key = ""
+
+        if (
+            not service_key_from_settings
+            and resolved_service_key
+            and resolved_service_key != settings_service_key
+            and url_from_settings
+        ):
+            resolved_url = ""
+            if key_from_settings:
+                resolved_key = ""
+
+        self._supabase_url = resolved_url
+        self._supabase_key = resolved_key
+        self._supabase_service_role_key = resolved_service_key
+
         self._timeout_sec = timeout_sec or settings.PERSISTENCE_TIMEOUT_SEC
 
-        # Active authentication key: prefer service_role_key for backend if available
-        self._active_key = self._supabase_service_role_key or self._supabase_key
-        self._is_configured = bool(self._supabase_url and self._active_key)
+        self._active_key = (
+            self._supabase_service_role_key or self._supabase_key
+        )
+        self._is_configured = bool(
+            self._supabase_url and self._active_key
+        )
 
-        # In-memory storage buffers for fallback / local development
         self._in_memory_records: List[Dict[str, Any]] = []
         self._mode_history_records: List[Dict[str, Any]] = []
         self._in_memory_devices: Dict[str, Dict[str, Any]] = {
@@ -93,8 +163,14 @@ class PersistenceRepository:
         self._last_persistence_error: Optional[str] = None
         self._total_persisted_count: int = 0
         self._failed_persistence_count: int = 0
-        self._connection_status: str = "UNCONFIGURED" if not self._is_configured else "CONFIGURED_UNCHECKED"
+        self._connection_status: str = (
+            "UNCONFIGURED"
+            if not self._is_configured
+            else "CONFIGURED_UNCHECKED"
+        )
         self._last_ping_ms: Optional[float] = None
+
+
 
     @property
     def is_configured(self) -> bool:
@@ -311,7 +387,7 @@ class PersistenceRepository:
 
         endpoint = f"{self._supabase_url}/rest/v1/sensor_readings"
         order_direction = "asc" if chronological else "desc"
-        
+
         # Build query params as list of tuples to support multiple timestamp constraints
         query_params: List[Tuple[str, str]] = [
             ("order", f"timestamp.{order_direction}"),
@@ -532,10 +608,11 @@ class PersistenceRepository:
             logger.warning(f"Failed to persist audit to Supabase Cloud: {exc}")
             return False
 
+
     def persist_incident_audit_sync(self, audit_dict: Dict[str, Any]) -> bool:
         """
         Synchronous variant of persist_incident_audit for atomic coordination in synchronous state store.
-        Uses idempotency resolution merge-duplicates to guarantee crash-safe retry.
+        Uses ignore-duplicates so retries cannot modify existing audit records.
         """
         if not self._is_configured:
             return True
@@ -546,7 +623,7 @@ class PersistenceRepository:
                 resp = client.post(
                     endpoint,
                     json=[audit_dict],
-                    headers=self._get_headers(prefer="resolution=merge-duplicates"),
+                    headers=self._get_headers(prefer="resolution=ignore-duplicates"),
                 )
                 if resp.status_code in (200, 201):
                     return True
@@ -555,7 +632,6 @@ class PersistenceRepository:
         except Exception as exc:
             logger.warning(f"Supabase synchronous audit persistence network error: {exc}")
             return False
-
     async def query_incident_audits(self, incident_id: str) -> List[Dict[str, Any]]:
         """
         Query incident audit ledger from Supabase Cloud.
@@ -565,6 +641,7 @@ class PersistenceRepository:
 
         endpoint = f"{self._supabase_url}/rest/v1/incident_audits"
         params = {"incident_id": f"eq.{incident_id}", "order": "timestamp.asc"}
+
         try:
             async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
                 resp = await client.get(
@@ -682,8 +759,8 @@ class PersistenceRepository:
         audit_id: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        Executes atomic server-side PostgreSQL stored procedure municipal_incident_transaction_rpc via Supabase RPC.
-        Atomically updates the incident, inserts the audit entry, and returns the updated incident.
+        Executes the atomic municipal incident and audit transaction.
+        Configured cloud failures raise instead of falling back to separate writes.
         """
         if not self._is_configured:
             return None
@@ -707,6 +784,7 @@ class PersistenceRepository:
             "p_reason": reason,
             "p_audit_id": audit_id,
         }
+
         try:
             with httpx.Client(timeout=self._timeout_sec) as client:
                 resp = client.post(
@@ -714,14 +792,23 @@ class PersistenceRepository:
                     json=payload,
                     headers=self._get_headers(),
                 )
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.warning(f"Supabase RPC incident transaction failed with HTTP {resp.status_code}: {resp.text}")
-                return None
-        except Exception as exc:
-            logger.warning(f"Supabase RPC incident transaction network error: {exc}")
-            return None
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"Municipal incident RPC failed with HTTP {resp.status_code}: {resp.text}"
+                    )
 
+                result = resp.json()
+                if not isinstance(result, dict) or result.get("id") != incident_id:
+                    raise RuntimeError(
+                        f"Municipal incident RPC returned an invalid response for '{incident_id}'."
+                    )
+
+                return result
+        except Exception as exc:
+            logger.error("Municipal incident RPC failed for %s: %s", incident_id, exc)
+            raise RuntimeError(
+                f"Atomic municipal cloud transaction failed for incident '{incident_id}'."
+            ) from exc
 
     def execute_citizen_incident_creation_sync(
         self,
@@ -737,13 +824,24 @@ class PersistenceRepository:
         audit_id: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        Executes atomic server-side PostgreSQL stored procedure citizen_incident_creation_rpc via Supabase RPC.
-        Atomically inserts the citizen incident and initial REPORTED audit event.
+        Executes the atomic citizen incident creation RPC.
+
+        The RPC atomically creates the incident and its initial audit record.
+
+        Returns the persisted incident only after validating the response.
+        Never falls back to separate incident and audit writes.
+
+        Returns None only when Supabase is not configured. Callers must
+        handle that case separately as local development mode.
         """
         if not self._is_configured:
             return None
 
-        endpoint = f"{self._supabase_url}/rest/v1/rpc/citizen_incident_creation_rpc"
+        endpoint = (
+            f"{self._supabase_url}/rest/v1/rpc/"
+            "citizen_incident_creation_rpc"
+        )
+
         payload = {
             "p_incident_id": incident_id,
             "p_category": category,
@@ -756,6 +854,7 @@ class PersistenceRepository:
             "p_photos": photos,
             "p_audit_id": audit_id,
         }
+
         try:
             with httpx.Client(timeout=self._timeout_sec) as client:
                 resp = client.post(
@@ -763,13 +862,79 @@ class PersistenceRepository:
                     json=payload,
                     headers=self._get_headers(),
                 )
+
                 if resp.status_code == 200:
-                    return resp.json()
-                logger.warning(f"Supabase RPC citizen creation failed with HTTP {resp.status_code}: {resp.text}")
-                return None
-        except Exception as exc:
-            logger.warning(f"Supabase RPC citizen creation network error: {exc}")
-            return None
+                    try:
+                        result = resp.json()
+                    except ValueError as exc:
+                        logger.error(
+                            "Citizen incident RPC returned invalid JSON."
+                        )
+                        raise RuntimeError(
+                            "Citizen incident RPC returned invalid JSON."
+                        ) from exc
+
+                    if (
+                        not isinstance(result, dict)
+                        or result.get("id") != incident_id
+                    ):
+                        logger.error(
+                            "Citizen incident RPC returned an invalid "
+                            "incident response for ID %s.",
+                            incident_id,
+                        )
+                        raise RuntimeError(
+                            "Citizen incident RPC did not confirm "
+                            "the requested incident."
+                        )
+
+                    return result
+
+                try:
+                    error_body = resp.json()
+                except ValueError:
+                    error_body = {}
+
+                error_code = (
+                    error_body.get("code")
+                    if isinstance(error_body, dict)
+                    else None
+                )
+
+                if (
+                    resp.status_code == 404
+                    and error_code == "PGRST202"
+                ):
+                    logger.error(
+                        "Citizen incident RPC is unavailable. "
+                        "Refusing non-atomic persistence fallback."
+                    )
+                    raise RuntimeError(
+                        "Citizen incident creation RPC is unavailable. "
+                        "Check the Supabase function and PostgREST schema cache."
+                    )
+
+                logger.error(
+                    "Supabase citizen creation RPC failed: "
+                    "HTTP %s, response: %s",
+                    resp.status_code,
+                    resp.text,
+                )
+
+                raise RuntimeError(
+                    f"Citizen incident RPC failed with HTTP "
+                    f"{resp.status_code}."
+                )
+
+        except httpx.RequestError as exc:
+            logger.error(
+                "Citizen incident RPC network error: %s",
+                exc,
+            )
+            raise RuntimeError(
+                "Citizen incident RPC could not be reached."
+            ) from exc
+
 
 
 # Global persistence client instance

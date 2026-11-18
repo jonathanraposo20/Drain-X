@@ -146,7 +146,7 @@ class StateStore:
         self._lock = threading.RLock()
         self._start_time = time.time()
         self._max_history = max_history_per_sensor
-        
+
         # Mode & State
         raw_mode = settings.SYSTEM_MODE
         self.mode = "PHYSICAL" if raw_mode == "HARDWARE" else raw_mode
@@ -242,7 +242,7 @@ class StateStore:
         valid_modes = {"SIMULATION", "PHYSICAL", "SAFE_HOLD", "HARDWARE"}
         if new_mode not in valid_modes:
             raise ValueError(f"Invalid operational mode '{new_mode}'. Allowed modes: {sorted(list(valid_modes))}")
-        
+
         # Canonicalize HARDWARE alias to PHYSICAL
         if new_mode == "HARDWARE":
             new_mode = "PHYSICAL"
@@ -597,6 +597,8 @@ class StateStore:
                 source=IncidentSource.DEMO,
                 reporter_name="St. Inez Ward Committee",
                 assigned_to="Team Alpha — St. Inez Drainage Crew",
+                assignment_type=AssignmentType.TEAM,
+                assigned_team_id="TEAM-ALPHA",
                 municipal_notes="High-capacity dewatering pump dispatched to site.",
             ),
             IncidentResponseContract(
@@ -610,6 +612,8 @@ class StateStore:
                 source=IncidentSource.DEMO,
                 reporter_name="Patto Commercial Association",
                 assigned_to="Team Beta — Patto Rapid Response",
+                assignment_type=AssignmentType.TEAM,
+                assigned_team_id="TEAM-BETA",
                 municipal_notes="Suction tanker scheduled for 14:00 drain vacuuming.",
             ),
             IncidentResponseContract(
@@ -623,6 +627,8 @@ class StateStore:
                 source=IncidentSource.DEMO,
                 reporter_name="Fontainhas Heritage Watch",
                 assigned_to="Team Gamma — Fontainhas Heritage Maintenance",
+                assignment_type=AssignmentType.TEAM,
+                assigned_team_id="TEAM-GAMMA",
                 municipal_notes="Verified by municipal field inspector. Manual clearing required.",
             ),
             IncidentResponseContract(
@@ -636,6 +642,8 @@ class StateStore:
                 source=IncidentSource.DEMO,
                 reporter_name="Panaji Municipal Patrol",
                 assigned_to="Team Delta — Miramar Outfall Sluice Unit",
+                assignment_type=AssignmentType.TEAM,
+                assigned_team_id="TEAM-DELTA",
                 municipal_notes="Grating slab repositioned and secured with structural steel anchors.",
             ),
         ]
@@ -665,9 +673,14 @@ class StateStore:
                                 previous_status=IncidentStatus.REPORTED.value,
                                 new_status=item.status.value,
                                 new_assigned_to=item.assigned_to,
+                                new_assignment_type=item.assignment_type.value,
+                                new_assigned_team_id=item.assigned_team_id,
+                                new_assigned_worker_id=item.assigned_worker_id,
                                 reason=item.municipal_notes or "Operational state progression",
                             )
                         )
+
+
 
     def create_incident(self, incident: IncidentResponseContract) -> IncidentResponseContract:
         with self._lock:
@@ -681,35 +694,55 @@ class StateStore:
                 reason="Initial hazard report submission",
             )
 
-            # In configured cloud mode, execute atomic cloud RPC
             from app.services.persistence_repository import persistence_repo
+
+            # Configured cloud persistence must use the atomic RPC.
+            # Never fall back to separate incident and audit writes.
             if persistence_repo.is_configured:
                 cloud_res = persistence_repo.execute_citizen_incident_creation_sync(
                     incident_id=incident.id,
-                    category=incident.category.value if hasattr(incident.category, "value") else str(incident.category),
+                    category=(
+                        incident.category.value
+                        if hasattr(incident.category, "value")
+                        else str(incident.category)
+                    ),
                     description=incident.description,
                     latitude=incident.latitude,
                     longitude=incident.longitude,
-                    severity=incident.severity.value if hasattr(incident.severity, "value") else str(incident.severity),
-                    source=incident.source.value if hasattr(incident.source, "value") else str(incident.source),
+                    severity=(
+                        incident.severity.value
+                        if hasattr(incident.severity, "value")
+                        else str(incident.severity)
+                    ),
+                    source=(
+                        incident.source.value
+                        if hasattr(incident.source, "value")
+                        else str(incident.source)
+                    ),
                     reporter_name=incident.reporter_name or "Citizen Anonymous",
                     photos=incident.photos,
                     audit_id=audit.audit_id,
                 )
-                if not cloud_res:
-                    # Fallback to direct PostgREST table insert if RPC migration not yet applied
-                    inc_dict = incident.model_dump(mode="json")
-                    p_ok = persistence_repo.persist_incident_sync(inc_dict)
-                    persistence_repo.persist_incident_audit_sync(audit.model_dump(mode="json"))
-                    if not p_ok and self._audit_durability.is_cloud_environment():
-                        raise RuntimeError(f"Cloud persistence failed for citizen incident '{incident.id}'.")
 
-            # Local durable journaling
+                if (
+                    not isinstance(cloud_res, dict)
+                    or cloud_res.get("id") != incident.id
+                ):
+                    raise RuntimeError(
+                        "Citizen incident creation was not confirmed "
+                        "by Supabase. Local incident creation aborted."
+                    )
+
+            # Only update local state after successful cloud persistence,
+            # or when running without Supabase in local development.
             self._audit_durability.append_audit(audit)
             self._incidents[incident.id] = incident
             self._incident_audits[incident.id] = [audit]
 
             return incident
+
+
+
 
     def get_incident(self, incident_id: str) -> Optional[IncidentResponseContract]:
         with self._lock:
@@ -920,13 +953,42 @@ class StateStore:
             # Snapshot incident for atomic rollback in case of audit persistence failure
             incident_snapshot = incident.model_copy(deep=True)
 
-            # 1. Terminal State Lockdown: Resolved and Rejected tickets cannot be mutated
-            if incident.status in (IncidentStatus.RESOLVED, IncidentStatus.REJECTED):
-                if update.status is not None and update.status != incident.status:
-                    raise ValueError(f"Cannot transition terminal incident '{incident.id}' in status '{incident.status.value}'.")
-                if update.assigned_to is not None and update.assigned_to != incident.assigned_to:
-                    raise ValueError(f"Cannot modify assignment for terminal incident '{incident.id}' in status '{incident.status.value}'.")
+            # Terminal incidents are completely immutable through ordinary updates.
+            if incident.status in (
+                IncidentStatus.RESOLVED,
+                IncidentStatus.REJECTED,
+            ):
+                raise ValueError(
+                    f"Cannot modify terminal incident '{incident.id}' "
+                    f"in status '{incident.status.value}'."
+                )
+            # Workers cannot modify assignment metadata, internal notes, or supervisory fields through direct store calls.
+            if actor_role == "worker":
+                protected_worker_fields = {
+                    "assigned_to",
+                    "assignment_type",
+                    "assigned_team_id",
+                    "assigned_worker_id",
+                    "internal_notes",
+                    "verified_by",
+                    "rejection_reason",
+                }
 
+                submitted_protected_fields = (
+                    update.model_fields_set & protected_worker_fields
+                )
+
+                if submitted_protected_fields:
+                    violating = sorted(submitted_protected_fields)[0]
+                    if violating in ("assigned_to", "assignment_type", "assigned_team_id", "assigned_worker_id"):
+                        raise ValueError(
+                            "Field workers are not permitted to reassign incidents "
+                            "or modify assignment metadata."
+                        )
+                    elif violating == "internal_notes":
+                        raise ValueError("Field workers are not permitted to set internal municipal notes.")
+                    else:
+                        raise ValueError(f"Field workers are not permitted to modify supervisory field '{violating}'.")
             # 2. Pre-validate status transition before applying ANY field mutations (Atomic Protection)
             if update.status is not None and update.status != incident.status:
                 if not validate_incident_status_transition(incident.status, update.status):
@@ -975,7 +1037,7 @@ class StateStore:
             if update.municipal_notes is not None:
                 incident.municipal_notes = update.municipal_notes
 
-            if update.internal_notes is not None:
+            if "internal_notes" in update.model_fields_set:
                 incident.internal_notes = update.internal_notes
 
             if update.photos is not None:
@@ -1049,15 +1111,12 @@ class StateStore:
                     reason=action_reason or update.rejection_reason or update.municipal_notes,
                     audit_id=audit_entry.audit_id,
                 )
-                if not rpc_result:
-                    # Direct PostgREST synchronization fallback
-                    inc_persisted = persistence_repo.persist_incident_sync(incident.model_dump(mode="json"))
-                    audit_persisted = persistence_repo.persist_incident_audit_sync(audit_entry.model_dump(mode="json"))
-                    if self._audit_durability.is_cloud_environment() and (not inc_persisted or not audit_persisted):
-                        # Fail closed in true cloud environment
-                        self._incidents[incident_id] = incident_snapshot
-                        raise RuntimeError(f"Cloud transaction failed for municipal mutation on incident '{incident_id}'. Operation aborted.")
-
+                if not isinstance(rpc_result, dict) or rpc_result.get("id") != incident.id:
+                    self._incidents[incident_id] = incident_snapshot
+                    raise RuntimeError(
+                        f"Atomic municipal cloud transaction failed or returned an invalid incident "
+                        f"for '{incident_id}'. Operation aborted."
+                    )
             # Atomicity guarantee: Attempt durable local journal append
             append_ok = self._audit_durability.append_audit(audit_entry)
             if not append_ok:
