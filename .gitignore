@@ -20,3 +20,6 @@ firmware/include/secrets.h
 **/.env
 **/.env.*
 !**/.env.example
+
+# Local runtime incident audit data
+backend/app/data/incident_audits.jsonl
