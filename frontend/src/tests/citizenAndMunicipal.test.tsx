@@ -267,6 +267,234 @@ describe('Citizen Reporting & Municipal Operations', () => {
         expect(screen.getByText(/Ticket successfully updated/i)).toBeTruthy();
       });
     });
+
+    it('renders Ticket Inspector modal in document.body via portal with z-[2000] and locks background scrolling', () => {
+      expect(document.body.style.overflow).toBe('');
+
+      render(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          onUpdateIncident={vi.fn()}
+        />
+      );
+
+      // Open modal
+      const manageButtons = screen.getAllByText('Manage');
+      fireEvent.click(manageButtons[0]);
+
+      // Verify rendered directly into document.body with z-[2000]
+      const modalBackdrop = document.body.querySelector('.fixed.inset-0.z-\\[2000\\]');
+      expect(modalBackdrop).not.toBeNull();
+      expect(document.body.style.overflow).toBe('hidden');
+
+      // Modal header and content are visible
+      expect(screen.getByText(/Ticket Inspector: INC-DEMO-01/i)).toBeTruthy();
+
+      // Close modal via close button
+      const closeBtn = screen.getByRole('button', { name: /Close Ticket Inspector/i });
+      fireEvent.click(closeBtn);
+
+      // Verify modal is removed and scroll is restored
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+      expect(document.body.style.overflow).toBe('');
+    });
+
+    it('closes modal and restores scrolling on Escape key or backdrop click', () => {
+      render(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          onUpdateIncident={vi.fn()}
+        />
+      );
+
+      // 1. Test Escape key dismissal
+      fireEvent.click(screen.getAllByText('Manage')[0]);
+      expect(document.body.style.overflow).toBe('hidden');
+
+      fireEvent.keyDown(window, { key: 'Escape' });
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+      expect(document.body.style.overflow).toBe('');
+
+      // 2. Test backdrop click dismissal
+      fireEvent.click(screen.getAllByText('Manage')[0]);
+      expect(document.body.style.overflow).toBe('hidden');
+
+      const modalBackdrop = document.body.querySelector('.fixed.inset-0.z-\\[2000\\]');
+      expect(modalBackdrop).not.toBeNull();
+      fireEvent.click(modalBackdrop!);
+
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+      expect(document.body.style.overflow).toBe('');
+    });
+
+    it('triggers onSelectOnMap and closes modal when Locate on GIS Map is clicked', () => {
+      const onSelectOnMap = vi.fn();
+
+      render(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          onSelectOnMap={onSelectOnMap}
+          onUpdateIncident={vi.fn()}
+        />
+      );
+
+      fireEvent.click(screen.getAllByText('Manage')[0]);
+      expect(screen.getByText(/Ticket Inspector: INC-DEMO-01/i)).toBeTruthy();
+
+      const locateBtn = screen.getByText(/Locate on GIS Map/i);
+      fireEvent.click(locateBtn);
+
+      expect(onSelectOnMap).toHaveBeenCalledWith(mockIncidents[0]);
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+      expect(document.body.style.overflow).toBe('');
+    });
+
+    it('restores document body scroll when unmounted while modal is open', () => {
+      const { unmount } = render(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          onUpdateIncident={vi.fn()}
+        />
+      );
+
+      fireEvent.click(screen.getAllByText('Manage')[0]);
+      expect(document.body.style.overflow).toBe('hidden');
+
+      unmount();
+      expect(document.body.style.overflow).toBe('');
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+    });
+
+    it('does not reopen modal when dismissed even if selectedIncidentId remains populated and incidents array refreshes', () => {
+      const onClearSelectedIncident = vi.fn();
+      const { rerender } = render(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          selectedIncidentId="INC-DEMO-01"
+          onUpdateIncident={vi.fn()}
+          onClearSelectedIncident={onClearSelectedIncident}
+        />
+      );
+
+      // Modal should open automatically on initial external selection
+      expect(screen.getByText(/Ticket Inspector: INC-DEMO-01/i)).toBeTruthy();
+
+      // Dismiss the modal
+      const closeBtn = screen.getByRole('button', { name: /Close Ticket Inspector/i });
+      fireEvent.click(closeBtn);
+
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+      expect(onClearSelectedIncident).toHaveBeenCalled();
+
+      // Simulate background polling: new incidents array reference with same selectedIncidentId still populated
+      const refreshedIncidents = mockIncidents.map((inc) => ({ ...inc }));
+      rerender(
+        <MunicipalOperationsPanel
+          incidents={refreshedIncidents}
+          onRefresh={vi.fn()}
+          selectedIncidentId="INC-DEMO-01"
+          onUpdateIncident={vi.fn()}
+          onClearSelectedIncident={onClearSelectedIncident}
+        />
+      );
+
+      // Must NOT reopen automatically after background polling
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+    });
+
+    it('opens new inspector when a different incident is selected, and reopens same incident when intentionally re-selected', () => {
+      const { rerender } = render(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          selectedIncidentId="INC-DEMO-01"
+          onUpdateIncident={vi.fn()}
+        />
+      );
+
+      // 1. Initial selection opens INC-DEMO-01
+      expect(screen.getByText(/Ticket Inspector: INC-DEMO-01/i)).toBeTruthy();
+
+      // Close it
+      fireEvent.click(screen.getByRole('button', { name: /Close Ticket Inspector/i }));
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+
+      // 2. Select another incident (INC-DEMO-02) -> opens INC-DEMO-02
+      rerender(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          selectedIncidentId="INC-DEMO-02"
+          onUpdateIncident={vi.fn()}
+        />
+      );
+      expect(screen.getByText(/Ticket Inspector: INC-DEMO-02/i)).toBeTruthy();
+
+      // Close it
+      fireEvent.click(screen.getByRole('button', { name: /Close Ticket Inspector/i }));
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-02/i)).toBeNull();
+
+      // 3. Intentionally re-select INC-DEMO-01 (e.g. via map click transition through null or different id)
+      rerender(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          selectedIncidentId={null}
+          onUpdateIncident={vi.fn()}
+        />
+      );
+      rerender(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          selectedIncidentId="INC-DEMO-01"
+          onUpdateIncident={vi.fn()}
+        />
+      );
+      expect(screen.getByText(/Ticket Inspector: INC-DEMO-01/i)).toBeTruthy();
+    });
+
+    it('keeps modal closed after Locate on GIS Map even when selectedIncidentId matches located ticket and incidents refreshes', () => {
+      const onSelectOnMap = vi.fn();
+      const { rerender } = render(
+        <MunicipalOperationsPanel
+          incidents={mockIncidents}
+          onRefresh={vi.fn()}
+          selectedIncidentId="INC-DEMO-01"
+          onSelectOnMap={onSelectOnMap}
+          onUpdateIncident={vi.fn()}
+        />
+      );
+
+      expect(screen.getByText(/Ticket Inspector: INC-DEMO-01/i)).toBeTruthy();
+
+      // Click Locate on GIS Map
+      const locateBtn = screen.getByText(/Locate on GIS Map/i);
+      fireEvent.click(locateBtn);
+
+      expect(onSelectOnMap).toHaveBeenCalledWith(mockIncidents[0]);
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+
+      // Simulate parent keeping selectedIncidentId as INC-DEMO-01 and polling refreshing incidents
+      const refreshedIncidents = [...mockIncidents];
+      rerender(
+        <MunicipalOperationsPanel
+          incidents={refreshedIncidents}
+          onRefresh={vi.fn()}
+          selectedIncidentId="INC-DEMO-01"
+          onSelectOnMap={onSelectOnMap}
+          onUpdateIncident={vi.fn()}
+        />
+      );
+
+      // Modal must remain closed
+      expect(screen.queryByText(/Ticket Inspector: INC-DEMO-01/i)).toBeNull();
+    });
   });
 
   describe('UrbanGisDashboard Integration', () => {
