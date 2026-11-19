@@ -184,7 +184,14 @@ export const UrbanGisDashboard: React.FC<UrbanGisDashboardProps> = ({
   };
 
   const handleSelectLiveIncident = (liveInc: IncidentResponseContract) => {
-    setSelectedLiveIncidentId(liveInc.id);
+    if (selectedLiveIncidentId === liveInc.id) {
+      setSelectedLiveIncidentId(null);
+      setTimeout(() => {
+        setSelectedLiveIncidentId(liveInc.id);
+      }, 0);
+    } else {
+      setSelectedLiveIncidentId(liveInc.id);
+    }
     setSelectedIncident(null);
     setSelectedStation(null);
     setSelectedChannel(null);
@@ -647,6 +654,9 @@ export const UrbanGisDashboard: React.FC<UrbanGisDashboardProps> = ({
             onUpdateIncident={handleIncidentUpdated}
             onSelectOnMap={(ticket) => {
               setSelectedLiveIncidentId(ticket.id);
+            }}
+            onClearSelectedIncident={() => {
+              setSelectedLiveIncidentId(null);
             }}
           />
         )}
