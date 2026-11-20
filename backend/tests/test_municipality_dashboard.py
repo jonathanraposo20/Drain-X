@@ -512,3 +512,96 @@ def test_kpi_terminal_state_handling_excludes_resolved_and_rejected(auth_client)
     assert updated["by_severity"]["CRITICAL"] == base["by_severity"]["CRITICAL"] + 1
     assert updated["by_severity"]["HIGH"] == base["by_severity"]["HIGH"] + 1
     assert updated["by_severity"]["MEDIUM"] == base["by_severity"]["MEDIUM"] + 1
+
+
+def test_kpis_empty_state_store(auth_client):
+    """
+    Verify get_incident_kpis() and GET /api/v1/incidents/municipal/kpis
+    return all zero counts when the incident store is genuinely empty.
+    Restores the store reliably after execution.
+    """
+    with state_store._lock:
+        backup_incidents = dict(state_store._incidents)
+        state_store._incidents.clear()
+
+    try:
+        # 1. Direct state_store method verification
+        kpis = state_store.get_incident_kpis()
+        assert kpis["total_incidents"] == 0
+        assert kpis["open_incidents"] == 0
+        assert kpis["resolved_incidents"] == 0
+        assert kpis["rejected_incidents"] == 0
+        assert kpis["assigned_incidents"] == 0
+        assert kpis["unassigned_incidents"] == 0
+        assert kpis["investigating_incidents"] == 0
+        assert kpis["critical_or_high_incidents"] == 0
+        assert kpis["demo_incidents_count"] == 0
+        assert kpis["genuine_incidents_count"] == 0
+
+        # Verify all nested category, severity, status and source counts are zero
+        assert all(count == 0 for count in kpis["by_category"].values())
+        assert all(count == 0 for count in kpis["by_severity"].values())
+        assert all(count == 0 for count in kpis["by_status"].values())
+        assert all(count == 0 for count in kpis["by_source"].values())
+
+        # 2. Endpoint verification via municipal client
+        headers = _token_headers("municipality", "muni-kpi-empty-auditor")
+        resp = auth_client.get("/api/v1/incidents/municipal/kpis", headers=headers)
+        assert resp.status_code == 200
+        endpoint_kpis = resp.json()
+
+        assert endpoint_kpis["total_incidents"] == 0
+        assert endpoint_kpis["open_incidents"] == 0
+        assert endpoint_kpis["resolved_incidents"] == 0
+        assert endpoint_kpis["rejected_incidents"] == 0
+        assert endpoint_kpis["assigned_incidents"] == 0
+        assert endpoint_kpis["unassigned_incidents"] == 0
+        assert endpoint_kpis["investigating_incidents"] == 0
+        assert endpoint_kpis["critical_or_high_incidents"] == 0
+        assert endpoint_kpis["demo_incidents_count"] == 0
+        assert endpoint_kpis["genuine_incidents_count"] == 0
+
+        assert all(count == 0 for count in endpoint_kpis["by_category"].values())
+        assert all(count == 0 for count in endpoint_kpis["by_severity"].values())
+        assert all(count == 0 for count in endpoint_kpis["by_status"].values())
+        assert all(count == 0 for count in endpoint_kpis["by_source"].values())
+    finally:
+        with state_store._lock:
+            state_store._incidents.clear()
+            state_store._incidents.update(backup_incidents)
+
+
+def test_incident_audit_trail_citizen_and_worker_forbidden(auth_client):
+    """
+    Verify GET /api/v1/incidents/{id}/audit rejects citizen and worker roles with 403,
+    and permits authorized municipal users with 200 OK returning the audit ledger.
+    """
+    target_id = "INC-DEMO-01"
+
+    # 1. Citizen role receives 403 Forbidden
+    citizen_headers = _token_headers("citizen", "citizen-audit-forbidden")
+    resp_cit = auth_client.get(f"/api/v1/incidents/{target_id}/audit", headers=citizen_headers)
+    assert resp_cit.status_code == 403
+    assert "Operation requires one of the following roles" in resp_cit.json()["detail"]
+
+    # 2. Field worker role receives 403 Forbidden
+    worker_headers = _token_headers("worker", "worker-audit-forbidden", team="Team Alpha")
+    resp_wrk = auth_client.get(f"/api/v1/incidents/{target_id}/audit", headers=worker_headers)
+    assert resp_wrk.status_code == 403
+    assert "Operation requires one of the following roles" in resp_wrk.json()["detail"]
+
+    # 3. Authorized municipal role receives 200 OK and valid audit trail
+    muni_headers = _token_headers("municipality", "muni-audit-allowed")
+    resp_muni = auth_client.get(f"/api/v1/incidents/{target_id}/audit", headers=muni_headers)
+    assert resp_muni.status_code == 200
+    audits = resp_muni.json()
+    assert isinstance(audits, list)
+    assert len(audits) >= 1
+
+    first_entry = audits[0]
+    assert first_entry["incident_id"] == target_id
+    assert "audit_id" in first_entry
+    assert "actor_id" in first_entry
+    assert "actor_role" in first_entry
+    assert "action" in first_entry
+    assert "timestamp" in first_entry
