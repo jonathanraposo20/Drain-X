@@ -49,6 +49,27 @@ class DatabaseConfigStatus(BaseModel):
     last_ping_ms: Optional[float] = None
 
 
+def _parse_record_datetime(ts_val: Any) -> Optional[datetime]:
+    """
+    Parses a timestamp value into a timezone-aware UTC datetime.
+    Gracefully returns None for malformed, non-string, or empty timestamp values.
+    """
+    if isinstance(ts_val, datetime):
+        if ts_val.tzinfo is None or ts_val.tzinfo.utcoffset(ts_val) is None:
+            return ts_val.replace(tzinfo=timezone.utc)
+        return ts_val
+    if not isinstance(ts_val, str) or not ts_val.strip():
+        return None
+    try:
+        clean_str = ts_val.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_str)
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
 class PersistenceRepository:
     """
     Modular persistence client interfacing FastAPI with Supabase Cloud PostgREST.
@@ -370,21 +391,39 @@ class PersistenceRepository:
         if not self._is_configured:
             results = list(self._in_memory_records)
             if sensor_id:
-                results = [r for r in results if r["sensor_id"] == sensor_id]
+                results = [r for r in results if r.get("sensor_id") == sensor_id]
             if source:
-                results = [r for r in results if r["source"] == source]
+                norm_source = str(source).upper()
+                if norm_source in ("PHYSICAL", "LIVE"):
+                    results = [r for r in results if str(r.get("source", "")).upper() in ("PHYSICAL", "LIVE")]
+                else:
+                    results = [r for r in results if str(r.get("source", "")).upper() == norm_source]
             if section_id:
-                results = [r for r in results if r["section_id"] == section_id]
+                results = [r for r in results if r.get("section_id") == section_id]
             if device_id:
                 results = [r for r in results if r.get("device_id") == device_id]
             if start_time:
-                iso_start = start_time.isoformat()
-                results = [r for r in results if r["timestamp"] >= iso_start]
+                aware_start = start_time if (start_time.tzinfo and start_time.tzinfo.utcoffset(start_time)) else start_time.replace(tzinfo=timezone.utc)
+                results = [
+                    r for r in results
+                    if _parse_record_datetime(r.get("timestamp")) is not None
+                    and _parse_record_datetime(r.get("timestamp")) >= aware_start
+                ]
             if end_time:
-                iso_end = end_time.isoformat()
-                results = [r for r in results if r["timestamp"] <= iso_end]
+                aware_end = end_time if (end_time.tzinfo and end_time.tzinfo.utcoffset(end_time)) else end_time.replace(tzinfo=timezone.utc)
+                results = [
+                    r for r in results
+                    if _parse_record_datetime(r.get("timestamp")) is not None
+                    and _parse_record_datetime(r.get("timestamp")) <= aware_end
+                ]
 
-            results.sort(key=lambda r: r["timestamp"], reverse=not chronological)
+            def _in_memory_sort_key(rec: Dict[str, Any]) -> Tuple[datetime, str]:
+                parsed_dt = _parse_record_datetime(rec.get("timestamp"))
+                safe_dt = parsed_dt if parsed_dt is not None else datetime.min.replace(tzinfo=timezone.utc)
+                safe_id = str(rec.get("id", ""))
+                return (safe_dt, safe_id)
+
+            results.sort(key=_in_memory_sort_key, reverse=not chronological)
             return results[offset : offset + limit]
 
         endpoint = f"{self._supabase_url}/rest/v1/sensor_readings"
@@ -392,8 +431,8 @@ class PersistenceRepository:
         page_size = getattr(self, "POSTGREST_PAGE_SIZE", 1000)
 
         all_records: List[Dict[str, Any]] = []
-        current_offset = offset
         remaining_limit = limit
+        cursor: Optional[Tuple[str, str]] = None
 
         headers = {
             "apikey": self._active_key,
@@ -405,17 +444,29 @@ class PersistenceRepository:
             while remaining_limit > 0:
                 fetch_count = min(remaining_limit, page_size)
 
-                # Build query params as list of tuples to support multiple timestamp constraints
+                # Build query params as list of tuples to support multiple constraints
                 query_params: List[Tuple[str, str]] = [
                     ("order", f"timestamp.{order_direction},id.{order_direction}"),
                     ("limit", str(fetch_count)),
                 ]
-                if current_offset > 0:
-                    query_params.append(("offset", str(current_offset)))
+                if cursor is None:
+                    if offset > 0:
+                        query_params.append(("offset", str(offset)))
+                else:
+                    c_ts, c_id = cursor
+                    if chronological:
+                        query_params.append(("or", f"(timestamp.gt.{c_ts},and(timestamp.eq.{c_ts},id.gt.{c_id}))"))
+                    else:
+                        query_params.append(("or", f"(timestamp.lt.{c_ts},and(timestamp.eq.{c_ts},id.lt.{c_id}))"))
+
                 if sensor_id:
                     query_params.append(("sensor_id", f"eq.{sensor_id}"))
                 if source:
-                    query_params.append(("source", f"eq.{source}"))
+                    norm_source = str(source).upper()
+                    if norm_source in ("PHYSICAL", "LIVE"):
+                        query_params.append(("source", "in.(PHYSICAL,LIVE)"))
+                    else:
+                        query_params.append(("source", f"eq.{source}"))
                 if section_id:
                     query_params.append(("section_id", f"eq.{section_id}"))
                 if device_id:
@@ -439,23 +490,35 @@ class PersistenceRepository:
                     logger.warning(err_msg)
                     raise RuntimeError(err_msg)
 
-                self._last_persistence_error = None
-                page_data = resp.json()
+                try:
+                    page_data = resp.json()
+                except Exception as exc:
+                    err_msg = f"Supabase query returned malformed JSON: {exc}"
+                    self._last_persistence_error = err_msg
+                    logger.warning(err_msg)
+                    raise RuntimeError(err_msg) from exc
+
                 if not isinstance(page_data, list):
                     err_msg = f"Supabase query returned unexpected non-list data: {type(page_data)}"
                     self._last_persistence_error = err_msg
                     logger.warning(err_msg)
                     raise RuntimeError(err_msg)
 
+                # Clear last error only after successful response decode and validation
+                self._last_persistence_error = None
+
                 if not page_data:
                     break
 
                 all_records.extend(page_data)
-                current_offset += len(page_data)
                 remaining_limit -= len(page_data)
 
-                # If server returned fewer records than fetch_count, result set is exhausted
-                if len(page_data) < fetch_count:
+                last_rec = page_data[-1]
+                last_ts = last_rec.get("timestamp")
+                last_id = str(last_rec.get("id", ""))
+                if last_ts is not None:
+                    cursor = (last_ts, last_id)
+                else:
                     break
 
         return all_records

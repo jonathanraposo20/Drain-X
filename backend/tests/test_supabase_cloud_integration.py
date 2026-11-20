@@ -28,6 +28,7 @@ Test Categories:
 
 import json
 import base64
+import re
 from typing import Optional, List, Dict, Any
 import pytest
 from datetime import datetime, timezone, timedelta
@@ -46,6 +47,28 @@ from app.models.contracts import (
     DataSource,
     SensorHealthStatus,
 )
+
+
+def filter_mock_postgrest(all_records: List[Dict[str, Any]], params: Any) -> List[Dict[str, Any]]:
+    """Helper to simulate PostgREST keyset filtering, offsets, and limits for unit testing."""
+    param_dict = dict(params or [])
+    limit_val = int(param_dict.get("limit", 1000))
+    offset_val = int(param_dict.get("offset", 0))
+    or_val = param_dict.get("or", "")
+
+    records = list(all_records)
+    if or_val:
+        m_asc = re.match(r"\(timestamp\.gt\.(.+?),and\(timestamp\.eq\.\1,id\.gt\.(.+?)\)\)", or_val)
+        m_desc = re.match(r"\(timestamp\.lt\.(.+?),and\(timestamp\.eq\.\1,id\.lt\.(.+?)\)\)", or_val)
+        if m_asc:
+            c_ts, c_id = m_asc.group(1), m_asc.group(2)
+            records = [r for r in records if (r["timestamp"], str(r["id"])) > (c_ts, str(c_id))]
+        elif m_desc:
+            c_ts, c_id = m_desc.group(1), m_desc.group(2)
+            records = [r for r in records if (r["timestamp"], str(r["id"])) < (c_ts, str(c_id))]
+    elif offset_val > 0:
+        records = records[offset_val:]
+    return records[:limit_val]
 
 
 @pytest.fixture(autouse=True)
@@ -219,12 +242,13 @@ async def test_supabase_historical_query_formatting():
     t_end = datetime(2026, 11, 13, 11, 0, 0, tzinfo=timezone.utc)
 
     mock_data = [
-        {"sensor_id": "US_UPSTREAM_01", "value": 6.0, "timestamp": "2026-11-13T10:15:00Z"},
-        {"sensor_id": "US_UPSTREAM_01", "value": 6.2, "timestamp": "2026-11-13T10:30:00Z"},
+        {"id": "rec_01", "sensor_id": "US_UPSTREAM_01", "value": 6.0, "timestamp": "2026-11-13T10:15:00Z"},
+        {"id": "rec_02", "sensor_id": "US_UPSTREAM_01", "value": 6.2, "timestamp": "2026-11-13T10:30:00Z"},
     ]
     mock_response = httpx.Response(status_code=200, json=mock_data)
+    mock_empty = httpx.Response(status_code=200, json=[])
 
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_response) as mock_get:
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=[mock_response, mock_empty]) as mock_get:
         results = await repo.query_historical_telemetry(
             sensor_id="US_UPSTREAM_01",
             source="PHYSICAL",
@@ -237,7 +261,7 @@ async def test_supabase_historical_query_formatting():
         )
         assert len(results) == 2
 
-        call_kwargs = mock_get.call_args.kwargs
+        call_kwargs = mock_get.call_args_list[0].kwargs
         params = call_kwargs["params"]
         # Params is a list of tuples
         param_dict = {}
@@ -248,7 +272,7 @@ async def test_supabase_historical_query_formatting():
         assert "limit" in param_dict and param_dict["limit"][0] == "50"
         assert "offset" in param_dict and param_dict["offset"][0] == "10"
         assert "sensor_id" in param_dict and param_dict["sensor_id"][0] == "eq.US_UPSTREAM_01"
-        assert "source" in param_dict and param_dict["source"][0] == "eq.PHYSICAL"
+        assert "source" in param_dict and param_dict["source"][0] == "in.(PHYSICAL,LIVE)"
         assert "device_id" in param_dict and param_dict["device_id"][0] == "eq.DRAINX-ESP32-NODE-01"
 
         # Verify both start and end time constraints are preserved without collision
@@ -638,27 +662,26 @@ async def test_supabase_pagination_7200_records_over_multiple_pages():
     )
 
     t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+    table_10000 = [
+        {
+            "id": i,
+            "sensor_id": "US_UPSTREAM_01",
+            "value": 10.0 + i * 0.01,
+            "timestamp": (t0 + timedelta(seconds=i)).isoformat(),
+            "source": "PHYSICAL",
+            "status": "OK",
+            "unit": "cm",
+        }
+        for i in range(10000)
+    ]
 
     # Simulated server dataset with 10,000 records
     def mock_get_handler(url, params=None, headers=None):
         param_dict = dict(params or [])
-        offset_val = int(param_dict.get("offset", 0))
         limit_val = int(param_dict.get("limit", 1000))
         assert limit_val <= 1000, f"Page limit {limit_val} exceeded 1,000 record ceiling"
-
-        page_records = [
-            {
-                "id": offset_val + i,
-                "sensor_id": "US_UPSTREAM_01",
-                "value": 10.0 + (offset_val + i) * 0.01,
-                "timestamp": (t0 + timedelta(seconds=offset_val + i)).isoformat(),
-                "source": "PHYSICAL",
-                "status": "OK",
-                "unit": "cm",
-            }
-            for i in range(min(limit_val, max(0, 10000 - offset_val)))
-        ]
-        return httpx.Response(status_code=200, json=page_records)
+        slice_data = filter_mock_postgrest(table_10000, params)
+        return httpx.Response(status_code=200, json=slice_data)
 
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_get_handler) as mock_get:
         results = await repo.query_historical_telemetry(
@@ -698,16 +721,21 @@ async def test_supabase_pagination_server_page_limit_and_filters():
 
     calls_received = []
 
+    table_data = [
+        {
+            "id": i,
+            "sensor_id": "US_UPSTREAM_01",
+            "source": "PHYSICAL",
+            "timestamp": (t_start + timedelta(seconds=i)).isoformat(),
+        }
+        for i in range(5000)
+    ]
+
     def mock_get_handler(url, params=None, headers=None):
         param_list = params or []
         calls_received.append(param_list)
-        param_dict = dict(param_list)
-        limit_val = int(param_dict.get("limit", 1000))
-        # Return 1,000 records per page
-        return httpx.Response(
-            status_code=200,
-            json=[{"id": i, "sensor_id": "US_UPSTREAM_01", "source": "PHYSICAL", "timestamp": t_start.isoformat()} for i in range(limit_val)],
-        )
+        slice_data = filter_mock_postgrest(table_data, param_list)
+        return httpx.Response(status_code=200, json=slice_data)
 
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_get_handler):
         results = await repo.query_historical_telemetry(
@@ -726,7 +754,7 @@ async def test_supabase_pagination_server_page_limit_and_filters():
         for call_params in calls_received:
             param_dict = dict(call_params)
             assert param_dict.get("sensor_id") == "eq.US_UPSTREAM_01"
-            assert param_dict.get("source") == "eq.PHYSICAL"
+            assert param_dict.get("source") == "in.(PHYSICAL,LIVE)"
             assert param_dict.get("order") == "timestamp.asc,id.asc"
 
             # Check timestamp filters
@@ -742,30 +770,32 @@ async def test_supabase_pagination_partial_and_empty_final_page():
         supabase_url="https://mock-project.supabase.co",
         supabase_key="anon-key",
     )
+    t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
 
     # 1. Partial final page: requested 2,500, but database only has 1,350 matching
+    # Under Fix 4, non-empty partial page (350 records) continues until an empty page (0 records) or limit is reached.
+    dataset_1350 = [
+        {"id": i, "timestamp": (t0 + timedelta(seconds=i)).isoformat()}
+        for i in range(1350)
+    ]
     def mock_partial_page(url, params=None, headers=None):
-        param_dict = dict(params or [])
-        offset_val = int(param_dict.get("offset", 0))
-        limit_val = int(param_dict.get("limit", 1000))
-
-        count = max(0, min(limit_val, 1350 - offset_val))
-        return httpx.Response(status_code=200, json=[{"id": offset_val + i} for i in range(count)])
+        slice_data = filter_mock_postgrest(dataset_1350, params)
+        return httpx.Response(status_code=200, json=slice_data)
 
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_partial_page) as mock_get:
         results = await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01", limit=2500)
         assert len(results) == 1350
-        # Page 1: 1000, Page 2: 350 (< 1000, terminates) -> exactly 2 calls
-        assert mock_get.call_count == 2
+        # Page 1: 1000, Page 2: 350, Page 3: 0 (empty -> break) = 3 calls
+        assert mock_get.call_count == 3
 
     # 2. Empty final page: table has exactly 1,000 records
+    dataset_1000 = [
+        {"id": i, "timestamp": (t0 + timedelta(seconds=i)).isoformat()}
+        for i in range(1000)
+    ]
     def mock_exact_page(url, params=None, headers=None):
-        param_dict = dict(params or [])
-        offset_val = int(param_dict.get("offset", 0))
-        limit_val = int(param_dict.get("limit", 1000))
-
-        count = max(0, min(limit_val, 1000 - offset_val))
-        return httpx.Response(status_code=200, json=[{"id": offset_val + i} for i in range(count)])
+        slice_data = filter_mock_postgrest(dataset_1000, params)
+        return httpx.Response(status_code=200, json=slice_data)
 
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_exact_page) as mock_get_exact:
         results = await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01", limit=2500)
@@ -858,11 +888,7 @@ async def test_supabase_pagination_identical_timestamps_across_page_boundaries()
     def mock_get_tiebreaker(url, params=None, headers=None):
         param_dict = dict(params or [])
         assert param_dict.get("order") == "timestamp.asc,id.asc", "Must use deterministic secondary sort key"
-        offset_val = int(param_dict.get("offset", 0))
-        limit_val = int(param_dict.get("limit", 5))
-
-        sorted_data = sorted(all_table_data, key=lambda r: (r["timestamp"], r["id"]))
-        slice_data = sorted_data[offset_val : offset_val + limit_val]
+        slice_data = filter_mock_postgrest(all_table_data, params)
         return httpx.Response(status_code=200, json=slice_data)
 
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_get_tiebreaker):
@@ -888,14 +914,18 @@ async def test_supabase_pagination_limit_reached_before_dataset_exhaustion():
     )
 
     # Table has 50,000 records
+    t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+    dataset = [
+        {"id": i, "timestamp": (t0 + timedelta(seconds=i)).isoformat()}
+        for i in range(5000)
+    ]
     call_counts = 0
 
     def mock_large_dataset(url, params=None, headers=None):
         nonlocal call_counts
         call_counts += 1
-        param_dict = dict(params or [])
-        limit_val = int(param_dict.get("limit", 1000))
-        return httpx.Response(status_code=200, json=[{"id": i} for i in range(limit_val)])
+        slice_data = filter_mock_postgrest(dataset, params)
+        return httpx.Response(status_code=200, json=slice_data)
 
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_large_dataset):
         results = await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01", limit=1500)
@@ -938,5 +968,303 @@ async def test_in_memory_fallback_unaffected_by_pagination_hardening():
     assert len(results) == 20
     assert results[0]["value"] == 15.0 # i=10
     assert results[-1]["value"] == 34.0 # i=29
+
+
+# ==============================================================================
+# CodeRabbit PR #4 Regression Tests (Fixes 1-6)
+# ==============================================================================
+
+def test_api_timezone_awareness_enforcement(client: TestClient):
+    """
+    Fix 1: Verify endpoints reject naive datetimes with HTTP 400 and require timezone offsets.
+    """
+    # 1. /telemetry/persistence/historical
+    # Naive start_time
+    r1 = client.get("/api/v1/telemetry/persistence/historical?start_time=2026-11-14T10:00:00")
+    assert r1.status_code == 400
+    assert "start_time must be timezone-aware" in r1.json()["detail"]
+
+    # Naive end_time
+    r2 = client.get("/api/v1/telemetry/persistence/historical?end_time=2026-11-14T10:00:00")
+    assert r2.status_code == 400
+    assert "end_time must be timezone-aware" in r2.json()["detail"]
+
+    # Timezone-aware but start > end
+    r3 = client.get(
+        "/api/v1/telemetry/persistence/historical?start_time=2026-11-14T11:00:00Z&end_time=2026-11-14T10:00:00Z"
+    )
+    assert r3.status_code == 400
+    assert "start_time must not be later than end_time" in r3.json()["detail"]
+
+    # Valid timezone-aware bounds
+    r4 = client.get(
+        "/api/v1/telemetry/persistence/historical?start_time=2026-11-14T10:00:00Z&end_time=2026-11-14T11:00:00Z"
+    )
+    assert r4.status_code == 200
+
+    # 2. /telemetry/analytics/rollup
+    # Naive start_time
+    r5 = client.get(
+        "/api/v1/telemetry/analytics/rollup?sensor_id=US_UPSTREAM_01&start_time=2026-11-14T10:00:00"
+    )
+    assert r5.status_code == 400
+    assert "start_time must be timezone-aware" in r5.json()["detail"]
+
+    # Naive end_time
+    r6 = client.get(
+        "/api/v1/telemetry/analytics/rollup?sensor_id=US_UPSTREAM_01&end_time=2026-11-14T10:00:00"
+    )
+    assert r6.status_code == 400
+    assert "end_time must be timezone-aware" in r6.json()["detail"]
+
+    # Valid timezone-aware bounds
+    r7 = client.get(
+        "/api/v1/telemetry/analytics/rollup?sensor_id=US_UPSTREAM_01&start_time=2026-11-14T10:00:00Z&end_time=2026-11-14T11:00:00Z"
+    )
+    assert r7.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_source_filtering_physical_includes_live_and_simulated_exact():
+    """
+    Fix 2: Verify querying PHYSICAL or LIVE matches both PHYSICAL and LIVE records,
+    while SIMULATED remains exact-match.
+    """
+    repo = PersistenceRepository(supabase_url=None, supabase_key=None)
+
+    t0 = datetime(2026, 11, 14, 10, 0, 0, tzinfo=timezone.utc)
+    records = [
+        SensorReadingContract(
+            sensor_id="US_UPSTREAM_01",
+            section_id="SEC_01",
+            sensor_type=SensorType.WATER_LEVEL,
+            value=10.0,
+            unit=MeasurementUnit.CENTIMETRE,
+            source=DataSource.PHYSICAL,
+            status=SensorHealthStatus.OK,
+            timestamp=t0,
+        ),
+        SensorReadingContract(
+            sensor_id="US_UPSTREAM_01",
+            section_id="SEC_01",
+            sensor_type=SensorType.WATER_LEVEL,
+            value=11.0,
+            unit=MeasurementUnit.CENTIMETRE,
+            source=DataSource.LIVE,
+            status=SensorHealthStatus.OK,
+            timestamp=t0 + timedelta(seconds=1),
+        ),
+        SensorReadingContract(
+            sensor_id="US_UPSTREAM_01",
+            section_id="SEC_01",
+            sensor_type=SensorType.WATER_LEVEL,
+            value=12.0,
+            unit=MeasurementUnit.CENTIMETRE,
+            source=DataSource.SIMULATED,
+            status=SensorHealthStatus.OK,
+            timestamp=t0 + timedelta(seconds=2),
+        ),
+    ]
+    await repo.persist_readings(records)
+
+    # 1. In-memory: Query PHYSICAL -> returns PHYSICAL and LIVE
+    res_phys = await repo.query_historical_telemetry(source="PHYSICAL")
+    assert len(res_phys) == 2
+    sources_phys = {r["source"] for r in res_phys}
+    assert sources_phys == {"PHYSICAL", "LIVE"}
+
+    # 2. In-memory: Query LIVE -> returns PHYSICAL and LIVE
+    res_live = await repo.query_historical_telemetry(source="LIVE")
+    assert len(res_live) == 2
+    sources_live = {r["source"] for r in res_live}
+    assert sources_live == {"PHYSICAL", "LIVE"}
+
+    # 3. In-memory: Query SIMULATED -> returns only SIMULATED
+    res_sim = await repo.query_historical_telemetry(source="SIMULATED")
+    assert len(res_sim) == 1
+    assert res_sim[0]["source"] == "SIMULATED"
+
+    # 4. PostgREST remote query parameter check
+    repo_cloud = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+    mock_resp = httpx.Response(status_code=200, json=[])
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
+        await repo_cloud.query_historical_telemetry(source="PHYSICAL", limit=10)
+        params = dict(mock_get.call_args.kwargs["params"])
+        assert params.get("source") == "in.(PHYSICAL,LIVE)"
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
+        await repo_cloud.query_historical_telemetry(source="LIVE", limit=10)
+        params = dict(mock_get.call_args.kwargs["params"])
+        assert params.get("source") == "in.(PHYSICAL,LIVE)"
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
+        await repo_cloud.query_historical_telemetry(source="SIMULATED", limit=10)
+        params = dict(mock_get.call_args.kwargs["params"])
+        assert params.get("source") == "eq.SIMULATED"
+
+
+@pytest.mark.anyio
+async def test_malformed_json_response_handling_and_diagnostics():
+    """
+    Fix 3: Catch JSON decoding errors from PostgREST, chain RuntimeError,
+    record diagnostic in _last_persistence_error, validate response is a list,
+    and only clear _last_persistence_error when valid.
+    """
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+
+    # 1. PostgREST returns non-JSON raw HTML/text with 200 OK
+    mock_bad_json = httpx.Response(status_code=200, text="<html>502 Bad Gateway from Cloudflare</html>")
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_bad_json):
+        with pytest.raises(RuntimeError) as exc_info:
+            await repo.query_historical_telemetry(limit=10)
+        assert "malformed JSON" in str(exc_info.value)
+        assert exc_info.value.__cause__ is not None  # chained exception
+        assert "malformed JSON" in repo.get_status().last_persistence_error
+
+    # 2. PostgREST returns JSON object instead of list
+    mock_dict_json = httpx.Response(status_code=200, json={"code": "PGRST100", "message": "Unknown error"})
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_dict_json):
+        with pytest.raises(RuntimeError) as exc_info:
+            await repo.query_historical_telemetry(limit=10)
+        assert "unexpected non-list data" in str(exc_info.value)
+        assert "unexpected non-list data" in repo.get_status().last_persistence_error
+
+    # 3. PostgREST returns valid list -> clears _last_persistence_error
+    mock_valid_json = httpx.Response(status_code=200, json=[])
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_valid_json):
+        results = await repo.query_historical_telemetry(limit=10)
+        assert results == []
+        assert repo.get_status().last_persistence_error is None
+
+
+@pytest.mark.anyio
+async def test_short_non_empty_pages_continue_until_limit_satisfied():
+    """
+    Fix 4: Verify pagination does NOT prematurely terminate when a page returns
+    fewer records than fetch_count, continuing until limit is satisfied or page is empty.
+    """
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+    t0 = datetime(2026, 11, 14, 10, 0, 0, tzinfo=timezone.utc)
+
+    # Server returns 3 pages of 50 records each for a requested limit of 150
+    p1 = [{"id": f"p1_{i}", "timestamp": (t0 + timedelta(seconds=i)).isoformat()} for i in range(50)]
+    p2 = [{"id": f"p2_{i}", "timestamp": (t0 + timedelta(seconds=50 + i)).isoformat()} for i in range(50)]
+    p3 = [{"id": f"p3_{i}", "timestamp": (t0 + timedelta(seconds=100 + i)).isoformat()} for i in range(50)]
+
+    responses = [
+        httpx.Response(status_code=200, json=p1),
+        httpx.Response(status_code=200, json=p2),
+        httpx.Response(status_code=200, json=p3),
+    ]
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=responses) as mock_get:
+        results = await repo.query_historical_telemetry(limit=150)
+        assert len(results) == 150
+        assert mock_get.call_count == 3
+        assert results[0]["id"] == "p1_0"
+        assert results[49]["id"] == "p1_49"
+        assert results[50]["id"] == "p2_0"
+        assert results[99]["id"] == "p2_49"
+        assert results[100]["id"] == "p3_0"
+        assert results[149]["id"] == "p3_49"
+
+
+@pytest.mark.anyio
+async def test_keyset_pagination_descending_and_initial_offset():
+    """
+    Fix 5: Verify keyset pagination with descending order (chronological=False)
+    and that initial offset is applied only on Page 1.
+    """
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+    repo.POSTGREST_PAGE_SIZE = 5
+
+    t0 = datetime(2026, 11, 14, 10, 0, 0, tzinfo=timezone.utc)
+    # 20 records in descending order
+    dataset = [
+        {
+            "id": f"rec_{i:02d}",
+            "timestamp": (t0 - timedelta(seconds=i)).isoformat(),
+        }
+        for i in range(20)
+    ]
+
+    calls_params = []
+    def mock_desc_handler(url, params=None, headers=None):
+        param_list = params or []
+        calls_params.append(dict(param_list))
+        slice_data = filter_mock_postgrest(dataset, param_list)
+        return httpx.Response(status_code=200, json=slice_data)
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_desc_handler):
+        results = await repo.query_historical_telemetry(limit=10, offset=2, chronological=False)
+        assert len(results) == 10
+        # Call 1 should have offset=2, limit=5, order=timestamp.desc,id.desc
+        assert calls_params[0]["offset"] == "2"
+        assert calls_params[0]["order"] == "timestamp.desc,id.desc"
+        assert "or" not in calls_params[0]
+
+        # Call 2 should NOT have offset, but should have keyset filter 'or' with timestamp.lt
+        assert "offset" not in calls_params[1]
+        assert "or" in calls_params[1]
+        assert "timestamp.lt." in calls_params[1]["or"]
+        assert "id.lt." in calls_params[1]["or"]
+
+
+@pytest.mark.anyio
+async def test_in_memory_timezone_aware_and_safe_datetime_parsing():
+    """
+    Fix 6: In-memory fallback handles mixed timezone strings (+05:30, -04:00, Z),
+    safely handles malformed timestamps without crashing, and sorts deterministically by (datetime, id).
+    """
+    repo = PersistenceRepository(supabase_url=None, supabase_key=None)
+
+    # 10:00:00 UTC represented with different offsets:
+    # 10:00:00Z = 10:00 UTC
+    # 15:30:00+05:30 = 10:00 UTC
+    # 06:00:00-04:00 = 10:00 UTC
+    # 10:00:01Z = 10:00:01 UTC
+    # corrupt = malformed
+    readings = [
+        {"id": "b_utc", "timestamp": "2026-11-14T10:00:00Z", "sensor_id": "US_01", "source": "PHYSICAL"},
+        {"id": "a_ist", "timestamp": "2026-11-14T15:30:00+05:30", "sensor_id": "US_01", "source": "PHYSICAL"},
+        {"id": "c_edt", "timestamp": "2026-11-14T06:00:00-04:00", "sensor_id": "US_01", "source": "PHYSICAL"},
+        {"id": "d_later", "timestamp": "2026-11-14T10:00:01Z", "sensor_id": "US_01", "source": "PHYSICAL"},
+        {"id": "e_corrupt", "timestamp": "not-a-valid-timestamp", "sensor_id": "US_01", "source": "PHYSICAL"},
+    ]
+    repo._in_memory_records = list(readings)
+
+    # Query with exact time window [10:00:00Z, 10:00:00Z]
+    t_exact = datetime(2026, 11, 14, 10, 0, 0, tzinfo=timezone.utc)
+    results = await repo.query_historical_telemetry(
+        sensor_id="US_01",
+        start_time=t_exact,
+        end_time=t_exact,
+        chronological=True,
+    )
+
+    # Should match a_ist, b_utc, and c_edt because all 3 represent 10:00:00 UTC
+    # e_corrupt is safely excluded; d_later is excluded (1 second later)
+    assert len(results) == 3
+    # Sorting tie-break by ID: a_ist, b_utc, c_edt
+    assert [r["id"] for r in results] == ["a_ist", "b_utc", "c_edt"]
+
+    # Sorting test with malformed record included (unbounded query):
+    all_res = await repo.query_historical_telemetry(sensor_id="US_01", chronological=True)
+    assert len(all_res) == 5
+    # e_corrupt defaults to datetime.min so it appears first in ascending order
+    assert all_res[0]["id"] == "e_corrupt"
 
 

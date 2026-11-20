@@ -33,6 +33,28 @@ logger = logging.getLogger("drainx.api.telemetry")
 router = APIRouter(prefix="/telemetry", tags=["Telemetry"])
 
 
+def _validate_timezone_bounds(start_time: Optional[datetime], end_time: Optional[datetime]) -> None:
+    """
+    Validates that query time bounds are timezone-aware and chronological.
+    Rejects naive datetimes to avoid ambiguous server-local conversions.
+    """
+    if start_time is not None and (start_time.tzinfo is None or start_time.tzinfo.utcoffset(start_time) is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_time must be timezone-aware (e.g. ISO-8601 with UTC offset like 'Z' or '+00:00').",
+        )
+    if end_time is not None and (end_time.tzinfo is None or end_time.tzinfo.utcoffset(end_time) is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="end_time must be timezone-aware (e.g. ISO-8601 with UTC offset like 'Z' or '+00:00').",
+        )
+    if start_time and end_time and start_time > end_time:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_time must not be later than end_time.",
+        )
+
+
 @router.post("", response_model=TelemetryIngestResponse, status_code=status.HTTP_201_CREATED, summary="Ingest sensor reading(s)")
 @router.post("/ingest", response_model=TelemetryIngestResponse, status_code=status.HTTP_201_CREATED, summary="Ingest sensor reading(s) (canonical alias)")
 async def ingest_telemetry(
@@ -195,11 +217,7 @@ async def query_persistent_telemetry(
     Queries persistent historical sensor readings from Supabase (or in-memory repository fallback).
     Supports time-range, sensor, device, and operational mode filtering with limit/offset pagination.
     """
-    if start_time and end_time and start_time > end_time:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="start_time must not be later than end_time.",
-        )
+    _validate_timezone_bounds(start_time, end_time)
 
     try:
         records = await persistence_repo.query_historical_telemetry(
@@ -273,11 +291,7 @@ async def get_telemetry_rollups(
             detail="interval_seconds must be either 60 (1-minute) or 300 (5-minute).",
         )
 
-    if start_time and end_time and start_time > end_time:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="start_time must not be later than end_time.",
-        )
+    _validate_timezone_bounds(start_time, end_time)
 
     # Determine effective query limit:
     if limit is not None:
