@@ -662,7 +662,7 @@ def test_supabase_constructor_fallback_scenarios(monkeypatch):
     assert repo7._supabase_url == "https://custom.supabase.co"
     assert repo7._supabase_key == "custom-key-123"
     assert repo7.is_configured is True
-        # 8. Disabling service-role key preserves default anon credentials.
+    # 8. Disabling service-role key preserves default anon credentials.
     repo8 = PersistenceRepository(service_role_key=None)
     assert repo8._supabase_url == "https://default-project.supabase.co"
     assert repo8._supabase_key == "default-anon-key"
@@ -682,3 +682,153 @@ def test_supabase_constructor_fallback_scenarios(monkeypatch):
     assert repo10._supabase_key == "default-anon-key"
     assert repo10._supabase_service_role_key == "default-service-role-key"
     assert repo10.is_configured is True
+
+
+def test_supabase_credential_regression_none_handling(monkeypatch):
+    """Regression Suite 1: Complementary cases for constructor behaviour when credentials are None."""
+    from app.services.persistence_repository import PersistenceRepository
+
+    monkeypatch.setattr(settings, "SUPABASE_URL", "https://default-project.supabase.co")
+    monkeypatch.setattr(settings, "SUPABASE_KEY", "default-anon-key")
+    monkeypatch.setattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "default-service-role-key")
+
+    # 1. URL explicitly None: disables client and prevents leaking settings keys
+    repo_url_none = PersistenceRepository(supabase_url=None)
+    assert repo_url_none._supabase_url == ""
+    assert repo_url_none._supabase_key == ""
+    assert repo_url_none._supabase_service_role_key == ""
+    assert repo_url_none.is_configured is False
+
+    # 2. Both keys explicitly None: retains default URL but clears both keys
+    repo_keys_none = PersistenceRepository(supabase_key=None, service_role_key=None)
+    assert repo_keys_none._supabase_url == "https://default-project.supabase.co"
+    assert repo_keys_none._supabase_key == ""
+    assert repo_keys_none._supabase_service_role_key == ""
+    assert repo_keys_none.is_configured is False
+
+
+def test_supabase_credential_regression_empty_credentials(monkeypatch):
+    """Regression Suite 2: Discrete empty-string credential handling."""
+    from app.services.persistence_repository import PersistenceRepository
+
+    monkeypatch.setattr(settings, "SUPABASE_URL", "https://default-project.supabase.co")
+    monkeypatch.setattr(settings, "SUPABASE_KEY", "default-anon-key")
+    monkeypatch.setattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "default-service-role-key")
+
+    # 1. Anon key explicitly empty string: disables anon key, preserves service role and URL
+    repo_anon_empty = PersistenceRepository(supabase_key="")
+    assert repo_anon_empty._supabase_url == "https://default-project.supabase.co"
+    assert repo_anon_empty._supabase_key == ""
+    assert repo_anon_empty._supabase_service_role_key == "default-service-role-key"
+    assert repo_anon_empty.is_configured is True
+
+    # 2. Service-role key explicitly empty string: disables service key, preserves anon key and URL
+    repo_service_empty = PersistenceRepository(service_role_key="")
+    assert repo_service_empty._supabase_url == "https://default-project.supabase.co"
+    assert repo_service_empty._supabase_key == "default-anon-key"
+    assert repo_service_empty._supabase_service_role_key == ""
+    assert repo_service_empty.is_configured is True
+
+    # 3. Both keys explicitly empty strings: retains default URL but clears both keys
+    repo_both_empty = PersistenceRepository(supabase_key="", service_role_key="")
+    assert repo_both_empty._supabase_url == "https://default-project.supabase.co"
+    assert repo_both_empty._supabase_key == ""
+    assert repo_both_empty._supabase_service_role_key == ""
+    assert repo_both_empty.is_configured is False
+
+    # 4. URL explicitly empty string: clears URL and avoids leaking settings keys
+    repo_url_empty = PersistenceRepository(supabase_url="")
+    assert repo_url_empty._supabase_url == ""
+    assert repo_url_empty._supabase_key == ""
+    assert repo_url_empty._supabase_service_role_key == ""
+    assert repo_url_empty.is_configured is False
+
+
+def test_supabase_credential_regression_whitespace_normalization(monkeypatch):
+    """Regression Suite 3: Service-role, whitespace-only, and custom URL/key normalisation."""
+    from app.services.persistence_repository import PersistenceRepository
+
+    monkeypatch.setattr(settings, "SUPABASE_URL", "https://default-project.supabase.co")
+    monkeypatch.setattr(settings, "SUPABASE_KEY", "default-anon-key")
+    monkeypatch.setattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "default-service-role-key")
+
+    # 1. Padded service-role key matches default after stripping
+    repo_service_ws = PersistenceRepository(service_role_key=" \t default-service-role-key \r\n ")
+    assert repo_service_ws._supabase_url == "https://default-project.supabase.co"
+    assert repo_service_ws._supabase_key == "default-anon-key"
+    assert repo_service_ws._supabase_service_role_key == "default-service-role-key"
+    assert repo_service_ws.is_configured is True
+
+    # 2. Pure whitespace anon key normalises to empty string (disabled, no cross-project guard trigger)
+    repo_ws_only_anon = PersistenceRepository(supabase_key="   \t\n  ")
+    assert repo_ws_only_anon._supabase_url == "https://default-project.supabase.co"
+    assert repo_ws_only_anon._supabase_key == ""
+    assert repo_ws_only_anon._supabase_service_role_key == "default-service-role-key"
+    assert repo_ws_only_anon.is_configured is True
+
+    # 3. Pure whitespace service-role key normalises to empty string (disabled)
+    repo_ws_only_service = PersistenceRepository(service_role_key="   \t   ")
+    assert repo_ws_only_service._supabase_url == "https://default-project.supabase.co"
+    assert repo_ws_only_service._supabase_key == "default-anon-key"
+    assert repo_ws_only_service._supabase_service_role_key == ""
+    assert repo_ws_only_service.is_configured is True
+
+    # 4. Pure whitespace for both keys normalises to empty strings
+    repo_ws_only_both = PersistenceRepository(
+        supabase_key="   ",
+        service_role_key="  \t  ",
+    )
+    assert repo_ws_only_both._supabase_url == "https://default-project.supabase.co"
+    assert repo_ws_only_both._supabase_key == ""
+    assert repo_ws_only_both._supabase_service_role_key == ""
+    assert repo_ws_only_both.is_configured is False
+
+    # 5. Trailing slashes on custom URL and surrounding whitespace on custom key
+    repo_custom_ws = PersistenceRepository(
+        supabase_url="https://custom.supabase.co///",
+        supabase_key="  custom-isolated-key  ",
+    )
+    assert repo_custom_ws._supabase_url == "https://custom.supabase.co"
+    assert repo_custom_ws._supabase_key == "custom-isolated-key"
+    assert repo_custom_ws.is_configured is True
+
+
+def test_supabase_credential_regression_overrides_and_isolation(monkeypatch):
+    """Regression Suite 4: Independent explicit overrides and cross-project mixing protection."""
+    from app.services.persistence_repository import PersistenceRepository
+
+    monkeypatch.setattr(settings, "SUPABASE_URL", "https://default-project.supabase.co")
+    monkeypatch.setattr(settings, "SUPABASE_KEY", "default-anon-key")
+    monkeypatch.setattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "default-service-role-key")
+
+    # 1. Custom URL with custom service-role key (independent resolution without anon key)
+    repo_custom_service = PersistenceRepository(
+        supabase_url="https://custom-project.supabase.co",
+        service_role_key="custom-service-role-key-999",
+    )
+    assert repo_custom_service._supabase_url == "https://custom-project.supabase.co"
+    assert repo_custom_service._supabase_key == ""
+    assert repo_custom_service._supabase_service_role_key == "custom-service-role-key-999"
+    assert repo_custom_service._active_key == "custom-service-role-key-999"
+    assert repo_custom_service.is_configured is True
+
+    # 2. Cross-project protection: Foreign anon key prevents leaking default URL and default service key
+    repo_foreign_anon = PersistenceRepository(supabase_key="foreign-isolated-key")
+    assert repo_foreign_anon._supabase_url == ""
+    assert repo_foreign_anon._supabase_key == "foreign-isolated-key"
+    assert repo_foreign_anon._supabase_service_role_key == ""
+    assert repo_foreign_anon.is_configured is False
+
+    # 3. Cross-project protection: Foreign service key prevents leaking default URL and default anon key
+    repo_foreign_service = PersistenceRepository(service_role_key="foreign-service-isolated-key")
+    assert repo_foreign_service._supabase_url == ""
+    assert repo_foreign_service._supabase_key == ""
+    assert repo_foreign_service._supabase_service_role_key == "foreign-service-isolated-key"
+    assert repo_foreign_service.is_configured is False
+
+    # 4. Cross-project protection: Foreign URL does not receive default anon or service keys
+    repo_foreign_url = PersistenceRepository(supabase_url="https://foreign-isolated-project.supabase.co")
+    assert repo_foreign_url._supabase_url == "https://foreign-isolated-project.supabase.co"
+    assert repo_foreign_url._supabase_key == ""
+    assert repo_foreign_url._supabase_service_role_key == ""
+    assert repo_foreign_url.is_configured is False
