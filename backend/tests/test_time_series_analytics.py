@@ -244,3 +244,331 @@ def test_api_analytics_endpoints(client: TestClient):
     resp_trend = client.get("/api/v1/telemetry/analytics/trend?sensor_id=US_UPSTREAM_01")
     assert resp_trend.status_code == 200
     assert resp_trend.json()["status"] in ("success", "empty")
+
+
+# ==============================================================================
+# Phase 3.2: Five-Minute Rollup Reliability & Time-Series Hardening Regressions
+# ==============================================================================
+
+def test_one_hour_2hz_produces_12_five_minute_buckets():
+    """Verify 7200 samples at 2 Hz (0.5s) over 1 hour produce exactly 12 complete 5-minute buckets."""
+    t0 = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
+    # 7200 samples: 1 sample every 0.5 seconds = exactly 3600 seconds = 1 hour
+    # from 12:00:00.0 to 12:59:59.5
+    readings = [
+        {
+            "sensor_id": "US_UPSTREAM_01",
+            "value": 10.0 + (i % 50) * 0.1,
+            "status": "OK",
+            "timestamp": t0 + timedelta(milliseconds=i * 500),
+            "metadata": {"is_valid": True},
+        }
+        for i in range(7200)
+    ]
+
+    buckets = aggregate_time_series(readings, bucket_interval_seconds=300, unit="cm")
+
+    assert len(buckets) == 12
+    for idx, b in enumerate(buckets):
+        assert b.sample_count == 600
+        assert b.valid_sample_count == 600
+        expected_start = t0 + timedelta(minutes=idx * 5)
+        assert b.bucket_start == expected_start
+        assert b.bucket_end == expected_start + timedelta(seconds=300)
+        assert b.min_value is not None
+        assert b.max_value is not None
+        assert b.avg_value is not None
+
+
+def test_one_hour_1hz_produces_same_12_buckets():
+    """Verify 3600 samples at 1 Hz (1.0s) over the same 1 hour produce identical 12 bucket boundaries."""
+    t0 = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
+    # 3600 samples: 1 sample every 1 second = 3600 seconds = 1 hour
+    readings = [
+        {
+            "sensor_id": "US_UPSTREAM_01",
+            "value": 10.0 + (i % 50) * 0.1,
+            "status": "OK",
+            "timestamp": t0 + timedelta(seconds=i),
+            "metadata": {"is_valid": True},
+        }
+        for i in range(3600)
+    ]
+
+    buckets = aggregate_time_series(readings, bucket_interval_seconds=300, unit="cm")
+
+    assert len(buckets) == 12
+    for idx, b in enumerate(buckets):
+        assert b.sample_count == 300
+        assert b.valid_sample_count == 300
+        expected_start = t0 + timedelta(minutes=idx * 5)
+        assert b.bucket_start == expected_start
+        assert b.bucket_end == expected_start + timedelta(seconds=300)
+
+
+def test_utc_boundary_alignment():
+    """Verify buckets strictly align to integer UTC epoch multiples of 300 seconds (clock minutes :00, :05, :10, etc.)."""
+    # Sample starting mid-minute: 12:03:42
+    t = datetime(2026, 11, 13, 12, 3, 42, tzinfo=timezone.utc)
+    readings = [
+        {"sensor_id": "US_UPSTREAM_01", "value": 5.0, "status": "OK", "timestamp": t, "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "value": 6.0, "status": "OK", "timestamp": t + timedelta(minutes=4), "metadata": {"is_valid": True}},
+    ]
+
+    buckets = aggregate_time_series(readings, bucket_interval_seconds=300, unit="cm")
+
+    assert len(buckets) == 2
+    # 12:03:42 falls in [12:00:00, 12:05:00)
+    b0_start = buckets[0].bucket_start
+    assert b0_start.minute == 0
+    assert b0_start.second == 0
+    assert int(b0_start.timestamp()) % 300 == 0
+
+    # 12:07:42 falls in [12:05:00, 12:10:00)
+    b1_start = buckets[1].bucket_start
+    assert b1_start.minute == 5
+    assert b1_start.second == 0
+    assert int(b1_start.timestamp()) % 300 == 0
+
+
+def test_partial_first_and_last_buckets():
+    """Verify non-window-aligned datasets produce accurate partial first and last buckets without truncation."""
+    # Data spans 10:02:15 to 10:17:45 (spans across 10:00:00-10:05:00, 10:05:00-10:10:00, 10:10:00-10:15:00, 10:15:00-10:20:00)
+    t_start = datetime(2026, 11, 13, 10, 2, 15, tzinfo=timezone.utc)
+    t_end = datetime(2026, 11, 13, 10, 17, 45, tzinfo=timezone.utc)
+
+    # 1 sample every 30 seconds
+    readings = []
+    curr = t_start
+    val = 1.0
+    while curr <= t_end:
+        readings.append({"sensor_id": "US_UPSTREAM_01", "value": val, "status": "OK", "timestamp": curr, "metadata": {"is_valid": True}})
+        curr += timedelta(seconds=30)
+        val += 0.5
+
+    buckets = aggregate_time_series(readings, bucket_interval_seconds=300, unit="cm")
+
+    assert len(buckets) == 4
+    # First bucket: 10:00:00 to 10:05:00 (readings at :02:15, :02:45, :03:15, :03:45, :04:15, :04:45 -> 6 samples)
+    assert buckets[0].bucket_start == datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+    assert buckets[0].sample_count == 6
+
+    # Last bucket: 10:15:00 to 10:20:00 (readings at :15:15, :15:45, :16:15, :16:45, :17:15, :17:45 -> 6 samples)
+    assert buckets[-1].bucket_start == datetime(2026, 11, 13, 10, 15, 0, tzinfo=timezone.utc)
+    assert buckets[-1].sample_count == 6
+
+
+def test_sparse_sensor_data_no_fabricated_buckets():
+    """Verify sparse sensor data does not generate fabricated empty intermediate buckets."""
+    t0 = datetime(2026, 11, 13, 10, 1, 0, tzinfo=timezone.utc)  # Bucket 10:00:00
+    t1 = datetime(2026, 11, 13, 10, 11, 0, tzinfo=timezone.utc) # Bucket 10:10:00 (10:05:00 is empty)
+
+    dataset = [
+        {"sensor_id": "US_UPSTREAM_01", "value": 5.0, "status": "OK", "timestamp": t0, "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "value": 5.2, "status": "OK", "timestamp": t1, "metadata": {"is_valid": True}},
+    ]
+
+    buckets = aggregate_time_series(dataset, bucket_interval_seconds=300, unit="cm")
+
+    # Exactly 2 buckets - no empty fabricated bucket for 10:05
+    assert len(buckets) == 2
+    assert buckets[0].bucket_start == datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+    assert buckets[1].bucket_start == datetime(2026, 11, 13, 10, 10, 0, tzinfo=timezone.utc)
+
+
+def test_multiple_sensors_segregated_cleanly():
+    """Verify multi-sensor datasets are cleanly partitioned without cross-sensor data mingling."""
+    t0 = datetime(2026, 11, 13, 10, 1, 0, tzinfo=timezone.utc)
+
+    mixed_dataset = [
+        {"sensor_id": "US_UPSTREAM_01", "value": 12.0, "status": "OK", "timestamp": t0, "unit": "cm", "metadata": {"is_valid": True}},
+        {"sensor_id": "FS_FLUME_01", "value": 45.0, "status": "OK", "timestamp": t0, "unit": "L/min", "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "value": 14.0, "status": "OK", "timestamp": t0 + timedelta(seconds=30), "unit": "cm", "metadata": {"is_valid": True}},
+        {"sensor_id": "FS_FLUME_01", "value": 55.0, "status": "OK", "timestamp": t0 + timedelta(seconds=30), "unit": "L/min", "metadata": {"is_valid": True}},
+    ]
+
+    # 1. Unfiltered aggregation segregates both sensors
+    all_buckets = aggregate_time_series(mixed_dataset, bucket_interval_seconds=300)
+    assert len(all_buckets) == 2
+    sensor_map = {b.sensor_id: b for b in all_buckets}
+    assert "US_UPSTREAM_01" in sensor_map
+    assert "FS_FLUME_01" in sensor_map
+    assert sensor_map["US_UPSTREAM_01"].avg_value == 13.0
+    assert sensor_map["US_UPSTREAM_01"].unit == "cm"
+    assert sensor_map["FS_FLUME_01"].avg_value == 50.0
+    assert sensor_map["FS_FLUME_01"].unit == "L/min"
+
+    # 2. Filtered by sensor_id
+    us_buckets = aggregate_time_series(mixed_dataset, bucket_interval_seconds=300, sensor_id="US_UPSTREAM_01")
+    assert len(us_buckets) == 1
+    assert us_buckets[0].sensor_id == "US_UPSTREAM_01"
+    assert us_buckets[0].avg_value == 13.0
+
+
+def test_physical_and_simulated_source_separation():
+    """Verify physical and simulated telemetry streams are strictly isolated during rollup."""
+    t0 = datetime(2026, 11, 13, 10, 1, 0, tzinfo=timezone.utc)
+
+    dataset = [
+        {"sensor_id": "US_UPSTREAM_01", "source": "PHYSICAL", "value": 10.0, "status": "OK", "timestamp": t0, "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "source": "SIMULATED", "value": 99.0, "status": "OK", "timestamp": t0 + timedelta(seconds=10), "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "source": "LIVE", "value": 12.0, "status": "OK", "timestamp": t0 + timedelta(seconds=20), "metadata": {"is_valid": True}},
+    ]
+
+    # Query PHYSICAL only (LIVE maps to PHYSICAL)
+    phys_buckets = aggregate_time_series(dataset, bucket_interval_seconds=300, source="PHYSICAL")
+    assert len(phys_buckets) == 1
+    assert phys_buckets[0].sample_count == 2
+    assert phys_buckets[0].avg_value == 11.0 # (10 + 12) / 2
+
+    # Query SIMULATED only
+    sim_buckets = aggregate_time_series(dataset, bucket_interval_seconds=300, source="SIMULATED")
+    assert len(sim_buckets) == 1
+    assert sim_buckets[0].sample_count == 1
+    assert sim_buckets[0].avg_value == 99.0
+
+
+def test_faulted_and_invalid_readings_excluded_from_stats():
+    """Verify corrupted/faulted measurements are excluded from statistical metrics while counted in sample_count."""
+    t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+
+    dataset = [
+        {"sensor_id": "US_UPSTREAM_01", "value": 10.0, "status": "OK", "timestamp": t0, "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "value": 20.0, "status": "OK", "timestamp": t0 + timedelta(seconds=30), "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "value": 0.0, "status": "FAULT", "timestamp": t0 + timedelta(seconds=60), "metadata": {"is_valid": False, "fault_code": "TIMEOUT_NO_ECHO"}},
+        {"sensor_id": "US_UPSTREAM_01", "value": 999.0, "status": "FAULT", "timestamp": t0 + timedelta(seconds=90), "metadata": {"is_valid": False, "fault_code": "SPIKE_ANOMALY"}},
+    ]
+
+    buckets = aggregate_time_series(dataset, bucket_interval_seconds=300, unit="cm")
+
+    assert len(buckets) == 1
+    b = buckets[0]
+    assert b.sample_count == 4
+    assert b.valid_sample_count == 2
+    assert b.min_value == 10.0
+    assert b.max_value == 20.0
+    assert b.avg_value == 15.0
+
+
+def test_valid_zero_flow_preserved():
+    """Verify 0.0 L/min flow readings with OK health status are strictly included in statistical metrics."""
+    t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+
+    dataset = [
+        {"sensor_id": "FS_FLUME_01", "value": 0.0, "status": "OK", "timestamp": t0, "unit": "L/min", "metadata": {"is_valid": True}},
+        {"sensor_id": "FS_FLUME_01", "value": 10.0, "status": "OK", "timestamp": t0 + timedelta(seconds=60), "unit": "L/min", "metadata": {"is_valid": True}},
+    ]
+
+    buckets = aggregate_time_series(dataset, bucket_interval_seconds=300, unit="L/min")
+
+    assert len(buckets) == 1
+    b = buckets[0]
+    assert b.sample_count == 2
+    assert b.valid_sample_count == 2
+    assert b.min_value == 0.0
+    assert b.max_value == 10.0
+    assert b.avg_value == 5.0 # (0.0 + 10.0) / 2 = 5.0
+
+
+@pytest.mark.anyio
+async def test_large_historical_windows_bounded_and_truncated():
+    """Verify historical queries support up to 10,000 samples and signal truncation when limit is reached."""
+    repo = PersistenceRepository(
+        supabase_url=None,
+        supabase_key=None,
+        service_role_key=None,
+    )
+
+    t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+    # Persist 500 records
+    readings = [
+        SensorReadingContract(
+            sensor_id="US_UPSTREAM_01",
+            section_id="SEC_SCREENING_01",
+            sensor_type=SensorType.WATER_LEVEL,
+            value=5.0,
+            unit=MeasurementUnit.CENTIMETRE,
+            source=DataSource.PHYSICAL,
+            status=SensorHealthStatus.OK,
+            timestamp=t0 + timedelta(seconds=i),
+        )
+        for i in range(500)
+    ]
+    await repo.persist_readings(readings)
+
+    # Query with a tight limit (50) to test truncation
+    records = await repo.query_historical_telemetry(
+        sensor_id="US_UPSTREAM_01",
+        limit=50,
+        chronological=True,
+    )
+    assert len(records) == 50
+
+    # Query with higher limit up to 10000
+    all_records = await repo.query_historical_telemetry(
+        sensor_id="US_UPSTREAM_01",
+        limit=10000,
+        chronological=True,
+    )
+    assert len(all_records) == 500
+
+
+def test_existing_60_second_rollups_remain_compatible():
+    """Verify existing 60-second rollup semantics, schema, and calculations remain 100% backward-compatible."""
+    t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+
+    dataset = [
+        {"sensor_id": "US_UPSTREAM_01", "value": 5.0, "status": "OK", "timestamp": t0 + timedelta(seconds=10), "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "value": 7.0, "status": "OK", "timestamp": t0 + timedelta(seconds=20), "metadata": {"is_valid": True}},
+        {"sensor_id": "US_UPSTREAM_01", "value": 10.0, "status": "OK", "timestamp": t0 + timedelta(seconds=70), "metadata": {"is_valid": True}},
+    ]
+
+    buckets = aggregate_time_series(dataset, bucket_interval_seconds=60, unit="cm")
+
+    assert len(buckets) == 2
+    assert buckets[0].sample_count == 2
+    assert buckets[0].avg_value == 6.0
+    assert buckets[1].sample_count == 1
+    assert buckets[1].avg_value == 10.0
+
+
+def test_api_rollup_time_window_and_contract_compatibility(client: TestClient):
+    """Verify GET /api/v1/telemetry/analytics/rollup handles time-window parameters and preserves the full contract."""
+    # 1. Invalid time range (start_time > end_time) returns 400
+    resp_invalid_range = client.get(
+        "/api/v1/telemetry/analytics/rollup?"
+        "sensor_id=US_UPSTREAM_01&"
+        "start_time=2026-11-13T12:00:00Z&"
+        "end_time=2026-11-13T11:00:00Z"
+    )
+    assert resp_invalid_range.status_code == 400
+    assert "start_time must not be later than end_time" in resp_invalid_range.json()["detail"]
+
+    # 2. 5-minute rollup with time window returns 200 and matches contract keys
+    resp_5m = client.get(
+        "/api/v1/telemetry/analytics/rollup?"
+        "sensor_id=US_UPSTREAM_01&"
+        "interval_seconds=300&"
+        "start_time=2026-11-13T10:00:00Z&"
+        "end_time=2026-11-13T11:00:00Z"
+    )
+    assert resp_5m.status_code == 200
+    data = resp_5m.json()
+
+    # Verify all expected response keys exist
+    expected_keys = {
+        "status",
+        "sensor_id",
+        "source",
+        "interval_seconds",
+        "dataset_sample_count",
+        "is_dataset_truncated",
+        "truncation_warning",
+        "bucket_count",
+        "buckets",
+    }
+    assert expected_keys.issubset(data.keys())
+    assert data["status"] == "success"
+    assert data["sensor_id"] == "US_UPSTREAM_01"
+    assert data["interval_seconds"] == 300
+    assert isinstance(data["buckets"], list)

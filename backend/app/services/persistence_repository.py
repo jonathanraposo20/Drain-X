@@ -54,6 +54,8 @@ class PersistenceRepository:
     Modular persistence client interfacing FastAPI with Supabase Cloud PostgREST.
     Operates in fallback/mock mode when unconfigured.
     """
+    POSTGREST_PAGE_SIZE: int = 1000
+
     def __init__(
         self,
         supabase_url: Any = _UNSET,
@@ -313,8 +315,8 @@ class PersistenceRepository:
 
         # Local buffer is maintained as fallback and secondary audit
         self._in_memory_records.extend(records)
-        if len(self._in_memory_records) > 2000:
-            self._in_memory_records = self._in_memory_records[-2000:]
+        if len(self._in_memory_records) > 20000:
+            self._in_memory_records = self._in_memory_records[-20000:]
 
         if not self._is_configured:
             self._total_persisted_count += len(records)
@@ -362,7 +364,7 @@ class PersistenceRepository:
         Query historical telemetry with operational source, device, and time-range filtering.
         Supports pagination via limit & offset.
         """
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(limit, 10000))
         offset = max(0, offset)
 
         if not self._is_configured:
@@ -387,26 +389,11 @@ class PersistenceRepository:
 
         endpoint = f"{self._supabase_url}/rest/v1/sensor_readings"
         order_direction = "asc" if chronological else "desc"
+        page_size = getattr(self, "POSTGREST_PAGE_SIZE", 1000)
 
-        # Build query params as list of tuples to support multiple timestamp constraints
-        query_params: List[Tuple[str, str]] = [
-            ("order", f"timestamp.{order_direction}"),
-            ("limit", str(limit)),
-        ]
-        if offset > 0:
-            query_params.append(("offset", str(offset)))
-        if sensor_id:
-            query_params.append(("sensor_id", f"eq.{sensor_id}"))
-        if source:
-            query_params.append(("source", f"eq.{source}"))
-        if section_id:
-            query_params.append(("section_id", f"eq.{section_id}"))
-        if device_id:
-            query_params.append(("device_id", f"eq.{device_id}"))
-        if start_time:
-            query_params.append(("timestamp", f"gte.{start_time.isoformat()}"))
-        if end_time:
-            query_params.append(("timestamp", f"lte.{end_time.isoformat()}"))
+        all_records: List[Dict[str, Any]] = []
+        current_offset = offset
+        remaining_limit = limit
 
         headers = {
             "apikey": self._active_key,
@@ -414,17 +401,64 @@ class PersistenceRepository:
             "Accept": "application/json",
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
-                resp = await client.get(endpoint, params=query_params, headers=headers)
-                if resp.status_code == 200:
-                    self._last_persistence_error = None
-                    return resp.json()
-                logger.warning(f"Supabase query error: HTTP {resp.status_code}")
-                return []
-        except Exception as exc:
-            logger.warning(f"Supabase query network error: {exc}")
-            return []
+        async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
+            while remaining_limit > 0:
+                fetch_count = min(remaining_limit, page_size)
+
+                # Build query params as list of tuples to support multiple timestamp constraints
+                query_params: List[Tuple[str, str]] = [
+                    ("order", f"timestamp.{order_direction},id.{order_direction}"),
+                    ("limit", str(fetch_count)),
+                ]
+                if current_offset > 0:
+                    query_params.append(("offset", str(current_offset)))
+                if sensor_id:
+                    query_params.append(("sensor_id", f"eq.{sensor_id}"))
+                if source:
+                    query_params.append(("source", f"eq.{source}"))
+                if section_id:
+                    query_params.append(("section_id", f"eq.{section_id}"))
+                if device_id:
+                    query_params.append(("device_id", f"eq.{device_id}"))
+                if start_time:
+                    query_params.append(("timestamp", f"gte.{start_time.isoformat()}"))
+                if end_time:
+                    query_params.append(("timestamp", f"lte.{end_time.isoformat()}"))
+
+                try:
+                    resp = await client.get(endpoint, params=query_params, headers=headers)
+                except Exception as exc:
+                    err_msg = f"Supabase query network error: {exc}"
+                    self._last_persistence_error = err_msg
+                    logger.warning(err_msg)
+                    raise RuntimeError(err_msg) from exc
+
+                if resp.status_code != 200:
+                    err_msg = f"Supabase query error: HTTP {resp.status_code} - {resp.text}"
+                    self._last_persistence_error = err_msg
+                    logger.warning(err_msg)
+                    raise RuntimeError(err_msg)
+
+                self._last_persistence_error = None
+                page_data = resp.json()
+                if not isinstance(page_data, list):
+                    err_msg = f"Supabase query returned unexpected non-list data: {type(page_data)}"
+                    self._last_persistence_error = err_msg
+                    logger.warning(err_msg)
+                    raise RuntimeError(err_msg)
+
+                if not page_data:
+                    break
+
+                all_records.extend(page_data)
+                current_offset += len(page_data)
+                remaining_limit -= len(page_data)
+
+                # If server returned fewer records than fetch_count, result set is exhausted
+                if len(page_data) < fetch_count:
+                    break
+
+        return all_records
 
     async def persist_mode_transition(
         self,

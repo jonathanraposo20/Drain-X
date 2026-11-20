@@ -30,7 +30,7 @@ import json
 import base64
 from typing import Optional, List, Dict, Any
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, patch, MagicMock
 from fastapi.testclient import TestClient
 import httpx
@@ -244,7 +244,7 @@ async def test_supabase_historical_query_formatting():
         for k, v in params:
             param_dict.setdefault(k, []).append(v)
 
-        assert "order" in param_dict and param_dict["order"][0] == "timestamp.asc"
+        assert "order" in param_dict and param_dict["order"][0] == "timestamp.asc,id.asc"
         assert "limit" in param_dict and param_dict["limit"][0] == "50"
         assert "offset" in param_dict and param_dict["offset"][0] == "10"
         assert "sensor_id" in param_dict and param_dict["sensor_id"][0] == "eq.US_UPSTREAM_01"
@@ -623,5 +623,320 @@ def test_persistence_ping_endpoint(client: TestClient):
     data = res.json()
     assert "status" in data
     assert "mode" in data
+
+
+# --------------------------------------------------------------------
+# 7. Phase 3.2.1: Supabase Bounded Pagination & Error Hardening
+# --------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_supabase_pagination_7200_records_over_multiple_pages():
+    """Verify 7,200 records are fetched across 8 discrete pages of <= 1,000 records each."""
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+
+    t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+
+    # Simulated server dataset with 10,000 records
+    def mock_get_handler(url, params=None, headers=None):
+        param_dict = dict(params or [])
+        offset_val = int(param_dict.get("offset", 0))
+        limit_val = int(param_dict.get("limit", 1000))
+        assert limit_val <= 1000, f"Page limit {limit_val} exceeded 1,000 record ceiling"
+
+        page_records = [
+            {
+                "id": offset_val + i,
+                "sensor_id": "US_UPSTREAM_01",
+                "value": 10.0 + (offset_val + i) * 0.01,
+                "timestamp": (t0 + timedelta(seconds=offset_val + i)).isoformat(),
+                "source": "PHYSICAL",
+                "status": "OK",
+                "unit": "cm",
+            }
+            for i in range(min(limit_val, max(0, 10000 - offset_val)))
+        ]
+        return httpx.Response(status_code=200, json=page_records)
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_get_handler) as mock_get:
+        results = await repo.query_historical_telemetry(
+            sensor_id="US_UPSTREAM_01",
+            source="PHYSICAL",
+            limit=7200,
+            chronological=True,
+        )
+
+        assert len(results) == 7200
+        # 7 full pages of 1,000 + 1 partial final page of 200 = 8 calls
+        assert mock_get.call_count == 8
+
+        # Verify ordering across page boundaries (page 1 boundary: record 999 to 1000)
+        assert results[999]["id"] == 999
+        assert results[1000]["id"] == 1000
+        assert results[999]["timestamp"] < results[1000]["timestamp"]
+
+        # Verify no duplicates
+        ids = [r["id"] for r in results]
+        assert len(ids) == len(set(ids))
+
+        # Verify no skipped records
+        assert ids == list(range(7200))
+
+
+@pytest.mark.anyio
+async def test_supabase_pagination_server_page_limit_and_filters():
+    """Verify sensor, source, start_time, and end_time filters persist across every page."""
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+
+    t_start = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+    t_end = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
+
+    calls_received = []
+
+    def mock_get_handler(url, params=None, headers=None):
+        param_list = params or []
+        calls_received.append(param_list)
+        param_dict = dict(param_list)
+        limit_val = int(param_dict.get("limit", 1000))
+        # Return 1,000 records per page
+        return httpx.Response(
+            status_code=200,
+            json=[{"id": i, "sensor_id": "US_UPSTREAM_01", "source": "PHYSICAL", "timestamp": t_start.isoformat()} for i in range(limit_val)],
+        )
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_get_handler):
+        results = await repo.query_historical_telemetry(
+            sensor_id="US_UPSTREAM_01",
+            source="PHYSICAL",
+            start_time=t_start,
+            end_time=t_end,
+            limit=2500,
+            chronological=True,
+        )
+
+        assert len(results) == 2500
+        # 1000 + 1000 + 500 = 3 pages
+        assert len(calls_received) == 3
+
+        for call_params in calls_received:
+            param_dict = dict(call_params)
+            assert param_dict.get("sensor_id") == "eq.US_UPSTREAM_01"
+            assert param_dict.get("source") == "eq.PHYSICAL"
+            assert param_dict.get("order") == "timestamp.asc,id.asc"
+
+            # Check timestamp filters
+            ts_filters = [v for k, v in call_params if k == "timestamp"]
+            assert any(f.startswith("gte.") for f in ts_filters)
+            assert any(f.startswith("lte.") for f in ts_filters)
+
+
+@pytest.mark.anyio
+async def test_supabase_pagination_partial_and_empty_final_page():
+    """Verify pagination terminates cleanly on partial or empty final page."""
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+
+    # 1. Partial final page: requested 2,500, but database only has 1,350 matching
+    def mock_partial_page(url, params=None, headers=None):
+        param_dict = dict(params or [])
+        offset_val = int(param_dict.get("offset", 0))
+        limit_val = int(param_dict.get("limit", 1000))
+
+        count = max(0, min(limit_val, 1350 - offset_val))
+        return httpx.Response(status_code=200, json=[{"id": offset_val + i} for i in range(count)])
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_partial_page) as mock_get:
+        results = await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01", limit=2500)
+        assert len(results) == 1350
+        # Page 1: 1000, Page 2: 350 (< 1000, terminates) -> exactly 2 calls
+        assert mock_get.call_count == 2
+
+    # 2. Empty final page: table has exactly 1,000 records
+    def mock_exact_page(url, params=None, headers=None):
+        param_dict = dict(params or [])
+        offset_val = int(param_dict.get("offset", 0))
+        limit_val = int(param_dict.get("limit", 1000))
+
+        count = max(0, min(limit_val, 1000 - offset_val))
+        return httpx.Response(status_code=200, json=[{"id": offset_val + i} for i in range(count)])
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_exact_page) as mock_get_exact:
+        results = await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01", limit=2500)
+        assert len(results) == 1000
+        # Page 1: 1000 (fetch_count=1000), Page 2: 0 (fetch_count=1000, empty -> break) -> 2 calls
+        assert mock_get_exact.call_count == 2
+
+
+@pytest.mark.anyio
+async def test_supabase_pagination_error_propagation_and_status():
+    """Verify PostgREST errors raise RuntimeError with diagnostics and update last_persistence_error."""
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+
+    # 1. HTTP 500 error raises RuntimeError
+    mock_500 = httpx.Response(status_code=500, text="Internal Database Fault")
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_500):
+        with pytest.raises(RuntimeError) as exc_info:
+            await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01")
+        assert "500" in str(exc_info.value)
+        assert "Internal Database Fault" in str(exc_info.value)
+        assert "500" in repo.get_status().last_persistence_error
+
+    # 2. Network timeout raises RuntimeError
+    with patch("httpx.AsyncClient.get", side_effect=httpx.ConnectTimeout("Gateway timed out")):
+        with pytest.raises(RuntimeError) as exc_net:
+            await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01")
+        assert "Gateway timed out" in str(exc_net.value)
+        assert "network error" in repo.get_status().last_persistence_error.lower()
+
+
+def test_api_rollup_downstream_error_returns_502(client: TestClient):
+    """Verify all 3 telemetry endpoints return generic 502 Bad Gateway without exposing internal DB error details."""
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+    mock_500 = httpx.Response(status_code=500, text="Internal SQL syntax error in table public.sensor_readings at offset 0")
+
+    with patch("app.api.v1.telemetry.persistence_repo", repo), patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_500):
+        # 1. Rollup endpoint
+        resp_rollup = client.get("/api/v1/telemetry/analytics/rollup?sensor_id=US_UPSTREAM_01")
+        assert resp_rollup.status_code == 502
+        assert resp_rollup.json()["detail"] == "Downstream database service unavailable"
+        assert "sensor_readings" not in resp_rollup.json()["detail"]
+        assert "SQL" not in resp_rollup.json()["detail"]
+
+        # 2. Historical query endpoint
+        resp_hist = client.get("/api/v1/telemetry/persistence/historical?sensor_id=US_UPSTREAM_01")
+        assert resp_hist.status_code == 502
+        assert resp_hist.json()["detail"] == "Downstream database service unavailable"
+        assert "sensor_readings" not in resp_hist.json()["detail"]
+
+        # 3. Trend endpoint
+        resp_trend = client.get("/api/v1/telemetry/analytics/trend?sensor_id=US_UPSTREAM_01")
+        assert resp_trend.status_code == 502
+        assert resp_trend.json()["detail"] == "Downstream database service unavailable"
+        assert "sensor_readings" not in resp_trend.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_supabase_pagination_identical_timestamps_across_page_boundaries():
+    """Verify records sharing identical timestamps across page boundaries are neither duplicated nor skipped."""
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+    repo.POSTGREST_PAGE_SIZE = 5
+
+    # 10 records total.
+    # Records 3, 4, 5, 6 share the identical timestamp!
+    # Page boundary will fall between record index 4 and 5 (page 1: 0..4, page 2: 5..9).
+    shared_ts = "2026-11-14T10:14:11.518167+00:00"
+    all_table_data = [
+        {"id": "rec_00", "timestamp": "2026-11-14T10:10:00.000000+00:00"},
+        {"id": "rec_01", "timestamp": "2026-11-14T10:11:00.000000+00:00"},
+        {"id": "rec_02", "timestamp": "2026-11-14T10:12:00.000000+00:00"},
+        {"id": "rec_03", "timestamp": shared_ts},
+        {"id": "rec_04", "timestamp": shared_ts},
+        {"id": "rec_05", "timestamp": shared_ts},
+        {"id": "rec_06", "timestamp": shared_ts},
+        {"id": "rec_07", "timestamp": "2026-11-14T10:16:00.000000+00:00"},
+        {"id": "rec_08", "timestamp": "2026-11-14T10:17:00.000000+00:00"},
+        {"id": "rec_09", "timestamp": "2026-11-14T10:18:00.000000+00:00"},
+    ]
+
+    # Deterministic sorting simulator matching PostgREST: (timestamp asc, id asc)
+    def mock_get_tiebreaker(url, params=None, headers=None):
+        param_dict = dict(params or [])
+        assert param_dict.get("order") == "timestamp.asc,id.asc", "Must use deterministic secondary sort key"
+        offset_val = int(param_dict.get("offset", 0))
+        limit_val = int(param_dict.get("limit", 5))
+
+        sorted_data = sorted(all_table_data, key=lambda r: (r["timestamp"], r["id"]))
+        slice_data = sorted_data[offset_val : offset_val + limit_val]
+        return httpx.Response(status_code=200, json=slice_data)
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_get_tiebreaker):
+        results = await repo.query_historical_telemetry(limit=10, chronological=True)
+
+        assert len(results) == 10
+        result_ids = [r["id"] for r in results]
+
+        # Verify zero duplicates
+        assert len(result_ids) == len(set(result_ids))
+
+        # Verify no skipped records across page boundary
+        expected_ids = ["rec_00", "rec_01", "rec_02", "rec_03", "rec_04", "rec_05", "rec_06", "rec_07", "rec_08", "rec_09"]
+        assert result_ids == expected_ids
+
+
+@pytest.mark.anyio
+async def test_supabase_pagination_limit_reached_before_dataset_exhaustion():
+    """Verify query stops immediately when requested limit is reached without fetching remaining data."""
+    repo = PersistenceRepository(
+        supabase_url="https://mock-project.supabase.co",
+        supabase_key="anon-key",
+    )
+
+    # Table has 50,000 records
+    call_counts = 0
+
+    def mock_large_dataset(url, params=None, headers=None):
+        nonlocal call_counts
+        call_counts += 1
+        param_dict = dict(params or [])
+        limit_val = int(param_dict.get("limit", 1000))
+        return httpx.Response(status_code=200, json=[{"id": i} for i in range(limit_val)])
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_large_dataset):
+        results = await repo.query_historical_telemetry(sensor_id="US_UPSTREAM_01", limit=1500)
+        assert len(results) == 1500
+        # Page 1: 1000, Page 2: 500 = 2 calls
+        assert call_counts == 2
+
+
+@pytest.mark.anyio
+async def test_in_memory_fallback_unaffected_by_pagination_hardening():
+    """Verify unconfigured in-memory fallback continues to slice internal buffer cleanly without HTTP calls."""
+    repo = PersistenceRepository(
+        supabase_url=None,
+        supabase_key=None,
+    )
+
+    t0 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+    readings = [
+        SensorReadingContract(
+            sensor_id="US_UPSTREAM_01",
+            section_id="SEC_SCREENING_01",
+            sensor_type=SensorType.WATER_LEVEL,
+            value=5.0 + i,
+            unit=MeasurementUnit.CENTIMETRE,
+            source=DataSource.PHYSICAL,
+            status=SensorHealthStatus.OK,
+            timestamp=t0 + timedelta(seconds=i),
+        )
+        for i in range(100)
+    ]
+    await repo.persist_readings(readings)
+
+    # Should fetch slice [10:30] directly from in-memory records
+    results = await repo.query_historical_telemetry(
+        sensor_id="US_UPSTREAM_01",
+        limit=20,
+        offset=10,
+        chronological=True,
+    )
+    assert len(results) == 20
+    assert results[0]["value"] == 15.0 # i=10
+    assert results[-1]["value"] == 34.0 # i=29
 
 
