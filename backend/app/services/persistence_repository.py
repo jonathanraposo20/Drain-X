@@ -49,11 +49,34 @@ class DatabaseConfigStatus(BaseModel):
     last_ping_ms: Optional[float] = None
 
 
+def _parse_record_datetime(ts_val: Any) -> Optional[datetime]:
+    """
+    Parses a timestamp value into a timezone-aware UTC datetime.
+    Gracefully returns None for malformed, non-string, or empty timestamp values.
+    """
+    if isinstance(ts_val, datetime):
+        if ts_val.tzinfo is None or ts_val.tzinfo.utcoffset(ts_val) is None:
+            return ts_val.replace(tzinfo=timezone.utc)
+        return ts_val
+    if not isinstance(ts_val, str) or not ts_val.strip():
+        return None
+    try:
+        clean_str = ts_val.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_str)
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
 class PersistenceRepository:
     """
     Modular persistence client interfacing FastAPI with Supabase Cloud PostgREST.
     Operates in fallback/mock mode when unconfigured.
     """
+    POSTGREST_PAGE_SIZE: int = 1000
+
     def __init__(
         self,
         supabase_url: Any = _UNSET,
@@ -313,8 +336,8 @@ class PersistenceRepository:
 
         # Local buffer is maintained as fallback and secondary audit
         self._in_memory_records.extend(records)
-        if len(self._in_memory_records) > 2000:
-            self._in_memory_records = self._in_memory_records[-2000:]
+        if len(self._in_memory_records) > 20000:
+            self._in_memory_records = self._in_memory_records[-20000:]
 
         if not self._is_configured:
             self._total_persisted_count += len(records)
@@ -362,51 +385,54 @@ class PersistenceRepository:
         Query historical telemetry with operational source, device, and time-range filtering.
         Supports pagination via limit & offset.
         """
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(limit, 10000))
         offset = max(0, offset)
 
         if not self._is_configured:
             results = list(self._in_memory_records)
             if sensor_id:
-                results = [r for r in results if r["sensor_id"] == sensor_id]
+                results = [r for r in results if r.get("sensor_id") == sensor_id]
             if source:
-                results = [r for r in results if r["source"] == source]
+                norm_source = str(source).upper()
+                if norm_source in ("PHYSICAL", "LIVE"):
+                    results = [r for r in results if str(r.get("source", "")).upper() in ("PHYSICAL", "LIVE")]
+                else:
+                    results = [r for r in results if str(r.get("source", "")).upper() == norm_source]
             if section_id:
-                results = [r for r in results if r["section_id"] == section_id]
+                results = [r for r in results if r.get("section_id") == section_id]
             if device_id:
                 results = [r for r in results if r.get("device_id") == device_id]
             if start_time:
-                iso_start = start_time.isoformat()
-                results = [r for r in results if r["timestamp"] >= iso_start]
+                aware_start = start_time if (start_time.tzinfo and start_time.tzinfo.utcoffset(start_time)) else start_time.replace(tzinfo=timezone.utc)
+                results = [
+                    r for r in results
+                    if _parse_record_datetime(r.get("timestamp")) is not None
+                    and _parse_record_datetime(r.get("timestamp")) >= aware_start
+                ]
             if end_time:
-                iso_end = end_time.isoformat()
-                results = [r for r in results if r["timestamp"] <= iso_end]
+                aware_end = end_time if (end_time.tzinfo and end_time.tzinfo.utcoffset(end_time)) else end_time.replace(tzinfo=timezone.utc)
+                results = [
+                    r for r in results
+                    if _parse_record_datetime(r.get("timestamp")) is not None
+                    and _parse_record_datetime(r.get("timestamp")) <= aware_end
+                ]
 
-            results.sort(key=lambda r: r["timestamp"], reverse=not chronological)
+            def _in_memory_sort_key(rec: Dict[str, Any]) -> Tuple[datetime, str]:
+                parsed_dt = _parse_record_datetime(rec.get("timestamp"))
+                safe_dt = parsed_dt if parsed_dt is not None else datetime.min.replace(tzinfo=timezone.utc)
+                safe_id = str(rec.get("id", ""))
+                return (safe_dt, safe_id)
+
+            results.sort(key=_in_memory_sort_key, reverse=not chronological)
             return results[offset : offset + limit]
 
         endpoint = f"{self._supabase_url}/rest/v1/sensor_readings"
         order_direction = "asc" if chronological else "desc"
+        page_size = getattr(self, "POSTGREST_PAGE_SIZE", 1000)
 
-        # Build query params as list of tuples to support multiple timestamp constraints
-        query_params: List[Tuple[str, str]] = [
-            ("order", f"timestamp.{order_direction}"),
-            ("limit", str(limit)),
-        ]
-        if offset > 0:
-            query_params.append(("offset", str(offset)))
-        if sensor_id:
-            query_params.append(("sensor_id", f"eq.{sensor_id}"))
-        if source:
-            query_params.append(("source", f"eq.{source}"))
-        if section_id:
-            query_params.append(("section_id", f"eq.{section_id}"))
-        if device_id:
-            query_params.append(("device_id", f"eq.{device_id}"))
-        if start_time:
-            query_params.append(("timestamp", f"gte.{start_time.isoformat()}"))
-        if end_time:
-            query_params.append(("timestamp", f"lte.{end_time.isoformat()}"))
+        all_records: List[Dict[str, Any]] = []
+        remaining_limit = limit
+        cursor: Optional[Tuple[str, str]] = None
 
         headers = {
             "apikey": self._active_key,
@@ -414,17 +440,88 @@ class PersistenceRepository:
             "Accept": "application/json",
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
-                resp = await client.get(endpoint, params=query_params, headers=headers)
-                if resp.status_code == 200:
-                    self._last_persistence_error = None
-                    return resp.json()
-                logger.warning(f"Supabase query error: HTTP {resp.status_code}")
-                return []
-        except Exception as exc:
-            logger.warning(f"Supabase query network error: {exc}")
-            return []
+        async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
+            while remaining_limit > 0:
+                fetch_count = min(remaining_limit, page_size)
+
+                # Build query params as list of tuples to support multiple constraints
+                query_params: List[Tuple[str, str]] = [
+                    ("order", f"timestamp.{order_direction},id.{order_direction}"),
+                    ("limit", str(fetch_count)),
+                ]
+                if cursor is None:
+                    if offset > 0:
+                        query_params.append(("offset", str(offset)))
+                else:
+                    c_ts, c_id = cursor
+                    if chronological:
+                        query_params.append(("or", f"(timestamp.gt.{c_ts},and(timestamp.eq.{c_ts},id.gt.{c_id}))"))
+                    else:
+                        query_params.append(("or", f"(timestamp.lt.{c_ts},and(timestamp.eq.{c_ts},id.lt.{c_id}))"))
+
+                if sensor_id:
+                    query_params.append(("sensor_id", f"eq.{sensor_id}"))
+                if source:
+                    norm_source = str(source).upper()
+                    if norm_source in ("PHYSICAL", "LIVE"):
+                        query_params.append(("source", "in.(PHYSICAL,LIVE)"))
+                    else:
+                        query_params.append(("source", f"eq.{source}"))
+                if section_id:
+                    query_params.append(("section_id", f"eq.{section_id}"))
+                if device_id:
+                    query_params.append(("device_id", f"eq.{device_id}"))
+                if start_time:
+                    query_params.append(("timestamp", f"gte.{start_time.isoformat()}"))
+                if end_time:
+                    query_params.append(("timestamp", f"lte.{end_time.isoformat()}"))
+
+                try:
+                    resp = await client.get(endpoint, params=query_params, headers=headers)
+                except Exception as exc:
+                    err_msg = f"Supabase query network error: {exc}"
+                    self._last_persistence_error = err_msg
+                    logger.warning(err_msg)
+                    raise RuntimeError(err_msg) from exc
+
+                if resp.status_code != 200:
+                    err_msg = f"Supabase query error: HTTP {resp.status_code} - {resp.text}"
+                    self._last_persistence_error = err_msg
+                    logger.warning(err_msg)
+                    raise RuntimeError(err_msg)
+
+                try:
+                    page_data = resp.json()
+                except Exception as exc:
+                    err_msg = f"Supabase query returned malformed JSON: {exc}"
+                    self._last_persistence_error = err_msg
+                    logger.warning(err_msg)
+                    raise RuntimeError(err_msg) from exc
+
+                if not isinstance(page_data, list):
+                    err_msg = f"Supabase query returned unexpected non-list data: {type(page_data)}"
+                    self._last_persistence_error = err_msg
+                    logger.warning(err_msg)
+                    raise RuntimeError(err_msg)
+
+                # Clear last error only after successful response decode and validation
+                self._last_persistence_error = None
+
+                if not page_data:
+                    break
+
+                all_records.extend(page_data)
+                remaining_limit -= len(page_data)
+
+                last_rec = page_data[-1]
+                last_ts = last_rec.get("timestamp")
+                last_id = str(last_rec.get("id", ""))
+                if last_ts is not None:
+                    cursor = (last_ts, last_id)
+                else:
+                    break
+
+        return all_records
 
     async def persist_mode_transition(
         self,

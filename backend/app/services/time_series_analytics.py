@@ -103,6 +103,8 @@ def aggregate_time_series(
     readings: List[Dict[str, Any]],
     bucket_interval_seconds: int = 60,
     unit: str = "cm",
+    sensor_id: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> List[TimeSeriesBucket]:
     """
     Groups readings into time buckets (e.g. 60s for 1-minute, 300s for 5-minute)
@@ -112,27 +114,55 @@ def aggregate_time_series(
     if not readings:
         return []
 
+    # Optional source filtering (normalizing PHYSICAL and LIVE as equivalent)
+    if source:
+        norm_source = "PHYSICAL" if str(source).upper() in ("PHYSICAL", "LIVE") else str(source).upper()
+        filtered_by_source = []
+        for r in readings:
+            r_src = r.get("source")
+            r_src_str = r_src.value if hasattr(r_src, "value") else str(r_src).upper() if r_src else ""
+            if norm_source == "PHYSICAL":
+                if r_src_str in ("PHYSICAL", "LIVE"):
+                    filtered_by_source.append(r)
+            else:
+                if r_src_str == norm_source:
+                    filtered_by_source.append(r)
+        readings = filtered_by_source
+
+    # Optional sensor filtering
+    if sensor_id:
+        readings = [r for r in readings if r.get("sensor_id") == sensor_id]
+
+    if not readings:
+        return []
+
     # Sort readings chronologically (oldest to newest)
     sorted_readings = sorted(readings, key=lambda r: _parse_timestamp(r.get("timestamp")))
 
-    buckets: Dict[int, List[Dict[str, Any]]] = {}
-    sensor_id = sorted_readings[0].get("sensor_id", "UNKNOWN")
+    # Group by (sensor_id, bucket_key) to support multiple sensors cleanly
+    buckets: Dict[tuple[str, int], List[Dict[str, Any]]] = {}
 
     for r in sorted_readings:
+        sid = r.get("sensor_id", "UNKNOWN")
         ts = _parse_timestamp(r.get("timestamp"))
         epoch_sec = int(ts.timestamp())
         bucket_key = (epoch_sec // bucket_interval_seconds) * bucket_interval_seconds
-        buckets.setdefault(bucket_key, []).append(r)
+        buckets.setdefault((sid, bucket_key), []).append(r)
 
     results: List[TimeSeriesBucket] = []
-    for bucket_key in sorted(buckets.keys()):
-        window_samples = buckets[bucket_key]
+    # Sort deterministically by bucket_key, then sensor_id
+    for (sid, bucket_key) in sorted(buckets.keys(), key=lambda k: (k[1], k[0])):
+        window_samples = buckets[(sid, bucket_key)]
         valid_values = [
             float(r["value"]) for r in window_samples if is_reading_valid(r)
         ]
 
         b_start = datetime.fromtimestamp(bucket_key, tz=timezone.utc)
         b_end = datetime.fromtimestamp(bucket_key + bucket_interval_seconds, tz=timezone.utc)
+
+        bucket_unit = window_samples[0].get("unit") or unit
+        if hasattr(bucket_unit, "value"):
+            bucket_unit = bucket_unit.value
 
         if valid_values:
             avg_val = round(sum(valid_values) / len(valid_values), 3)
@@ -147,13 +177,13 @@ def aggregate_time_series(
             TimeSeriesBucket(
                 bucket_start=b_start,
                 bucket_end=b_end,
-                sensor_id=sensor_id,
+                sensor_id=sid,
                 sample_count=len(window_samples),
                 valid_sample_count=len(valid_values),
                 avg_value=avg_val,
                 min_value=min_val,
                 max_value=max_val,
-                unit=unit,
+                unit=str(bucket_unit),
             )
         )
 

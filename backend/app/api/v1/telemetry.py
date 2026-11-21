@@ -33,6 +33,28 @@ logger = logging.getLogger("drainx.api.telemetry")
 router = APIRouter(prefix="/telemetry", tags=["Telemetry"])
 
 
+def _validate_timezone_bounds(start_time: Optional[datetime], end_time: Optional[datetime]) -> None:
+    """
+    Validates that query time bounds are timezone-aware and chronological.
+    Rejects naive datetimes to avoid ambiguous server-local conversions.
+    """
+    if start_time is not None and (start_time.tzinfo is None or start_time.tzinfo.utcoffset(start_time) is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_time must be timezone-aware (e.g. ISO-8601 with UTC offset like 'Z' or '+00:00').",
+        )
+    if end_time is not None and (end_time.tzinfo is None or end_time.tzinfo.utcoffset(end_time) is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="end_time must be timezone-aware (e.g. ISO-8601 with UTC offset like 'Z' or '+00:00').",
+        )
+    if start_time and end_time and start_time > end_time:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_time must not be later than end_time.",
+        )
+
+
 @router.post("", response_model=TelemetryIngestResponse, status_code=status.HTTP_201_CREATED, summary="Ingest sensor reading(s)")
 @router.post("/ingest", response_model=TelemetryIngestResponse, status_code=status.HTTP_201_CREATED, summary="Ingest sensor reading(s) (canonical alias)")
 async def ingest_telemetry(
@@ -195,23 +217,26 @@ async def query_persistent_telemetry(
     Queries persistent historical sensor readings from Supabase (or in-memory repository fallback).
     Supports time-range, sensor, device, and operational mode filtering with limit/offset pagination.
     """
-    if start_time and end_time and start_time > end_time:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="start_time must not be later than end_time.",
-        )
+    _validate_timezone_bounds(start_time, end_time)
 
-    records = await persistence_repo.query_historical_telemetry(
-        sensor_id=sensor_id,
-        source=source,
-        section_id=section_id,
-        device_id=device_id,
-        start_time=start_time,
-        end_time=end_time,
-        limit=limit,
-        offset=offset,
-        chronological=chronological,
-    )
+    try:
+        records = await persistence_repo.query_historical_telemetry(
+            sensor_id=sensor_id,
+            source=source,
+            section_id=section_id,
+            device_id=device_id,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+            offset=offset,
+            chronological=chronological,
+        )
+    except RuntimeError as exc:
+        logger.error("Persistent telemetry query failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Downstream database service unavailable",
+        )
     is_truncated = (len(records) >= limit)
     return {
         "status": "success",
@@ -233,12 +258,32 @@ async def get_telemetry_rollups(
     sensor_id: str = Query(..., description="Target sensor ID (e.g. US_UPSTREAM_01, FS_FLUME_01)"),
     source: Optional[str] = Query(default=None, description="Operational source filter: PHYSICAL or SIMULATED"),
     interval_seconds: int = Query(default=60, description="Bucket interval in seconds (e.g. 60 or 300)"),
-    limit: int = Query(default=100, ge=1, le=500, description="Max historical samples to aggregate"),
+    start_time: Optional[datetime] = Query(default=None, description="Optional ISO timestamp lower bound"),
+    end_time: Optional[datetime] = Query(default=None, description="Optional ISO timestamp upper bound"),
+    limit: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=10000,
+        description=(
+            "Max historical samples to aggregate (up to 10,000). "
+            "For 5-minute rollups (interval_seconds=300), defaults to 3,600 samples "
+            "(approximately 30 minutes at 2 Hz or one hour at 1 Hz). "
+            "Explicit time windows or an explicit limit should be supplied for larger historical requests."
+        ),
+    ),
 ):
     """
     Computes statistical aggregations (avg, min, max, valid_count) across time buckets.
     Excludes invalid readings, sensor timeouts, and uninstalled hardware faults.
     Zero-flow is preserved as valid data.
+
+    Bounded Query Defaults & Coverage:
+    - 1-minute rollups (interval_seconds=60) default to 100 samples when unbounded.
+    - 5-minute rollups (interval_seconds=300) default to 3,600 samples when unbounded,
+      covering approximately 30 minutes at 2 Hz or one hour at 1 Hz.
+    - Explicit time windows (start_time / end_time) automatically elevate the query ceiling
+      to 10,000 samples. An explicit limit (up to 10,000) should be supplied for larger
+      historical requests (e.g. limit=7200 for a full 1-hour window at 2 Hz).
     """
     if interval_seconds not in (60, 300):
         raise HTTPException(
@@ -246,16 +291,43 @@ async def get_telemetry_rollups(
             detail="interval_seconds must be either 60 (1-minute) or 300 (5-minute).",
         )
 
-    raw_records = await persistence_repo.query_historical_telemetry(
+    _validate_timezone_bounds(start_time, end_time)
+
+    # Determine effective query limit:
+    if limit is not None:
+        query_limit = limit
+    elif start_time or end_time:
+        query_limit = 10000
+    elif interval_seconds == 300:
+        query_limit = 3600
+    else:
+        query_limit = 100
+
+    try:
+        raw_records = await persistence_repo.query_historical_telemetry(
+            sensor_id=sensor_id,
+            source=source,
+            start_time=start_time,
+            end_time=end_time,
+            limit=query_limit,
+            chronological=True,
+        )
+    except RuntimeError as exc:
+        logger.error("Telemetry rollup query failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Downstream database service unavailable",
+        )
+
+    is_truncated = (len(raw_records) >= query_limit)
+    unit = raw_records[0].get("unit", "cm") if raw_records else "cm"
+    buckets = aggregate_time_series(
+        raw_records,
+        bucket_interval_seconds=interval_seconds,
+        unit=unit,
         sensor_id=sensor_id,
         source=source,
-        limit=limit,
-        chronological=True,
     )
-
-    is_truncated = (len(raw_records) >= limit)
-    unit = raw_records[0].get("unit", "cm") if raw_records else "cm"
-    buckets = aggregate_time_series(raw_records, bucket_interval_seconds=interval_seconds, unit=unit)
 
     return {
         "status": "success",
@@ -282,12 +354,19 @@ async def get_telemetry_trend(
     - Flow sensor: average flow, peak flow, rate of change (L/min per min), and total volume.
     Excludes invalid measurements and SENSOR_NOT_INSTALLED faults.
     """
-    raw_records = await persistence_repo.query_historical_telemetry(
-        sensor_id=sensor_id,
-        source=source,
-        limit=limit,
-        chronological=True,
-    )
+    try:
+        raw_records = await persistence_repo.query_historical_telemetry(
+            sensor_id=sensor_id,
+            source=source,
+            limit=limit,
+            chronological=True,
+        )
+    except RuntimeError as exc:
+        logger.error("Telemetry trend query failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Downstream database service unavailable",
+        )
 
     if not raw_records:
         return {
