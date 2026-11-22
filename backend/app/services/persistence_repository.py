@@ -496,9 +496,13 @@ class PersistenceRepository:
     def is_storage_configured(self) -> bool:
         """
         True only when both PostgREST URL and SUPABASE_SERVICE_ROLE_KEY are configured.
-        Storage operations require service-role privileges.
+        Storage and rate-limit RPC operations require service-role privileges.
         """
-        return bool(self._is_configured and self._supabase_service_role_key and self._supabase_service_role_key.strip())
+        return bool(
+            self._is_configured
+            and (self._supabase_url or "").strip()
+            and (self._supabase_service_role_key or "").strip()
+        )
 
     @property
     def upload_lease_sec(self) -> int:
@@ -3031,6 +3035,49 @@ class PersistenceRepository:
             "reconciled_objects": reconciled,
             "uncertain_paths": uncertain_paths,
         }
+
+    def check_and_increment_rate_limit_sync(
+        self, key_hash: str, action: str, limit: int, window_sec: int
+    ) -> Dict[str, Any]:
+        """
+        Executes atomic database rate limiting via RPC `check_and_increment_rate_limit_rpc`.
+        Validates all RPC arguments prior to invoking PostgREST and requires service-role credentials.
+        Returns dict containing:
+            {
+                "allowed": bool,
+                "current_count": int,
+                "limit": int,
+                "remaining": int,
+                "reset_after_sec": int,
+                "retry_after_sec": int
+            }
+        Raises StorageValidationError on invalid arguments, or StorageError /
+        StorageNotConfiguredError on connection failure/timeout.
+        """
+        self._ensure_storage_configured()
+        if not isinstance(key_hash, str) or not REQUEST_FINGERPRINT_PATTERN.match(key_hash):
+            raise StorageValidationError(
+                "Invalid rate limit key hash: must be 64 lowercase hexadecimal characters."
+            )
+        clean_action = action.value if hasattr(action, "value") else action
+        if not isinstance(clean_action, str) or clean_action not in (
+            "incident_create",
+            "photo_upload",
+            "photo_retrieve",
+        ):
+            raise StorageValidationError("Invalid rate limit action.")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not (1 <= limit <= 100_000):
+            raise StorageValidationError("Invalid rate limit max requests: must be between 1 and 100000.")
+        if not isinstance(window_sec, int) or isinstance(window_sec, bool) or not (1 <= window_sec <= 2_592_000):
+            raise StorageValidationError("Invalid rate limit window seconds: must be between 1 and 2592000.")
+
+        payload = {
+            "p_key_hash": key_hash,
+            "p_action": clean_action,
+            "p_limit": limit,
+            "p_window_sec": window_sec,
+        }
+        return self._call_rpc_sync("check_and_increment_rate_limit_rpc", payload)
 
 
 # Global persistence client instance

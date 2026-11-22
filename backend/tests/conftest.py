@@ -60,6 +60,7 @@ def sample_png_bytes():
 def reset_state_store(monkeypatch, tmp_path):
     """Reset application state and fully isolate global persistence repository and audit ledger."""
     from app.services.persistence_repository import persistence_repo
+    from app.services.rate_limiter import in_memory_rate_limiter
 
     def _reset_persistence_repo():
         persistence_repo._in_memory_records.clear()
@@ -85,6 +86,8 @@ def reset_state_store(monkeypatch, tmp_path):
 
     # Prevent tests from contacting Supabase unless they explicitly enable and mock cloud persistence.
     monkeypatch.setattr(persistence_repo, "_is_configured", False)
+    monkeypatch.setattr(settings, "RATE_LIMIT_STORAGE_BACKEND", "memory")
+    in_memory_rate_limiter.clear()
 
     # Isolate durable audit journal to temporary storage so tests never pollute or delete real audit files.
     test_audit_path = tmp_path / "test_incident_audits.jsonl"
@@ -101,6 +104,7 @@ def reset_state_store(monkeypatch, tmp_path):
 
     yield
 
+    in_memory_rate_limiter.clear()
     with state_store._lock:
         state_store._incident_audits.clear()
     state_store.clear()

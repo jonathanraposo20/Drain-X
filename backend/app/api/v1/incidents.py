@@ -7,7 +7,7 @@ import hashlib
 import logging
 from typing import Optional, Dict, Any, Tuple
 from pydantic import BaseModel
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Header, Response, Depends, status
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Header, Request, Response, Depends, status
 from fastapi.responses import FileResponse
 
 from app.services.persistence_repository import (
@@ -26,6 +26,7 @@ logger = logging.getLogger("drainx.incidents")
 
 from app.core.config import settings
 from app.core.security import get_current_user_claims, get_optional_user_claims, require_roles
+from app.services.rate_limiter import check_rate_limit, check_rate_limit_async, RateLimitAction
 from app.models.contracts import (
     IncidentCreateContract,
     IncidentUpdateContract,
@@ -215,11 +216,19 @@ def get_municipal_queue(
 
 
 @router.post("", response_model=IncidentResponseContract, status_code=status.HTTP_201_CREATED)
-def create_incident(payload: IncidentCreateContract) -> IncidentResponseContract:
+def create_incident(
+    payload: IncidentCreateContract,
+    request: Request,
+    claims: Optional[Dict[str, Any]] = Depends(get_optional_user_claims),
+) -> IncidentResponseContract:
     """
     Submit a citizen or field-reported drainage incident.
     Initial status will automatically be set to REPORTED.
+    Enforces citizen and anonymous creation rate limiting.
+    Municipal and field-worker operations bypass the citizen limit.
     """
+    check_rate_limit(RateLimitAction.INCIDENT_CREATE, claims, request=request)
+
     incident = IncidentResponseContract(
         category=payload.category,
         description=payload.description,
@@ -862,6 +871,7 @@ def _authorize_photo_retrieval(
 @router.post("/{incident_id}/photos", response_model=IncidentResponseContract)
 async def upload_incident_photos(
     incident_id: str,
+    request: Request,
     files: list[UploadFile] = File(..., description="Photographic evidence files (max 3 per incident, 5MB max each, JPEG/PNG/WebP)"),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     claims: Optional[Dict[str, Any]] = Depends(get_optional_user_claims),
@@ -902,6 +912,10 @@ async def upload_incident_photos(
             )
     else:
         clean_key = idempotency_key.strip() if idempotency_key else f"loc_key_{uuid.uuid4().hex}"
+
+    # Enforce rate limiting on photo uploads before authoritative PostgreSQL lookup (RL-AUD-A-01, RL-AUD-11)
+    # Evaluated before database queries to prevent PostgREST/PostgreSQL DoS via nonexistent incident IDs.
+    await check_rate_limit_async(RateLimitAction.PHOTO_UPLOAD, claims, request=request)
 
     # D-02: In cloud mode, retrieve authoritative incident state from PostgreSQL; convert outages to HTTP 503
     if cloud_mode:
@@ -1079,11 +1093,13 @@ async def upload_incident_photos(
 async def get_incident_scoped_photo(
     incident_id: str,
     filename: str,
+    request: Request,
     claims: Optional[Dict[str, Any]] = Depends(get_optional_user_claims),
 ):
     """
     Canonical V3.1 incident-scoped photo retrieval.
-    Enforces authorization policy, durable membership verification, fail-closed cloud semantics,
+    Enforces rate limiting prior to expensive PostgREST/Storage/disk access,
+    authorization policy, durable membership verification, fail-closed cloud semantics,
     and strict privacy headers.
     """
     try:
@@ -1106,6 +1122,9 @@ async def get_incident_scoped_photo(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Cloud persistence is configured without service-role storage credentials. Local fallback is disabled.",
         )
+
+    # Enforce rate limiting before expensive PostgREST queries, Storage downloads, or disk reads (RL-AUD-11)
+    await check_rate_limit_async(RateLimitAction.PHOTO_RETRIEVE, claims, request=request)
 
     if persistence_repo.is_storage_configured:
         # D-02: Fetch authoritative incident row from PostgreSQL (never authorize from stale in-memory objects)
@@ -1208,11 +1227,13 @@ async def get_incident_scoped_photo(
 @router.get("/photos/{filename}", summary="Retrieve legacy incident photograph")
 async def get_incident_photo(
     filename: str,
+    request: Request,
     claims: Optional[Dict[str, Any]] = Depends(get_optional_user_claims),
 ):
     """
     Legacy filename-only photo retrieval route.
     SEC-DUR-06: Immediately rejects canonical sha256_ filenames (requires incident-scoped route).
+    Enforces rate limiting prior to expensive PostgREST/Storage/disk access.
     Fails closed (404) on missing or ambiguous (>1) incident associations, and fails closed (503)
     on partial cloud configuration or PostgREST outage.
     """
@@ -1234,6 +1255,9 @@ async def get_incident_photo(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Cloud persistence is configured without service-role storage credentials. Local fallback is disabled.",
         )
+
+    # Enforce rate limiting before expensive PostgREST queries or disk lookups (RL-AUD-11)
+    await check_rate_limit_async(RateLimitAction.PHOTO_RETRIEVE, claims, request=request)
 
     if persistence_repo.is_configured or persistence_repo.is_storage_configured:
         try:
@@ -1301,6 +1325,7 @@ async def get_incident_photo(
         ".webp": "image/webp",
     }
     response = FileResponse(path=file_path, media_type=media_map.get(ext, "image/jpeg"))
+
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Cache-Control"] = "private, no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
