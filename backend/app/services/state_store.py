@@ -313,11 +313,6 @@ class StateStore:
             self._incidents.clear()
             if seed_incidents:
                 self.seed_demo_incidents()
-            self._active_scenario = None
-            self._latest_benchmark = None
-            self._incidents.clear()
-            if seed_incidents:
-                self.seed_demo_incidents()
 
     def ingest_reading(self, reading: SensorReadingContract) -> None:
         with self._lock:
@@ -744,9 +739,32 @@ class StateStore:
 
 
 
-    def get_incident(self, incident_id: str) -> Optional[IncidentResponseContract]:
+    def get_incident(
+        self, incident_id: str, authoritative_cloud: bool = False
+    ) -> Optional[IncidentResponseContract]:
         with self._lock:
-            return self._incidents.get(incident_id)
+            from app.services.persistence_repository import persistence_repo
+            if authoritative_cloud and (
+                persistence_repo.is_configured or persistence_repo.is_storage_configured
+            ):
+                row = persistence_repo.query_incident_by_id_sync(incident_id)
+                if row:
+                    fetched = IncidentResponseContract.model_validate(row)
+                    self._incidents[incident_id] = fetched
+                    return fetched
+                self._incidents.pop(incident_id, None)
+                return None
+
+            incident = self._incidents.get(incident_id)
+            if incident is not None:
+                return incident
+            if persistence_repo.is_configured or persistence_repo.is_storage_configured:
+                row = persistence_repo.query_incident_by_id_sync(incident_id)
+                if row:
+                    fetched = IncidentResponseContract.model_validate(row)
+                    self._incidents[incident_id] = fetched
+                    return fetched
+            return None
 
     def get_incident_kpis(self) -> dict[str, Any]:
         """
@@ -1149,13 +1167,11 @@ class StateStore:
         with self._lock:
             from app.services.persistence_repository import persistence_repo
             if persistence_repo.is_configured:
-                try:
-                    cloud_records = persistence_repo.query_incident_audits_sync(incident_id)
-                    if cloud_records:
-                        parsed_audits = [IncidentAuditContract(**rec) for rec in cloud_records]
-                        return sorted(parsed_audits, key=lambda a: a.timestamp)
-                except Exception as exc:
-                    logger.warning(f"Error querying cloud audits from Supabase: {exc}. Using local ledger fallback.")
+                cloud_records = persistence_repo.query_incident_audits_sync(incident_id, strict=True)
+                if cloud_records:
+                    parsed_audits = [IncidentAuditContract(**rec) for rec in cloud_records]
+                    return sorted(parsed_audits, key=lambda a: a.timestamp)
+                return []
 
             audits = self._incident_audits.get(incident_id, [])
             return sorted(audits, key=lambda a: a.timestamp)
@@ -1165,18 +1181,70 @@ class StateStore:
         return [t for t in AUTHORITATIVE_FIELD_TEAMS if t.is_active]
 
     def attach_incident_photos(
-        self, incident_id: str, new_photos: list[str]
+        self,
+        incident_id: str,
+        new_photos: list[str],
+        audit_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        actor_role: Optional[str] = None,
+        files_to_cleanup_on_failure: Optional[list[Any]] = None,
     ) -> Optional[IncidentResponseContract]:
         with self._lock:
             incident = self._incidents.get(incident_id)
             if not incident:
-                return None
+                from app.services.persistence_repository import persistence_repo
+                if persistence_repo.is_configured:
+                    row = persistence_repo.query_incident_by_id_sync(incident_id)
+                    if row:
+                        incident = IncidentResponseContract.model_validate(row)
+                        self._incidents[incident_id] = incident
+                if not incident:
+                    return None
+
+            added_photos: list[str] = []
             for p in new_photos:
                 if len(incident.photos) >= 3:
                     break
                 if p not in incident.photos:
                     incident.photos.append(p)
+                    added_photos.append(p)
+
             incident.updated_at = datetime.now(timezone.utc)
+
+            # Local durable audit append if actor attribution is provided
+            if audit_id and actor_id and actor_role:
+                audit_entry = IncidentAuditContract(
+                    audit_id=audit_id,
+                    incident_id=incident_id,
+                    actor_id=actor_id,
+                    actor_role=actor_role,
+                    action="ATTACH_PHOTOS",
+                    new_status=incident.status,
+                    new_severity=incident.severity,
+                    reason=f"ATTACH_PHOTOS count:{len(added_photos)}",
+                    timestamp=datetime.now(timezone.utc),
+                )
+                try:
+                    append_ok = self._audit_durability.append_audit(audit_entry)
+                except Exception:
+                    append_ok = False
+
+                if not append_ok:
+                    # Rollback photos from in-memory incident
+                    for p in added_photos:
+                        if p in incident.photos:
+                            incident.photos.remove(p)
+                    if files_to_cleanup_on_failure:
+                        for f in files_to_cleanup_on_failure:
+                            try:
+                                if hasattr(f, "unlink"):
+                                    f.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    raise RuntimeError("Durable audit journal append failed for photo attachment.")
+
+                self._incident_audits.setdefault(incident_id, []).append(audit_entry)
+
             return incident
 
     def is_photo_registered(self, filename: str) -> bool:

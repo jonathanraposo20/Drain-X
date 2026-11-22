@@ -3,9 +3,26 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Depends, status
+import hashlib
+import logging
+from typing import Optional, Dict, Any, Tuple
+from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Header, Response, Depends, status
 from fastapi.responses import FileResponse
+
+from app.services.persistence_repository import (
+    persistence_repo,
+    StorageError,
+    StorageNotConfiguredError,
+    StorageConflictError,
+    StorageValidationError,
+    CANONICAL_V3_FILENAME_PATTERN,
+    PHOTO_FILENAME_PATTERN,
+    IDEMPOTENCY_KEY_PATTERN,
+    _validate_incident_id,
+)
+
+logger = logging.getLogger("drainx.incidents")
 
 from app.core.config import settings
 from app.core.security import get_current_user_claims, get_optional_user_claims, require_roles
@@ -627,14 +644,28 @@ def get_incident_audit_trail(
     Restricted strictly to municipality, admin, and service_role.
     Citizens and workers are denied with 403 Forbidden.
     """
-    existing = state_store.get_incident(incident_id)
+    try:
+        existing = state_store.get_incident(incident_id)
+    except Exception as exc:
+        logger.error("Authoritative incident lookup failed during audit retrieval: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authoritative cloud incident service unavailable.",
+        )
     if not existing:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident with ID '{incident_id}' not found",
         )
 
-    audits = state_store.get_incident_audits(incident_id)
+    try:
+        audits = state_store.get_incident_audits(incident_id)
+    except Exception as exc:
+        logger.error("Authoritative audit query failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authoritative cloud audit ledger unavailable.",
+        )
     return audits
 
 
@@ -761,17 +792,132 @@ def update_incident(
 
 
 
+def _resolve_photo_actor(claims: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+    """
+    Normalizes caller actor_id and actor_role according to INT-05:
+    - citizen / unauthenticated (claims is None) -> ('citizen_anonymous', 'citizen')
+    - municipal_officer / municipality -> (claims['sub'], 'municipal_officer')
+    - field_worker / worker -> (claims['sub'], 'field_worker')
+    - admin -> (claims['sub'], 'admin')
+    - service_role / system -> (claims['sub'] or 'system', 'system')
+    """
+    if not claims:
+        return "citizen_anonymous", "citizen"
+
+    actor_id = claims.get("sub") or claims.get("id") or "anonymous"
+    raw_role = (
+        claims.get("extracted_role")
+        or claims.get("role")
+        or claims.get("user_metadata", {}).get("role")
+        or claims.get("app_metadata", {}).get("role")
+        or ""
+    ).strip().lower()
+
+    if raw_role in ("admin",):
+        return actor_id, "admin"
+    if raw_role in ("service_role", "system"):
+        return actor_id, "system"
+    if raw_role in ("municipality", "municipal_officer"):
+        return actor_id, "municipal_officer"
+    if raw_role in ("worker", "field_worker"):
+        return actor_id, "field_worker"
+    return actor_id, "citizen"
+
+
+def _authorize_photo_retrieval(
+    incident: IncidentResponseContract, claims: Optional[Dict[str, Any]]
+) -> None:
+    """
+    Enforces authorization policy for photo evidence retrieval:
+    1. REJECTED incidents: Only supervisors ('municipal_officer', 'admin', 'system') may view.
+       All others (unauthenticated, citizens, workers) receive HTTP 404 to mask existence.
+    2. Field workers: Must be assigned to the incident (assigned_worker_id, assigned_to, or team assignment).
+       Unassigned workers receive HTTP 403 Forbidden.
+    3. Citizens & Unauthenticated: Allowed for non-rejected incidents.
+    """
+    actor_id, actor_role = _resolve_photo_actor(claims)
+
+    # Status-based restrictions
+    if incident.status == IncidentStatus.REJECTED:
+        if actor_role not in ("municipal_officer", "admin", "system"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Photo not found.",
+            )
+
+    # Worker tenancy restriction
+    if actor_role == "field_worker":
+        is_assigned = (
+            incident.assigned_worker_id == actor_id
+            or incident.assigned_to == actor_id
+            or (claims is not None and _is_worker_assigned_to_incident(claims, incident))
+        )
+        if not is_assigned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Field workers may only access evidence for incidents assigned to them.",
+            )
+
+
 @router.post("/{incident_id}/photos", response_model=IncidentResponseContract)
 async def upload_incident_photos(
     incident_id: str,
     files: list[UploadFile] = File(..., description="Photographic evidence files (max 3 per incident, 5MB max each, JPEG/PNG/WebP)"),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     claims: Optional[Dict[str, Any]] = Depends(get_optional_user_claims),
 ) -> IncidentResponseContract:
     """
     Upload 1 to 3 photo evidence files for a specific incident.
     Validates MIME type, maximum 5MB size per file, and attaches safe relative URLs to the incident.
+    In cloud mode, strictly enforces mandatory Idempotency-Key header, fail-closed partial config check,
+    authoritative PostgreSQL incident lookup, and atomic RPC orchestration.
     """
-    incident = state_store.get_incident(incident_id)
+    if not files or len(files) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one photo file must be provided.",
+        )
+
+    # D-02: Fail closed with HTTP 503 if database persistence is configured without Storage service-role key
+    if persistence_repo.is_configured and not persistence_repo.is_storage_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cloud persistence is configured without service-role storage credentials. Local fallback is disabled.",
+        )
+
+    cloud_mode = bool(persistence_repo.is_storage_configured)
+
+    # In cloud mode, Idempotency-Key header is strictly required
+    if cloud_mode:
+        if not idempotency_key or not idempotency_key.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Idempotency-Key header is required for photo uploads in cloud mode.",
+            )
+        clean_key = idempotency_key.strip()
+        if not IDEMPOTENCY_KEY_PATTERN.match(clean_key):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Idempotency-Key format. Must be 8-64 alphanumeric characters, dots, underscores, or hyphens.",
+            )
+    else:
+        clean_key = idempotency_key.strip() if idempotency_key else f"loc_key_{uuid.uuid4().hex}"
+
+    # D-02: In cloud mode, retrieve authoritative incident state from PostgreSQL; convert outages to HTTP 503
+    if cloud_mode:
+        try:
+            incident = state_store.get_incident(incident_id, authoritative_cloud=True)
+        except StorageValidationError as sve:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(sve))
+        except Exception as exc:
+            logger.error("Authoritative cloud incident query failed during upload: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authoritative cloud incident service unavailable.",
+            )
+    else:
+        incident = state_store.get_incident(incident_id)
+
     if not incident:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -790,10 +936,26 @@ async def upload_incident_photos(
             detail=f"Cannot exceed maximum limit of {settings.MAX_PHOTOS_PER_INCIDENT} photos per incident. Already attached: {len(incident.photos)}, attempting to add: {len(files)}.",
         )
 
-    new_photo_urls: list[str] = []
+    actor_id, actor_role = _resolve_photo_actor(claims)
+
+    # Enforce worker tenancy
+    if actor_role == "field_worker":
+        is_assigned = (
+            incident.assigned_worker_id == actor_id
+            or incident.assigned_to == actor_id
+            or (claims is not None and _is_worker_assigned_to_incident(claims, incident))
+        )
+        if not is_assigned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Field workers may only upload evidence for incidents assigned to them.",
+            )
+
+    # Read and sanitize files; detect duplicate image content within the request
+    seen_digests = set()
+    sanitized_items = []
 
     for file in files:
-        # Validate MIME type
         content_type = file.content_type or ""
         if content_type not in ALLOWED_MIME_TYPES:
             raise HTTPException(
@@ -801,21 +963,18 @@ async def upload_incident_photos(
                 detail=f"Unsupported image type '{content_type}'. Allowed types: JPEG, PNG, WebP.",
             )
 
-        # Validate file size
         data = await file.read()
         if len(data) > settings.MAX_PHOTO_SIZE_BYTES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Image file exceeds maximum allowable size of 5 MB ({len(data)} bytes received).",
             )
-
         if len(data) == 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Empty file upload is not permitted.",
             )
 
-        # Validate and sanitize actual image content; strip EXIF/GPS/device metadata
         try:
             clean_data, detected_mime, ext = sanitize_and_clean_image(data, content_type)
         except ImageProcessingError as ipe:
@@ -824,47 +983,302 @@ async def upload_incident_photos(
                 detail=str(ipe),
             )
 
-        # Safe server-side filename generation
+        digest = hashlib.sha256(clean_data).hexdigest()
+        if digest in seen_digests:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Duplicate image content within the same request is not permitted.",
+            )
+        seen_digests.add(digest)
+        sanitized_items.append((file.filename or f"photo{ext}", clean_data, detected_mime, ext, digest))
+
+    audit_id = f"AUD-{uuid.uuid4().hex[:12].upper()}"
+
+    # Cloud mode upload orchestration
+    if cloud_mode:
+        prepared_for_cloud = [
+            (f"sha256_{item[4]}{item[3]}", item[1], item[2])
+            for item in sanitized_items
+        ]
+        try:
+            updated_dict = persistence_repo.execute_photo_attachment_workflow_sync(
+                incident_id=incident_id,
+                files=prepared_for_cloud,
+                idempotency_key=clean_key,
+                actor_id=actor_id,
+                actor_role=actor_role,
+                audit_id=audit_id,
+            )
+            updated_contract = IncidentResponseContract.model_validate(updated_dict)
+            with state_store._lock:
+                state_store._incidents[incident_id] = updated_contract
+            return updated_contract
+        except StorageValidationError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        except StorageConflictError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except (StorageNotConfiguredError, StorageError, RuntimeError) as e:
+            logger.error("Cloud photo upload workflow failed: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Storage operation failed: {str(e)}",
+            )
+        except Exception as e:
+            logger.error("Cloud photo upload unexpected error: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Storage operation failed: {str(e)}",
+            )
+
+    # Local fallback mode (only when cloud persistence is completely unconfigured)
+    new_photo_urls: list[str] = []
+    written_files: list[Path] = []
+    for item in sanitized_items:
+        ext = item[3]
         safe_name = f"{incident_id}_{uuid.uuid4().hex[:8]}{ext}"
         destination = UPLOAD_DIR / safe_name
-
         try:
-            destination.write_bytes(clean_data)
+            destination.write_bytes(item[1])
+            written_files.append(destination)
         except Exception:
+            for wf in written_files:
+                wf.unlink(missing_ok=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to persist photographic evidence.",
             )
+        new_photo_urls.append(f"/api/v1/incidents/photos/{safe_name}")
 
-        photo_url = f"/api/v1/incidents/photos/{safe_name}"
-        new_photo_urls.append(photo_url)
+    try:
+        updated = state_store.attach_incident_photos(
+            incident_id=incident_id,
+            new_photos=new_photo_urls,
+            audit_id=audit_id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            files_to_cleanup_on_failure=written_files,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Photo attachment failed: {str(exc)}",
+        )
 
-    updated = state_store.attach_incident_photos(incident_id, new_photo_urls)
     if not updated:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident with ID '{incident_id}' not found",
         )
-    return _filter_incident_for_role(updated, claims)
+    return updated
 
 
-@router.get("/photos/{filename}")
-def get_incident_photo(filename: str):
+@router.get(
+    "/{incident_id}/photos/{filename}",
+    summary="Retrieve canonical incident photograph",
+)
+async def get_incident_scoped_photo(
+    incident_id: str,
+    filename: str,
+    claims: Optional[Dict[str, Any]] = Depends(get_optional_user_claims),
+):
     """
-    Retrieve and serve an uploaded incident photograph.
-    Enforces path traversal protection, safe filename structure, and verifies registration.
+    Canonical V3.1 incident-scoped photo retrieval.
+    Enforces authorization policy, durable membership verification, fail-closed cloud semantics,
+    and strict privacy headers.
     """
-    # Filename structure validation
+    try:
+        clean_inc_id = _validate_incident_id(incident_id)
+    except StorageValidationError as sve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(sve),
+        )
+
+    if not CANONICAL_V3_FILENAME_PATTERN.match(filename) and not PHOTO_FILENAME_PATTERN.match(filename):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid photo filename structure.",
+        )
+
+    # D-02: Fail closed with HTTP 503 if database persistence is configured without Storage service-role key
+    if persistence_repo.is_configured and not persistence_repo.is_storage_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cloud persistence is configured without service-role storage credentials. Local fallback is disabled.",
+        )
+
+    if persistence_repo.is_storage_configured:
+        # D-02: Fetch authoritative incident row from PostgreSQL (never authorize from stale in-memory objects)
+        try:
+            inc_row = persistence_repo.query_incident_by_id_sync(clean_inc_id)
+        except Exception as exc:
+            logger.error("Authoritative cloud incident query failed during photo retrieval: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authoritative cloud incident verification unavailable.",
+            )
+        if not inc_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Incident '{clean_inc_id}' not found.",
+            )
+        incident = IncidentResponseContract.model_validate(inc_row)
+        with state_store._lock:
+            state_store._incidents[clean_inc_id] = incident
+
+        _authorize_photo_retrieval(incident, claims)
+
+        canonical_path = f"{clean_inc_id}/{filename}"
+        try:
+            is_member = persistence_repo.verify_attached_photo_membership_sync(
+                clean_inc_id, canonical_path, incident_row=inc_row
+            )
+        except StorageValidationError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' is not attached to incident '{clean_inc_id}'.",
+            )
+        except Exception as exc:
+            logger.error("Durable photo membership verification failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Durable cloud photo membership verification unavailable.",
+            )
+        if not is_member:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' is not attached to incident '{clean_inc_id}'.",
+            )
+
+        try:
+            downloaded = persistence_repo.download_incident_photo(canonical_path, incident_id=clean_inc_id)
+        except Exception as exc:
+            logger.error("Cloud photo download failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Cloud storage photo download unavailable.",
+            )
+        if not downloaded:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' not found in storage.",
+            )
+        content_bytes, content_type = downloaded
+        response = Response(content=content_bytes, media_type=content_type)
+    else:
+        incident = state_store.get_incident(clean_inc_id)
+        if not incident:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Incident '{clean_inc_id}' not found.",
+            )
+
+        _authorize_photo_retrieval(incident, claims)
+
+        target = f"/api/v1/incidents/photos/{filename}"
+        canonical_local = f"{clean_inc_id}/{filename}"
+        accepted_entries = {filename, target, canonical_local}
+        if not any(p in accepted_entries for p in incident.photos):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' not found on incident.",
+            )
+        file_path = (UPLOAD_DIR / filename).resolve()
+        if not file_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' not found on disk.",
+            )
+        ext = file_path.suffix.lower()
+        media_map = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }
+        response = FileResponse(path=file_path, media_type=media_map.get(ext, "image/jpeg"))
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Vary"] = "Authorization"
+    return response
+
+
+@router.get("/photos/{filename}", summary="Retrieve legacy incident photograph")
+async def get_incident_photo(
+    filename: str,
+    claims: Optional[Dict[str, Any]] = Depends(get_optional_user_claims),
+):
+    """
+    Legacy filename-only photo retrieval route.
+    SEC-DUR-06: Immediately rejects canonical sha256_ filenames (requires incident-scoped route).
+    Fails closed (404) on missing or ambiguous (>1) incident associations, and fails closed (503)
+    on partial cloud configuration or PostgREST outage.
+    """
+    if filename.startswith("sha256_"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Canonical incident photos must be retrieved via /api/v1/incidents/{incident_id}/photos/{filename}",
+        )
+
     if not re.match(r"^[A-Za-z0-9_-]+\.(jpg|jpeg|png|webp)$", filename):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid filename structure or unsupported extension.",
         )
 
-    # Path traversal validation
+    # D-02: Fail closed with HTTP 503 if database persistence is configured without Storage service-role key
+    if persistence_repo.is_configured and not persistence_repo.is_storage_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cloud persistence is configured without service-role storage credentials. Local fallback is disabled.",
+        )
+
+    if persistence_repo.is_configured or persistence_repo.is_storage_configured:
+        try:
+            rows = persistence_repo.query_incidents_by_photo_entry_sync(filename)
+        except Exception as exc:
+            logger.error("Authoritative cloud legacy photo lookup failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authoritative cloud incident photo lookup unavailable.",
+            )
+        if len(rows) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' not found.",
+            )
+        if len(rows) > 1:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' is ambiguous across multiple incidents.",
+            )
+        incident = IncidentResponseContract.model_validate(rows[0])
+    else:
+        matching_incidents = []
+        target = f"/api/v1/incidents/photos/{filename}"
+        accepted_entries = {filename, target}
+        with state_store._lock:
+            for inc in state_store._incidents.values():
+                if any(p in accepted_entries for p in inc.photos):
+                    matching_incidents.append(inc)
+        if len(matching_incidents) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' not found.",
+            )
+        if len(matching_incidents) > 1:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Photo '{filename}' is ambiguous across multiple incidents.",
+            )
+        incident = matching_incidents[0]
+
+    _authorize_photo_retrieval(incident, claims)
+
     file_path = (UPLOAD_DIR / filename).resolve()
     upload_root = UPLOAD_DIR.resolve()
-
     try:
         file_path.relative_to(upload_root)
     except ValueError:
@@ -879,13 +1293,6 @@ def get_incident_photo(filename: str):
             detail=f"Photo '{filename}' not found.",
         )
 
-    # Verify the photo is associated with an active incident record in state store
-    if not state_store.is_photo_registered(filename):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Photo '{filename}' not found.",
-        )
-
     ext = file_path.suffix.lower()
     media_map = {
         ".jpg": "image/jpeg",
@@ -895,5 +1302,57 @@ def get_incident_photo(filename: str):
     }
     response = FileResponse(path=file_path, media_type=media_map.get(ext, "image/jpeg"))
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Cache-Control"] = "public, max-age=3600"
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Vary"] = "Authorization"
     return response
+
+
+class StorageCleanupRecoveryRequest(BaseModel):
+    cleanup_id: str
+    incident_id: str
+    idempotency_key: str
+    scope: str = "incident_attachment"
+    lease_sec: int = 60
+
+
+@router.post(
+    "/maintenance/recover-storage-cleanup",
+    summary="Recover expired storage cleanup operation",
+)
+async def recover_storage_cleanup(
+    body: StorageCleanupRecoveryRequest,
+    claims: Dict[str, Any] = Depends(require_roles(["admin", "service_role"])),
+):
+    """
+    Admin/system maintenance endpoint to recover expired storage cleanup operations.
+    Strictly derives recovery actor from authenticated claims; caller cannot supply actor identity.
+    """
+    actor_id, actor_role = _resolve_photo_actor(claims)
+    if actor_role not in ("admin", "system"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin or system service-role may trigger cleanup recovery.",
+        )
+
+    try:
+        result = persistence_repo.execute_cleanup_recovery_workflow_sync(
+            cleanup_id=body.cleanup_id,
+            incident_id=body.incident_id,
+            idempotency_key=body.idempotency_key,
+            scope=body.scope,
+            recovery_actor_id=actor_id,
+            recovery_actor_role=actor_role,
+            lease_sec=body.lease_sec,
+        )
+        return result
+    except StorageValidationError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except StorageConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except (StorageNotConfiguredError, StorageError, RuntimeError) as e:
+        logger.error("Cleanup recovery failed: %s", e)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except Exception as e:
+        logger.error("Cleanup recovery unexpected error: %s", e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

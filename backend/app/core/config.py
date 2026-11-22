@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "uploads/incidents"
     MAX_PHOTO_SIZE_BYTES: int = 5 * 1024 * 1024  # 5 MB
     MAX_PHOTOS_PER_INCIDENT: int = 3
+    SUPABASE_STORAGE_BUCKET_INCIDENTS: str = "incident-evidence"
+    SUPABASE_STORAGE_SIGNED_URL_EXPIRY_SEC: int = 300
 
     model_config = SettingsConfigDict(
         env_file=".env",
