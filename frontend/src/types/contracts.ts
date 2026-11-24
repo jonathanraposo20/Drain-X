@@ -407,4 +407,51 @@ export interface StreamInitMessage {
   stream_config?: Record<string, unknown>;
 }
 
+export type IncidentStreamEventType =
+  | 'INCIDENT_REPORTED'
+  | 'INCIDENT_TRIAGED'
+  | 'INCIDENT_ASSIGNED'
+  | 'INCIDENT_IN_PROGRESS'
+  | 'INCIDENT_RESOLVED'
+  | 'INCIDENT_REJECTED'
+  | 'INCIDENT_PHOTOS_ATTACHED'
+  | 'DUPLICATE_SUSPECTED'
+  | 'DUPLICATE_REVIEWED'
+  | 'HEARTBEAT'
+  | 'RESYNC_REQUIRED';
+
+export interface IncidentStreamEvent {
+  event_id: string;
+  seq_id: number;
+  instance_id: string;
+  timestamp: string;
+  event_type: IncidentStreamEventType;
+  incident_id?: string | null;
+  action?: string | null;
+  previous_status?: string | null;
+  new_status?: string | null;
+  assigned_team_id?: string | null;
+  assigned_worker_id?: string | null;
+  previous_assigned_team_id?: string | null;
+  previous_assigned_worker_id?: string | null;
+  incident?: IncidentResponseContract | null;
+  duplicate_link?: Record<string, unknown> | null;
+  reason?: string | null;
+}
+
+export interface IncidentStreamInitMessage {
+  event_type: 'INIT';
+  protocol_version: string;
+  client_id: string;
+  instance_id: string;
+  current_seq_id: number;
+  user_id: string;
+  role: string;
+  team_id?: string | null;
+  connection_time: string;
+  message: string;
+  max_queue_size: number;
+  heartbeat_interval_sec: number;
+}
+
 
