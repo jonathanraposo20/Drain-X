@@ -5,6 +5,8 @@ from app.models.contracts import (
     SystemStatusContract,
     SystemOperationalState,
     ModeTransitionRequest,
+    DirectiveIssuerType,
+    DirectiveAuditOutboxFullError,
 )
 from app.services.state_store import state_store
 from app.services.persistence_repository import persistence_repo
@@ -60,15 +62,47 @@ async def set_system_mode(
     """
     try:
         old_mode = state_store.mode
-        success, message = state_store.set_mode(payload.mode, payload.reason or "")
+        user_role = claims.get("extracted_role")
+        raw_subject = claims.get("sub") or claims.get("email")
+        verified_subject = (
+            raw_subject.strip()
+            if isinstance(raw_subject, str) and raw_subject.strip()
+            else None
+        )
+        if user_role in ("admin", "municipality", "worker") and verified_subject:
+            mode_issuer_type = DirectiveIssuerType.OPERATOR
+            mode_issuer_id = verified_subject
+        else:
+            mode_issuer_type = (
+                DirectiveIssuerType.SAFETY_INTERLOCK
+                if payload.mode == "SAFE_HOLD"
+                else DirectiveIssuerType.AUTOMATED_ENGINE
+            )
+            mode_issuer_id = verified_subject or (
+                "safety_interlock"
+                if payload.mode == "SAFE_HOLD"
+                else "system_mode_controller"
+            )
+
+        success, message = state_store.set_mode(
+            payload.mode,
+            payload.reason or "",
+            issuer_type=mode_issuer_type,
+            issuer_id=mode_issuer_id,
+        )
         if success and old_mode != state_store.mode:
-            operator_id = claims.get("sub") or claims.get("email") or "API_OPERATOR"
+            operator_id = verified_subject or "API_OPERATOR"
             await persistence_repo.persist_mode_transition(
                 from_mode=old_mode,
                 to_mode=state_store.mode,
                 reason=payload.reason or f"Mode transition to {state_store.mode}",
                 operator_id=operator_id,
             )
+    except DirectiveAuditOutboxFullError as e:
+        raise HTTPException(
+            status_code=503,
+            detail="Actuator directive audit outbox capacity exceeded; persistence backpressure applied.",
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

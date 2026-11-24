@@ -1,9 +1,11 @@
 import time
 import logging
-from collections import deque
+import math
+from collections import deque, OrderedDict
 from datetime import datetime, timezone
+from decimal import Decimal
 import threading
-from typing import Optional, Any
+from typing import Optional, Any, Sequence
 
 from app.models.contracts import (
     SensorReadingContract,
@@ -17,6 +19,21 @@ from app.models.contracts import (
     SystemOperationalState,
     AlertSeverity,
     ActuatorDirectiveContract,
+    DirectiveEventType,
+    DirectiveIssuerType,
+    DirectiveAuditOutboxFullError,
+    ActuatorDirectiveEventContract,
+    StagedDeliveryEnvelope,
+    ActuatorDirectiveResponseContract,
+    build_issued_audit_id,
+    build_mode_cancellation_audit_id,
+    build_reboot_cancellation_audit_id,
+    build_alignment_observed_audit_id,
+    build_execution_failed_audit_id,
+    build_verification_timeout_audit_id,
+    build_superseded_audit_id,
+    quantize_numeric_5_2_decimal,
+    compute_verification_timeout_timestamp,
     IncidentResponseContract,
     IncidentUpdateContract,
     IncidentAuditContract,
@@ -30,11 +47,98 @@ from app.models.contracts import (
     ModeTransitionRecord,
     DataSource,
     validate_incident_status_transition,
+    DuplicateLinkContract,
+    DuplicateLinkStatus,
 )
 from app.core.config import settings
 from app.services.audit_durability import AuditDurabilityManager
+from app.services.actuator_digest import (
+    VALID_FIRMWARE_GATE_STATES,
+    canonicalize_value,
+    compute_reading_digest,
+    compute_aggregate_observation_digest,
+    evaluate_alignment_consistency,
+)
 
 logger = logging.getLogger("drainx.state_store")
+
+
+class ObservationRecord:
+    """
+    Coalesced physical observation record cached in DeviceObservationSession.
+    """
+    def __init__(
+        self,
+        sequence_number: int,
+        uptime_ms: int,
+        raw_readings: list[SensorReadingContract],
+        sensor_digests: dict[str, str],
+        firmware_version: Optional[str] = None,
+        actuator_snapshot: Optional[dict[str, Any]] = None,
+        aggregate_digest: str = "",
+    ):
+        self.sequence_number = sequence_number
+        self.uptime_ms = uptime_ms
+        self.raw_readings = list(raw_readings)
+        self.sensor_digests = dict(sensor_digests)
+        self.firmware_version = firmware_version
+        self.actuator_snapshot = dict(actuator_snapshot or {})
+        self.aggregate_digest = aggregate_digest
+        self.first_seen_time = time.time()
+        self.last_seen_time = self.first_seen_time
+
+
+class RebootCandidate:
+    """
+    Candidate reboot tracking state machine.
+    """
+    def __init__(
+        self,
+        anchor_seq: int,
+        anchor_uptime_ms: int,
+        anchor_timestamp: float,
+        observations: list[ObservationRecord],
+        confirm_count: int = 1,
+        first_observed_time: float = 0.0,
+        last_observed_time: float = 0.0,
+    ):
+        self.anchor_seq = anchor_seq
+        self.anchor_uptime_ms = anchor_uptime_ms
+        self.anchor_timestamp = anchor_timestamp
+        self.observations = list(observations)
+        self.confirm_count = confirm_count
+        self.first_observed_time = first_observed_time or time.time()
+        self.last_observed_time = last_observed_time or self.first_observed_time
+
+
+class DeviceObservationSession:
+    """
+    Tracks device sequence number progression, session epochs, and bounded seen-observation cache.
+    """
+    def __init__(self, device_id: str):
+        self.device_id = device_id
+        self.device_session_epoch: int = 0
+        self.last_seen_seq: Optional[int] = None
+        self.last_seen_uptime_ms: Optional[int] = None
+        self.last_seen_timestamp: Optional[datetime] = None
+        self.seen_observations: OrderedDict[tuple[int, int], ObservationRecord] = OrderedDict()
+        self.pending_reboot_candidate: Optional[RebootCandidate] = None
+
+
+def _normalize_utc_timestamp(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _is_timestamp_strictly_newer(
+    candidate: Optional[datetime], current: Optional[datetime]
+) -> bool:
+    if candidate is None:
+        return False
+    if current is None:
+        return True
+    return _normalize_utc_timestamp(candidate) > _normalize_utc_timestamp(current)
 
 # Directory of registered field response crews (explicitly classified as DEMO or MUNICIPAL)
 AUTHORITATIVE_FIELD_TEAMS: list[FieldTeamContract] = [
@@ -198,10 +302,32 @@ class StateStore:
 
         # Municipal & Citizen Incidents
         self._incidents: dict[str, IncidentResponseContract] = {}
+        self._incident_versions: dict[str, int] = {}
+        self._incidents_clear_generation: int = 0
+        self._duplicate_links: dict[str, DuplicateLinkContract] = {}
         self._audit_durability = AuditDurabilityManager()
         self._incident_audits: dict[str, list[IncidentAuditContract]] = self._audit_durability.load_all_audits()
+
+        # Device Observation Sessions for reboot inference and deduplication
+        self._device_sessions: dict[str, DeviceObservationSession] = {}
+
+        # Actuator Directive Lifecycle Ledger & Outbox
+        self._directive_audits: list[ActuatorDirectiveEventContract] = []
+        self._directive_audits_outbox: list[ActuatorDirectiveEventContract] = []
+        self._ephemeral_delivery_buffer: deque[StagedDeliveryEnvelope] = deque(maxlen=1000)
+        self._active_directives: dict[str, Optional[ActuatorDirectiveContract]] = {
+            "SIMULATION": None,
+            "PHYSICAL": None,
+            "SAFE_HOLD": None,
+        }
+
         self.seed_demo_incidents()
         self.recover_incidents_from_cloud()
+
+    def _bump_incident_version_locked(self, incident_id: str) -> int:
+        next_ver = self._incident_versions.get(incident_id, 0) + 1
+        self._incident_versions[incident_id] = next_ver
+        return next_ver
 
     def recover_incidents_from_cloud(self) -> None:
         """
@@ -212,12 +338,17 @@ class StateStore:
             from app.services.persistence_repository import persistence_repo
             if persistence_repo.is_configured:
                 records = persistence_repo.query_all_incidents_sync()
+                parsed: list[IncidentResponseContract] = []
                 for rec in records:
                     try:
-                        inc = IncidentResponseContract(**rec)
-                        self._incidents[inc.id] = inc
+                        parsed.append(IncidentResponseContract(**rec))
                     except Exception as parse_err:
                         logger.warning(f"Failed to parse cloud incident record {rec.get('id')}: {parse_err}")
+                if parsed:
+                    with self._lock:
+                        for inc in parsed:
+                            self._incidents[inc.id] = inc
+                            self._bump_incident_version_locked(inc.id)
                 if records:
                     logger.info(f"Recovered {len(records)} authoritative incidents from Supabase Cloud.")
         except Exception as exc:
@@ -232,7 +363,14 @@ class StateStore:
     def is_safe_hold(self) -> bool:
         return self.mode in (OperationalMode.SAFE_HOLD, "SAFE_HOLD")
 
-    def set_mode(self, new_mode: str, reason: str = "") -> tuple[bool, str]:
+    def set_mode(
+        self,
+        new_mode: str,
+        reason: str = "",
+        *,
+        issuer_type: Optional[DirectiveIssuerType] = None,
+        issuer_id: Optional[str] = None,
+    ) -> tuple[bool, str]:
         """
         Explicit, auditable operational mode transition.
         Allowed modes: SIMULATION, PHYSICAL, SAFE_HOLD, HARDWARE.
@@ -247,10 +385,54 @@ class StateStore:
         if new_mode == "HARDWARE":
             new_mode = "PHYSICAL"
 
+        clean_issuer_id = issuer_id.strip() if isinstance(issuer_id, str) else ""
+        if issuer_type is not None:
+            if isinstance(issuer_type, str) and not isinstance(issuer_type, DirectiveIssuerType):
+                issuer_type = DirectiveIssuerType(issuer_type)
+            if issuer_type == DirectiveIssuerType.OPERATOR and not clean_issuer_id:
+                raise ValueError("OPERATOR mode transition requires an explicit non-empty issuer_id.")
+            resolved_issuer_type = issuer_type
+            resolved_issuer_id = clean_issuer_id or (
+                "safety_interlock"
+                if issuer_type == DirectiveIssuerType.SAFETY_INTERLOCK
+                else "mode_transition"
+            )
+        else:
+            if new_mode == "SAFE_HOLD":
+                resolved_issuer_type = DirectiveIssuerType.SAFETY_INTERLOCK
+                resolved_issuer_id = clean_issuer_id or "safety_interlock"
+            else:
+                resolved_issuer_type = DirectiveIssuerType.AUTOMATED_ENGINE
+                resolved_issuer_id = clean_issuer_id or "mode_transition"
+
         with self._lock:
             old_mode = self.mode
             if old_mode == new_mode:
                 return True, f"System already in mode {new_mode}"
+
+            # Mode transition cancels active directive in old mode
+            prev_directive = self._active_directives.get(old_mode)
+            if prev_directive is not None:
+                cancel_event = ActuatorDirectiveEventContract(
+                    audit_id=build_mode_cancellation_audit_id(prev_directive.directive_id, new_mode),
+                    directive_id=prev_directive.directive_id,
+                    event_type=DirectiveEventType.CANCELLED,
+                    device_id=prev_directive.device_id,
+                    section_id=prev_directive.section_id,
+                    operational_mode=old_mode,
+                    action=prev_directive.action,
+                    gate_target_angle=prev_directive.gate_target_angle,
+                    reason=f"System operational mode transitioned from {old_mode} to {new_mode}.",
+                    risk_level=prev_directive.risk_level,
+                    emergency_stop=prev_directive.emergency_stop,
+                    issuer_type=resolved_issuer_type,
+                    issuer_id=resolved_issuer_id,
+                    correlation_id=prev_directive.correlation_id,
+                    device_session_epoch=prev_directive.device_session_epoch,
+                    baseline_device_sequence_number=prev_directive.baseline_device_sequence_number,
+                )
+                self._record_directive_event_locked(cancel_event)
+                self._active_directives[old_mode] = None
 
             self.mode = new_mode
             record = ModeTransitionRecord(
@@ -262,13 +444,53 @@ class StateStore:
 
             # In SAFE_HOLD mode, guarantee fail-safe actuator directive
             if self.is_safe_hold():
-                self._safe_hold_gate_directive = ActuatorDirectiveContract(
+                safe_device_id = (
+                    prev_directive.device_id
+                    if (old_mode == "PHYSICAL" and prev_directive is not None)
+                    else None
+                )
+                safe_session = (
+                    self._device_sessions.get(safe_device_id)
+                    if safe_device_id is not None
+                    else None
+                )
+                safe_epoch = safe_session.device_session_epoch if safe_session is not None else None
+                safe_seq = safe_session.last_seen_seq if safe_session is not None else None
+
+                safe_directive = ActuatorDirectiveContract(
+                    device_id=safe_device_id,
+                    baseline_device_sequence_number=safe_seq,
+                    device_session_epoch=safe_epoch,
                     gate_target_angle=settings.SAFE_HOLD_GATE_ANGLE,
                     action="SAFE_HOLD_LOCK",
                     reason=f"SAFE_HOLD active: {record.reason}. Automated actuation locked to fail-safe angle ({settings.SAFE_HOLD_GATE_ANGLE} deg).",
                     risk_level=AlertSeverity.HIGH,
                     emergency_stop=True,
+                    issuer_type=DirectiveIssuerType.SAFETY_INTERLOCK,
+                    issuer_id="safety_interlock",
                 )
+                self._safe_hold_gate_directive = safe_directive
+                self._active_directives["SAFE_HOLD"] = safe_directive
+                issued_event = ActuatorDirectiveEventContract(
+                    audit_id=build_issued_audit_id(safe_directive.directive_id),
+                    directive_id=safe_directive.directive_id,
+                    event_type=DirectiveEventType.ISSUED,
+                    device_id=safe_directive.device_id,
+                    section_id=safe_directive.section_id,
+                    operational_mode="SAFE_HOLD",
+                    action=safe_directive.action,
+                    gate_target_angle=safe_directive.gate_target_angle,
+                    reason=safe_directive.reason,
+                    risk_level=safe_directive.risk_level,
+                    emergency_stop=safe_directive.emergency_stop,
+                    issuer_type=safe_directive.issuer_type,
+                    issuer_id=safe_directive.issuer_id,
+                    correlation_id=safe_directive.correlation_id,
+                    device_session_epoch=safe_directive.device_session_epoch,
+                    baseline_device_sequence_number=safe_directive.baseline_device_sequence_number,
+                    timestamp=safe_directive.timestamp,
+                )
+                self._record_directive_event_locked(issued_event)
 
             return True, f"Successfully switched mode from {old_mode} to {new_mode}"
 
@@ -308,9 +530,23 @@ class StateStore:
             self._safe_hold_history.clear()
             self._safe_hold_gate_directive = None
 
+            # Reset actuator directive lifecycle state and device observation sessions
+            self._device_sessions.clear()
+            self._directive_audits.clear()
+            self._directive_audits_outbox.clear()
+            self._ephemeral_delivery_buffer.clear()
+            self._active_directives = {
+                "SIMULATION": None,
+                "PHYSICAL": None,
+                "SAFE_HOLD": None,
+            }
+
             self._active_scenario = None
             self._latest_benchmark = None
             self._incidents.clear()
+            self._incident_versions.clear()
+            self._incidents_clear_generation += 1
+            self._duplicate_links.clear()
             if seed_incidents:
                 self.seed_demo_incidents()
 
@@ -480,24 +716,652 @@ class StateStore:
                 return self._physical_latest_prediction
             return self._sim_latest_prediction
 
+    def _record_directive_event_locked(self, event: ActuatorDirectiveEventContract) -> None:
+        """Appends an event to the internal audit history and outbox buffer."""
+        max_size = getattr(settings, "DIRECTIVE_AUDIT_OUTBOX_MAX_SIZE", 500)
+        if len(self._directive_audits_outbox) >= max_size:
+            raise DirectiveAuditOutboxFullError(
+                f"Directive audit outbox capacity ({max_size}) exceeded; applying backpressure."
+            )
+        self._directive_audits.append(event)
+        self._directive_audits_outbox.append(event)
+
+    def _cancel_active_directive_on_reboot_locked(self, device_id: str, new_epoch: int) -> None:
+        """Cancels active directives for a device when an ESP32 reboot is confirmed."""
+        for mode, directive in list(self._active_directives.items()):
+            # Strict attribution: never fabricate a device ID. SIMULATION directives and
+            # unattributed directives are never cancelled by a physical device reboot.
+            if directive is not None and mode != "SIMULATION":
+                d_id = directive.device_id
+                if d_id is not None and d_id == device_id:
+                    cancel_event = ActuatorDirectiveEventContract(
+                        audit_id=build_reboot_cancellation_audit_id(directive.directive_id, new_epoch),
+                        directive_id=directive.directive_id,
+                        event_type=DirectiveEventType.CANCELLED,
+                        device_id=device_id,
+                        section_id=directive.section_id,
+                        operational_mode=mode,
+                        action=directive.action,
+                        gate_target_angle=directive.gate_target_angle,
+                        reason="Device reboot confirmed; active supervisory directive cancelled.",
+                        risk_level=directive.risk_level,
+                        emergency_stop=directive.emergency_stop,
+                        issuer_type=DirectiveIssuerType.SAFETY_INTERLOCK,
+                        issuer_id="reboot_detector",
+                        correlation_id=directive.correlation_id,
+                        device_session_epoch=new_epoch,
+                        baseline_device_sequence_number=directive.baseline_device_sequence_number,
+                    )
+                    self._record_directive_event_locked(cancel_event)
+                    self._active_directives[mode] = None
+
+    def _insert_seen_observation(
+        self, session: DeviceObservationSession, key: tuple[int, int], record: ObservationRecord
+    ) -> None:
+        """
+        Inserts an observation into the bounded OrderedDict LRU cache (capacity 256).
+        Evicts oldest entry using popitem(last=False) when over capacity.
+        """
+        session.seen_observations[key] = record
+        session.seen_observations.move_to_end(key, last=True)
+        while len(session.seen_observations) > settings.DEVICE_SESSION_SEEN_CACHE_SIZE:
+            session.seen_observations.popitem(last=False)
+
+    def process_telemetry_observation(
+        self, readings: Sequence[SensorReadingContract]
+    ) -> tuple[str, Optional[ObservationRecord]]:
+        """
+        Atomically ingests a batch of sensor readings under self._lock,
+        enforcing device observation session tracking, reboot candidate state machine,
+        observation coalescing, mixed partial-batch completion, and explicit OrderedDict LRU eviction.
+        """
+        if not readings:
+            return ("EMPTY", None)
+
+        with self._lock:
+            def _get_dev(r: SensorReadingContract) -> str:
+                if getattr(r, "device_id", None):
+                    return r.device_id
+                if r.metadata and "device_id" in r.metadata:
+                    return str(r.metadata["device_id"])
+                return "DRAINX-ESP32-NODE-01"
+
+            def _get_seq(r: SensorReadingContract) -> Any:
+                if getattr(r, "sequence_number", None) is not None:
+                    return r.sequence_number
+                if r.metadata and "sequence_number" in r.metadata:
+                    return r.metadata["sequence_number"]
+                return None
+
+            def _get_uptime(r: SensorReadingContract) -> Any:
+                if getattr(r, "uptime_ms", None) is not None:
+                    return r.uptime_ms
+                if r.metadata and "uptime_ms" in r.metadata:
+                    return r.metadata["uptime_ms"]
+                return None
+
+            def _get_angle(r: SensorReadingContract) -> Optional[float]:
+                if getattr(r, "gate_angle_deg", None) is not None:
+                    return r.gate_angle_deg
+                if r.metadata and "gate_angle_deg" in r.metadata:
+                    return r.metadata["gate_angle_deg"]
+                if r.metadata and "gate_angle" in r.metadata:
+                    return r.metadata["gate_angle"]
+                return None
+
+            # 1. Device identity & session retrieval
+            first_r = readings[0]
+            device_id = _get_dev(first_r)
+            if device_id not in self._device_sessions:
+                self._device_sessions[device_id] = DeviceObservationSession(device_id=device_id)
+            session = self._device_sessions[device_id]
+
+            # 2. Strict core numeric validation
+            seq_num = _get_seq(first_r)
+            uptime_ms = _get_uptime(first_r)
+
+            if seq_num is None or uptime_ms is None:
+                return ("INVALID_NUMERIC", None)
+            if isinstance(seq_num, bool) or isinstance(uptime_ms, bool):
+                return ("INVALID_NUMERIC", None)
+            if not isinstance(seq_num, int) or not isinstance(uptime_ms, int):
+                return ("INVALID_NUMERIC", None)
+            if seq_num < 0 or uptime_ms < 0:
+                return ("INVALID_NUMERIC", None)
+
+            # Ensure all readings in batch share device_id, sequence_number, and uptime_ms
+            for r in readings:
+                r_dev = _get_dev(r)
+                if r_dev != device_id or _get_seq(r) != seq_num or _get_uptime(r) != uptime_ms:
+                    return ("INVALID_BATCH", None)
+
+            # 3. Extract sensor digests and metadata
+            try:
+                sensor_digests = {r.sensor_id: compute_reading_digest(r) for r in readings}
+                agg_digest = compute_aggregate_observation_digest(readings)
+            except Exception as exc:
+                logger.warning("Error computing reading digest: %s", exc)
+                return ("INVALID_DIGEST", None)
+
+            firmware_ver = next(
+                (r.metadata.get("firmware_version") for r in readings if r.metadata and "firmware_version" in r.metadata),
+                None,
+            )
+            measured_angle = next((_get_angle(r) for r in readings if _get_angle(r) is not None), None)
+            measured_state = next(
+                (
+                    r.metadata.get("gate_state") or r.metadata.get("measured_state")
+                    for r in readings
+                    if r.metadata and ("gate_state" in r.metadata or "measured_state" in r.metadata)
+                ),
+                None,
+            )
+            actuator_snapshot = {
+                "measured_angle": measured_angle,
+                "measured_state": measured_state,
+            }
+
+            obs_key = (seq_num, uptime_ms)
+
+            # 4. Check if observation was already seen in session cache
+            if obs_key in session.seen_observations:
+                existing = session.seen_observations[obs_key]
+
+                # (a) Check overlapping sensor digests
+                for s_id, s_dig in sensor_digests.items():
+                    if s_id in existing.sensor_digests:
+                        if existing.sensor_digests[s_id] != s_dig:
+                            # Conflicting overlapping sensor! Atomically reject merge.
+                            return ("AMBIGUOUS_REGRESSION", None)
+
+                # (b) Check firmware version consistency
+                if firmware_ver and existing.firmware_version and firmware_ver != existing.firmware_version:
+                    return ("AMBIGUOUS_REGRESSION", None)
+
+                # (c) Check actuator snapshot consistency (safe against bool/NaN/non-numeric inputs)
+                existing_angle = existing.actuator_snapshot.get("measured_angle")
+                if measured_angle is not None and existing_angle is not None:
+                    if (
+                        isinstance(measured_angle, bool)
+                        or isinstance(existing_angle, bool)
+                        or not isinstance(measured_angle, (int, float, Decimal))
+                        or not isinstance(existing_angle, (int, float, Decimal))
+                    ):
+                        if canonicalize_value(measured_angle) != canonicalize_value(existing_angle):
+                            return ("AMBIGUOUS_REGRESSION", None)
+                    else:
+                        fa = float(measured_angle)
+                        fb = float(existing_angle)
+                        if not math.isfinite(fa) or not math.isfinite(fb):
+                            if canonicalize_value(fa) != canonicalize_value(fb):
+                                return ("AMBIGUOUS_REGRESSION", None)
+                        elif abs(fa - fb) > 0.001:
+                            return ("AMBIGUOUS_REGRESSION", None)
+                if measured_state is not None and existing.actuator_snapshot.get("measured_state") is not None:
+                    if measured_state != existing.actuator_snapshot["measured_state"]:
+                        return ("AMBIGUOUS_REGRESSION", None)
+
+                # All overlapping fields match!
+                new_sensors = set(sensor_digests.keys()) - set(existing.sensor_digests.keys())
+                if not new_sensors:
+                    # Subset retransmission / Duplicate
+                    session.seen_observations.move_to_end(obs_key, last=True)
+                    existing.last_seen_time = time.time()
+                    return ("DUPLICATE", existing)
+                else:
+                    # Partial batch completion! Merge new sensor entries
+                    for r in readings:
+                        if r.sensor_id in new_sensors:
+                            existing.raw_readings.append(r)
+                            existing.sensor_digests[r.sensor_id] = sensor_digests[r.sensor_id]
+                    if firmware_ver and not existing.firmware_version:
+                        existing.firmware_version = firmware_ver
+                    if measured_angle is not None and existing.actuator_snapshot.get("measured_angle") is None:
+                        existing.actuator_snapshot["measured_angle"] = measured_angle
+                    if measured_state is not None and existing.actuator_snapshot.get("measured_state") is None:
+                        existing.actuator_snapshot["measured_state"] = measured_state
+
+                    # Recompute aggregate digest
+                    existing.aggregate_digest = compute_aggregate_observation_digest(existing.raw_readings)
+                    existing.last_seen_time = time.time()
+                    session.seen_observations.move_to_end(obs_key, last=True)
+                    return ("PARTIAL_BATCH_COMPLETION", existing)
+
+            # 5. Observation is NOT yet in session cache
+            new_record = ObservationRecord(
+                sequence_number=seq_num,
+                uptime_ms=uptime_ms,
+                raw_readings=list(readings),
+                sensor_digests=sensor_digests,
+                firmware_version=firmware_ver,
+                actuator_snapshot=actuator_snapshot,
+                aggregate_digest=agg_digest,
+            )
+
+            # Check uint32 rollover
+            is_rollover = (
+                session.last_seen_uptime_ms is not None
+                and session.last_seen_uptime_ms > (0xFFFFFFFF - settings.DEVICE_UPTIME_ROLLOVER_WINDOW_MS)
+                and uptime_ms < settings.DEVICE_UPTIME_ROLLOVER_WINDOW_MS
+            )
+
+            if session.last_seen_seq is None:
+                # First observation ever for this session
+                session.last_seen_seq = seq_num
+                session.last_seen_uptime_ms = uptime_ms
+                session.last_seen_timestamp = datetime.now(timezone.utc)
+                self._insert_seen_observation(session, obs_key, new_record)
+                self._correlate_actuator_feedback_locked(
+                    device_id, session.device_session_epoch, seq_num, measured_angle, measured_state, uptime_ms
+                )
+                return ("NEW", new_record)
+
+            if seq_num > session.last_seen_seq or is_rollover:
+                # Monotonic forward progression
+                session.last_seen_seq = seq_num
+                session.last_seen_uptime_ms = uptime_ms
+                session.last_seen_timestamp = datetime.now(timezone.utc)
+                self._insert_seen_observation(session, obs_key, new_record)
+
+                # Clear expired reboot candidate
+                if session.pending_reboot_candidate and (
+                    time.time() - session.pending_reboot_candidate.first_observed_time > settings.DEVICE_REBOOT_CONFIRM_WINDOW_S
+                ):
+                    session.pending_reboot_candidate = None
+
+                self._correlate_actuator_feedback_locked(
+                    device_id, session.device_session_epoch, seq_num, measured_angle, measured_state, uptime_ms
+                )
+                return ("NEW", new_record)
+
+            # Sequence or uptime regressed (seq_num <= session.last_seen_seq and not rollover)
+            is_potential_reboot = (seq_num < session.last_seen_seq and uptime_ms < session.last_seen_uptime_ms)
+
+            if is_potential_reboot:
+                now_ts = time.time()
+                cand = session.pending_reboot_candidate
+
+                if cand is None or (now_ts - cand.first_observed_time > settings.DEVICE_REBOOT_CONFIRM_WINDOW_S):
+                    cand = RebootCandidate(
+                        anchor_seq=seq_num,
+                        anchor_uptime_ms=uptime_ms,
+                        anchor_timestamp=now_ts,
+                        observations=[new_record],
+                        confirm_count=1,
+                        first_observed_time=now_ts,
+                        last_observed_time=now_ts,
+                    )
+                    session.pending_reboot_candidate = cand
+                else:
+                    # Check if observation matches one already in candidate
+                    match_cand_obs = next(
+                        (o for o in cand.observations if o.sequence_number == seq_num and o.uptime_ms == uptime_ms),
+                        None,
+                    )
+                    if match_cand_obs is not None:
+                        # Staged reboot observation merge semantics
+                        overlap_conflict = any(
+                            match_cand_obs.sensor_digests.get(sid) != sdig
+                            for sid, sdig in sensor_digests.items()
+                            if sid in match_cand_obs.sensor_digests
+                        )
+                        if overlap_conflict:
+                            return ("AMBIGUOUS_REGRESSION", None)
+                        for r in readings:
+                            if r.sensor_id not in match_cand_obs.sensor_digests:
+                                match_cand_obs.raw_readings.append(r)
+                                match_cand_obs.sensor_digests[r.sensor_id] = sensor_digests[r.sensor_id]
+                        match_cand_obs.aggregate_digest = compute_aggregate_observation_digest(match_cand_obs.raw_readings)
+                        # Repeated observation does not increment confirm_count
+                    else:
+                        if seq_num >= cand.anchor_seq and uptime_ms >= cand.anchor_uptime_ms:
+                            wall_delta_s = now_ts - cand.first_observed_time
+                            uptime_delta_s = (uptime_ms - cand.anchor_uptime_ms) / 1000.0
+                            pacing_drift = abs(wall_delta_s - uptime_delta_s)
+                            if pacing_drift <= settings.DEVICE_REBOOT_MAX_PACING_DRIFT_S:
+                                cand.observations.append(new_record)
+                                cand.confirm_count += 1
+                                cand.last_observed_time = now_ts
+
+                span_s = cand.last_observed_time - cand.first_observed_time
+                if (
+                    cand.confirm_count >= settings.DEVICE_REBOOT_MIN_CONFIRM_PACKETS
+                    and span_s >= settings.DEVICE_REBOOT_MIN_CONFIRM_SPAN_S
+                    and (now_ts - cand.first_observed_time) <= settings.DEVICE_REBOOT_CONFIRM_WINDOW_S
+                ):
+                    # REBOOT CONFIRMED
+                    session.device_session_epoch += 1
+                    session.last_seen_seq = cand.observations[-1].sequence_number
+                    session.last_seen_uptime_ms = cand.observations[-1].uptime_ms
+                    session.last_seen_timestamp = datetime.now(timezone.utc)
+                    for obs in cand.observations:
+                        self._insert_seen_observation(session, (obs.sequence_number, obs.uptime_ms), obs)
+                    session.pending_reboot_candidate = None
+                    self._cancel_active_directive_on_reboot_locked(device_id, session.device_session_epoch)
+                    return ("REBOOT_CONFIRMED", new_record)
+                else:
+                    self._insert_seen_observation(session, obs_key, new_record)
+                    return ("REBOOT_PENDING", new_record)
+
+            # Delayed / Out of order packet
+            self._insert_seen_observation(session, obs_key, new_record)
+            return ("OUT_OF_ORDER", new_record)
+
+    @staticmethod
+    def _sanitize_nullable_feedback_angle(value: Any, field_name: str) -> Optional[float]:
+        """Returns NUMERIC(5,2)-safe float in [0, 90] or None when invalid; never fabricates values."""
+        if value is None:
+            return None
+        try:
+            q = quantize_numeric_5_2_decimal(value, field_name, allow_none=True)
+        except (ValueError, TypeError):
+            return None
+        if q is None:
+            return None
+        return 0.0 if q == 0 else float(q)
+
+    def _correlate_actuator_feedback_locked(
+        self,
+        device_id: str,
+        session_epoch: int,
+        seq_num: int,
+        measured_angle: Any,
+        measured_state: Any,
+        uptime_ms: Optional[int] = None,
+    ) -> None:
+        """Evaluates feedback against the active directive in the current operational mode."""
+        directive = self._active_directives.get(self.mode)
+        if directive is None:
+            return
+
+        # Target device check: refuse correlation from another device or against an unattributed baseline
+        if directive.device_id is not None and directive.device_id != device_id:
+            return
+        if directive.device_id is None and (
+            directive.device_session_epoch is not None
+            or directive.baseline_device_sequence_number is not None
+        ):
+            return
+
+        # Session epoch check: directive baseline epoch must match current observation epoch
+        if directive.device_session_epoch is not None and directive.device_session_epoch != session_epoch:
+            return
+
+        # Sequence number check: observation must be newer than baseline
+        if directive.baseline_device_sequence_number is not None and seq_num <= directive.baseline_device_sequence_number:
+            return
+
+        # Feedback completeness check: handle missing measured_angle or measured_state safely
+        if measured_angle is None or measured_state is None:
+            return
+
+        is_aligned, reason, angular_error = evaluate_alignment_consistency(
+            target_angle=directive.gate_target_angle,
+            measured_angle=measured_angle,
+            measured_state=measured_state,
+            tolerance=settings.ACTUATOR_VERIFICATION_TOLERANCE_DEG,
+        )
+
+        elapsed_s = (datetime.now(timezone.utc) - directive.timestamp).total_seconds()
+
+        if is_aligned:
+            # Physical alignment observed
+            event = ActuatorDirectiveEventContract(
+                audit_id=build_alignment_observed_audit_id(directive.directive_id, session_epoch, seq_num),
+                directive_id=directive.directive_id,
+                event_type=DirectiveEventType.ALIGNMENT_OBSERVED,
+                device_id=device_id,
+                section_id=directive.section_id,
+                operational_mode=self.mode,
+                action=directive.action,
+                gate_target_angle=directive.gate_target_angle,
+                reason="Observed physical alignment with supervisory setpoint.",
+                risk_level=directive.risk_level,
+                emergency_stop=directive.emergency_stop,
+                measured_gate_angle=measured_angle,
+                measured_gate_state=measured_state,
+                execution_divergence_deg=angular_error,
+                issuer_type=directive.issuer_type,
+                issuer_id=directive.issuer_id,
+                correlation_id=directive.correlation_id,
+                device_session_epoch=session_epoch,
+                baseline_device_sequence_number=directive.baseline_device_sequence_number,
+                device_sequence_number=seq_num,
+                device_uptime_ms=uptime_ms,
+            )
+            self._record_directive_event_locked(event)
+            self._active_directives[self.mode] = None
+        else:
+            if elapsed_s >= settings.ACTUATOR_SETTLING_TIMEOUT_SEC:
+                # Sanitize invalid hardware measurements to None so ledger persistence never crashes
+                safe_angle = self._sanitize_nullable_feedback_angle(measured_angle, "measured_gate_angle")
+                safe_state = (
+                    measured_state
+                    if isinstance(measured_state, str) and measured_state in VALID_FIRMWARE_GATE_STATES
+                    else None
+                )
+                safe_divergence = (
+                    self._sanitize_nullable_feedback_angle(angular_error, "execution_divergence_deg")
+                    if safe_angle is not None
+                    else None
+                )
+                clean_reason = (reason or "").replace("\x00", "").strip()
+                if not clean_reason:
+                    clean_reason = (
+                        f"Persistent divergence beyond {settings.ACTUATOR_SETTLING_TIMEOUT_SEC:.0f}s settling window."
+                    )
+
+                event = ActuatorDirectiveEventContract(
+                    audit_id=build_execution_failed_audit_id(directive.directive_id, session_epoch, seq_num),
+                    directive_id=directive.directive_id,
+                    event_type=DirectiveEventType.EXECUTION_FAILED,
+                    device_id=device_id,
+                    section_id=directive.section_id,
+                    operational_mode=self.mode,
+                    action=directive.action,
+                    gate_target_angle=directive.gate_target_angle,
+                    reason=clean_reason,
+                    risk_level=directive.risk_level,
+                    emergency_stop=directive.emergency_stop,
+                    measured_gate_angle=safe_angle,
+                    measured_gate_state=safe_state,
+                    execution_divergence_deg=safe_divergence,
+                    issuer_type=directive.issuer_type,
+                    issuer_id=directive.issuer_id,
+                    correlation_id=directive.correlation_id,
+                    device_session_epoch=session_epoch,
+                    baseline_device_sequence_number=directive.baseline_device_sequence_number,
+                    device_sequence_number=seq_num,
+                    device_uptime_ms=uptime_ms,
+                )
+                self._record_directive_event_locked(event)
+                self._active_directives[self.mode] = None
+
+    def evaluate_verification_timeouts(self) -> list[ActuatorDirectiveEventContract]:
+        """Checks for verification timeout (30s) across all active directives."""
+        with self._lock:
+            timeout_events = []
+            now_dt = datetime.now(timezone.utc)
+            for mode, directive in list(self._active_directives.items()):
+                if directive is not None:
+                    elapsed_s = (now_dt - directive.timestamp).total_seconds()
+                    if elapsed_s >= settings.ACTUATOR_VERIFICATION_TIMEOUT_SEC:
+                        evt = ActuatorDirectiveEventContract(
+                            audit_id=build_verification_timeout_audit_id(directive.directive_id),
+                            directive_id=directive.directive_id,
+                            event_type=DirectiveEventType.VERIFICATION_TIMEOUT,
+                            device_id=directive.device_id,
+                            section_id=directive.section_id,
+                            operational_mode=mode,
+                            action=directive.action,
+                            gate_target_angle=directive.gate_target_angle,
+                            reason=f"Verification timeout after {settings.ACTUATOR_VERIFICATION_TIMEOUT_SEC:.0f}s window without observed physical alignment.",
+                            risk_level=directive.risk_level,
+                            emergency_stop=directive.emergency_stop,
+                            issuer_type=directive.issuer_type,
+                            issuer_id=directive.issuer_id,
+                            correlation_id=directive.correlation_id,
+                            device_session_epoch=directive.device_session_epoch,
+                            baseline_device_sequence_number=directive.baseline_device_sequence_number,
+                            timestamp=compute_verification_timeout_timestamp(
+                                directive.timestamp, settings.ACTUATOR_VERIFICATION_TIMEOUT_SEC
+                            ),
+                        )
+                        self._record_directive_event_locked(evt)
+                        self._active_directives[mode] = None
+                        timeout_events.append(evt)
+            return timeout_events
+
     def set_gate_directive(self, directive: ActuatorDirectiveContract) -> None:
         """
-        Thread-safe gate directive update.
+        Thread-safe gate directive update with supervisory lifecycle tracking.
         SAFE_HOLD invariant: while in SAFE_HOLD, incoming non-SAFE_HOLD directives
         can NEVER replace the immutable fail-safe hold posture.
         """
         with self._lock:
+            current_mode = self.mode
+            if directive.operational_mode is None:
+                directive.operational_mode = current_mode
             if self.is_safe_hold():
                 if directive.action != "SAFE_HOLD_LOCK" or not directive.emergency_stop:
                     # Reject incoming operational directives to preserve fail-safe hold invariant
                     return
-                self._safe_hold_gate_directive = directive
-                return
 
-            if self.is_physical():
-                self._physical_latest_gate_directive = directive
+            # Resolve target device once per issuance; preserve SIMULATION without inventing hardware IDs
+            raw_device_id = (
+                directive.device_id.strip()
+                if isinstance(directive.device_id, str) and directive.device_id.strip()
+                else None
+            )
+            if current_mode == "PHYSICAL":
+                resolved_device_id: Optional[str] = raw_device_id or "DRAINX-ESP32-NODE-01"
+                directive.device_id = resolved_device_id
             else:
+                resolved_device_id = raw_device_id
+                directive.device_id = resolved_device_id
+
+            # Guard against duplicate/conflicting ISSUED audit generation for the same directive_id
+            existing_issued = next(
+                (
+                    evt
+                    for evt in self._directive_audits
+                    if evt.directive_id == directive.directive_id
+                    and evt.event_type == DirectiveEventType.ISSUED
+                ),
+                None,
+            )
+            if existing_issued is not None:
+                incoming_angle_q = quantize_numeric_5_2_decimal(directive.gate_target_angle, "gate_target_angle")
+                existing_angle_q = quantize_numeric_5_2_decimal(
+                    existing_issued.gate_target_angle, "gate_target_angle"
+                )
+                matches_core = (
+                    existing_issued.section_id == directive.section_id
+                    and existing_issued.device_id == resolved_device_id
+                    and existing_issued.operational_mode == current_mode
+                    and existing_issued.action == directive.action
+                    and existing_angle_q == incoming_angle_q
+                    and existing_issued.reason == (directive.reason or "").strip()
+                    and existing_issued.risk_level == directive.risk_level
+                    and existing_issued.emergency_stop == directive.emergency_stop
+                    and existing_issued.issuer_type == directive.issuer_type
+                    and existing_issued.issuer_id == directive.issuer_id
+                    and existing_issued.correlation_id == directive.correlation_id
+                    and (
+                        directive.device_session_epoch is None
+                        or directive.device_session_epoch == existing_issued.device_session_epoch
+                    )
+                    and (
+                        directive.baseline_device_sequence_number is None
+                        or directive.baseline_device_sequence_number == existing_issued.baseline_device_sequence_number
+                    )
+                )
+                if matches_core:
+                    directive.device_session_epoch = existing_issued.device_session_epoch
+                    directive.baseline_device_sequence_number = existing_issued.baseline_device_sequence_number
+                    return
+                raise ValueError(
+                    f"Directive '{directive.directive_id}' was already issued with conflicting attributes."
+                )
+
+            if self.is_safe_hold():
+                self._safe_hold_gate_directive = directive
+
+            # Check if previous active directive in current mode is being superseded
+            prev_active = self._active_directives.get(current_mode)
+            needed = 2 if (prev_active is not None and prev_active.directive_id != directive.directive_id) else 1
+            max_size = getattr(settings, "DIRECTIVE_AUDIT_OUTBOX_MAX_SIZE", 500)
+            if len(self._directive_audits_outbox) + needed > max_size:
+                raise DirectiveAuditOutboxFullError(
+                    f"Directive audit outbox capacity ({max_size}) exceeded; applying backpressure."
+                )
+
+            if prev_active is not None and prev_active.directive_id != directive.directive_id:
+                supersede_event = ActuatorDirectiveEventContract(
+                    audit_id=build_superseded_audit_id(prev_active.directive_id, directive.directive_id),
+                    directive_id=prev_active.directive_id,
+                    event_type=DirectiveEventType.SUPERSEDED,
+                    device_id=prev_active.device_id,
+                    section_id=prev_active.section_id,
+                    operational_mode=current_mode,
+                    action=prev_active.action,
+                    gate_target_angle=prev_active.gate_target_angle,
+                    reason=f"Superseded by newer directive {directive.directive_id}",
+                    risk_level=prev_active.risk_level,
+                    emergency_stop=prev_active.emergency_stop,
+                    issuer_type=prev_active.issuer_type,
+                    issuer_id=prev_active.issuer_id,
+                    correlation_id=prev_active.correlation_id,
+                    device_session_epoch=prev_active.device_session_epoch,
+                    baseline_device_sequence_number=prev_active.baseline_device_sequence_number,
+                )
+                self._record_directive_event_locked(supersede_event)
+
+            # Assign device baseline sequence number and session epoch only when a device identity is resolved
+            if resolved_device_id is not None:
+                session = self._device_sessions.get(resolved_device_id)
+                if session is not None:
+                    directive.baseline_device_sequence_number = session.last_seen_seq
+                    directive.device_session_epoch = session.device_session_epoch
+
+            # Store as active directive for this mode
+            self._active_directives[current_mode] = directive
+            if current_mode == "PHYSICAL":
+                self._physical_latest_gate_directive = directive
+            elif current_mode == "SIMULATION":
                 self._sim_latest_gate_directive = directive
+
+            # Record ISSUED event in append-only ledger
+            issued_event = ActuatorDirectiveEventContract(
+                audit_id=build_issued_audit_id(directive.directive_id),
+                directive_id=directive.directive_id,
+                event_type=DirectiveEventType.ISSUED,
+                device_id=directive.device_id,
+                section_id=directive.section_id,
+                operational_mode=current_mode,
+                action=directive.action,
+                gate_target_angle=directive.gate_target_angle,
+                reason=directive.reason,
+                risk_level=directive.risk_level,
+                emergency_stop=directive.emergency_stop,
+                issuer_type=directive.issuer_type,
+                issuer_id=directive.issuer_id,
+                correlation_id=directive.correlation_id,
+                device_session_epoch=directive.device_session_epoch,
+                baseline_device_sequence_number=directive.baseline_device_sequence_number,
+                timestamp=directive.timestamp,
+            )
+            self._record_directive_event_locked(issued_event)
+
+            # Stage in delivery envelope buffer
+            envelope = StagedDeliveryEnvelope(
+                directive_id=directive.directive_id,
+                gate_target_angle=directive.gate_target_angle,
+                action=directive.action,
+                emergency_stop=directive.emergency_stop,
+                issued_timestamp=directive.timestamp,
+            )
+            self._ephemeral_delivery_buffer.append(envelope)
 
     def get_gate_directive(self) -> Optional[ActuatorDirectiveContract]:
         with self._lock:
@@ -507,6 +1371,126 @@ class StateStore:
                 return self._physical_latest_gate_directive
             else:
                 return self._sim_latest_gate_directive
+
+    def get_active_directive(self, mode: Optional[str] = None) -> Optional[ActuatorDirectiveContract]:
+        """Returns the currently active, unsettled directive in the specified or current mode."""
+        with self._lock:
+            m = mode or self.mode
+            return self._active_directives.get(m)
+
+    def get_directive_audits(
+        self, directive_id: Optional[str] = None, limit: Optional[int] = 100
+    ) -> list[ActuatorDirectiveEventContract]:
+        """Retrieves in-memory directive audit events in chronological order."""
+        with self._lock:
+            if directive_id:
+                events = [e for e in self._directive_audits if e.directive_id == directive_id]
+            else:
+                events = list(self._directive_audits)
+            # Stable sort by timestamp only: events sharing a timestamp (coarse clock resolution)
+            # retain true insertion/lifecycle order instead of alphabetical audit_id order.
+            ordered = sorted(events, key=lambda x: x.timestamp)
+            if limit is None:
+                return ordered
+            return ordered[-limit:]
+
+    def flush_directive_audits_outbox(
+        self, max_batch_size: Optional[int] = None
+    ) -> list[ActuatorDirectiveEventContract]:
+        """Flushes outbox events for database persistence in FIFO order."""
+        with self._lock:
+            if not self._directive_audits_outbox:
+                return []
+            if max_batch_size is None or max_batch_size >= len(self._directive_audits_outbox):
+                flushed = list(self._directive_audits_outbox)
+                self._directive_audits_outbox.clear()
+                return flushed
+            if max_batch_size <= 0:
+                return []
+            flushed = list(self._directive_audits_outbox[:max_batch_size])
+            self._directive_audits_outbox = self._directive_audits_outbox[max_batch_size:]
+            return flushed
+
+    def restore_directive_audits_outbox(
+        self, events: Sequence[ActuatorDirectiveEventContract]
+    ) -> None:
+        """
+        Restores undelivered events back to the outbox upon persistence failure.
+        - Deduplicates against existing events in the outbox by audit_id.
+        - Prepends restored events ahead of newer events to preserve strict FIFO ordering.
+        - Enforces bounded capacity; raises DirectiveAuditOutboxFullError if capacity exceeded.
+        - Never silently evicts events.
+        """
+        if not events:
+            return
+        with self._lock:
+            existing_ids = {e.audit_id for e in self._directive_audits_outbox}
+            to_restore: list[ActuatorDirectiveEventContract] = []
+            for e in events:
+                if e.audit_id not in existing_ids:
+                    existing_ids.add(e.audit_id)
+                    to_restore.append(e)
+
+            if not to_restore:
+                return
+
+            max_size = getattr(settings, "DIRECTIVE_AUDIT_OUTBOX_MAX_SIZE", 500)
+            self._directive_audits_outbox = to_restore + self._directive_audits_outbox
+            if len(self._directive_audits_outbox) > max_size:
+                raise DirectiveAuditOutboxFullError(
+                    f"Directive audit outbox capacity ({max_size}) exceeded after restoring "
+                    f"{len(to_restore)} events; applying backpressure."
+                )
+
+    def get_directive_audits_outbox_count(self) -> int:
+        """Returns the number of events currently queued in the volatile outbox."""
+        with self._lock:
+            return len(self._directive_audits_outbox)
+
+    def reconcile_recovered_directive(
+        self, directive: ActuatorDirectiveContract, latest_event_type: DirectiveEventType
+    ) -> bool:
+        """
+        Reconciles recovered directives on startup with strict operational mode isolation:
+        - Rejects terminal directives (only ISSUED / FEEDBACK_RECEIVED are eligible).
+        - PHYSICAL directives must NEVER be reactivated across a backend restart.
+        - SIMULATION directives are only restored into _active_directives["SIMULATION"]
+          if the current process mode is SIMULATION.
+        - SAFE_HOLD directives are only restored into _active_directives["SAFE_HOLD"]
+          if the current process is in SAFE_HOLD.
+        """
+        with self._lock:
+            if latest_event_type not in (DirectiveEventType.ISSUED, DirectiveEventType.FEEDBACK_RECEIVED):
+                return False
+
+            op_mode = directive.operational_mode
+            if op_mode == "PHYSICAL":
+                logger.warning(
+                    "Reconciliation rejected physical directive '%s': physical directives must never be reactivated across backend restart.",
+                    directive.directive_id,
+                )
+                return False
+
+            if op_mode == "SIMULATION":
+                if self.mode == "SIMULATION":
+                    self._active_directives["SIMULATION"] = directive
+                    self._sim_latest_gate_directive = directive
+                    return True
+                logger.warning(
+                    "Reconciliation skipped simulation directive '%s': process mode is '%s'.",
+                    directive.directive_id,
+                    self.mode,
+                )
+                return False
+
+            if op_mode == "SAFE_HOLD" or (directive.action == "SAFE_HOLD_LOCK" and directive.emergency_stop):
+                if self.is_safe_hold():
+                    self._active_directives["SAFE_HOLD"] = directive
+                    self._safe_hold_gate_directive = directive
+                    return True
+                return False
+
+            return False
 
     # Mechanism State
     def get_mechanism_status(self) -> MechanismStatusContract:
@@ -595,6 +1579,7 @@ class StateStore:
                 assignment_type=AssignmentType.TEAM,
                 assigned_team_id="TEAM-ALPHA",
                 municipal_notes="High-capacity dewatering pump dispatched to site.",
+                origin_operational_mode="SIMULATION",
             ),
             IncidentResponseContract(
                 id="INC-DEMO-02",
@@ -610,6 +1595,7 @@ class StateStore:
                 assignment_type=AssignmentType.TEAM,
                 assigned_team_id="TEAM-BETA",
                 municipal_notes="Suction tanker scheduled for 14:00 drain vacuuming.",
+                origin_operational_mode="SIMULATION",
             ),
             IncidentResponseContract(
                 id="INC-DEMO-03",
@@ -625,6 +1611,7 @@ class StateStore:
                 assignment_type=AssignmentType.TEAM,
                 assigned_team_id="TEAM-GAMMA",
                 municipal_notes="Verified by municipal field inspector. Manual clearing required.",
+                origin_operational_mode="SIMULATION",
             ),
             IncidentResponseContract(
                 id="INC-DEMO-04",
@@ -640,12 +1627,14 @@ class StateStore:
                 assignment_type=AssignmentType.TEAM,
                 assigned_team_id="TEAM-DELTA",
                 municipal_notes="Grating slab repositioned and secured with structural steel anchors.",
+                origin_operational_mode="SIMULATION",
             ),
         ]
         with self._lock:
             for item in demo_items:
                 if item.id not in self._incidents:
                     self._incidents[item.id] = item
+                    self._bump_incident_version_locked(item.id)
                     # Seed corresponding audit history for demo inspection
                     self._incident_audits[item.id] = [
                         IncidentAuditContract(
@@ -679,6 +1668,11 @@ class StateStore:
 
     def create_incident(self, incident: IncidentResponseContract) -> IncidentResponseContract:
         with self._lock:
+            if not incident.origin_operational_mode:
+                incident.origin_operational_mode = (
+                    "SIMULATION" if self.is_simulation() else ("SAFE_HOLD" if self.is_safe_hold() else "PHYSICAL")
+                )
+
             audit = IncidentAuditContract(
                 incident_id=incident.id,
                 actor_id=incident.reporter_name or "citizen",
@@ -717,6 +1711,7 @@ class StateStore:
                     reporter_name=incident.reporter_name or "Citizen Anonymous",
                     photos=incident.photos,
                     audit_id=audit.audit_id,
+                    origin_operational_mode=incident.origin_operational_mode,
                 )
 
                 if (
@@ -732,39 +1727,183 @@ class StateStore:
             # or when running without Supabase in local development.
             self._audit_durability.append_audit(audit)
             self._incidents[incident.id] = incident
+            self._bump_incident_version_locked(incident.id)
             self._incident_audits[incident.id] = [audit]
 
             return incident
 
+    def delete_incident(self, incident_id: str) -> bool:
+        """Thread-safely removes an incident from memory and advances its mutation version."""
+        with self._lock:
+            existed = self._incidents.pop(incident_id, None) is not None
+            self._bump_incident_version_locked(incident_id)
+            return existed
 
+    def _reconcile_cloud_incident_locked(
+        self,
+        incident_id: str,
+        fetched: Optional[IncidentResponseContract],
+        *,
+        authoritative_cloud: bool,
+        start_clear_gen: int,
+        start_version: int,
+        start_present: bool,
+        start_updated_at: Optional[datetime],
+    ) -> Optional[IncidentResponseContract]:
+        """Reconciles a cloud-fetched incident against local state while holding self._lock."""
+        if self._incidents_clear_generation != start_clear_gen:
+            return self._incidents.get(incident_id)
 
+        current_version = self._incident_versions.get(incident_id, 0)
+        current_local = self._incidents.get(incident_id)
+        current_updated_at = current_local.updated_at if current_local is not None else None
+
+        concurrent_mutation = (
+            current_version != start_version
+            or (start_present and current_local is None)
+            or (not start_present and current_local is not None)
+            or (
+                start_present
+                and current_local is not None
+                and start_updated_at is not None
+                and current_updated_at is not None
+                and current_updated_at != start_updated_at
+            )
+        )
+
+        if concurrent_mutation:
+            if current_local is None:
+                return None
+            if fetched is None:
+                return current_local
+            if _is_timestamp_strictly_newer(fetched.updated_at, current_local.updated_at):
+                self._incidents[incident_id] = fetched
+                self._bump_incident_version_locked(incident_id)
+                return fetched
+            return current_local
+
+        if fetched is not None:
+            self._incidents[incident_id] = fetched
+            self._bump_incident_version_locked(incident_id)
+            return fetched
+
+        if authoritative_cloud and current_local is not None:
+            self._incidents.pop(incident_id, None)
+            self._bump_incident_version_locked(incident_id)
+        return None
 
     def get_incident(
         self, incident_id: str, authoritative_cloud: bool = False
     ) -> Optional[IncidentResponseContract]:
-        with self._lock:
-            from app.services.persistence_repository import persistence_repo
-            if authoritative_cloud and (
-                persistence_repo.is_configured or persistence_repo.is_storage_configured
-            ):
-                row = persistence_repo.query_incident_by_id_sync(incident_id)
-                if row:
-                    fetched = IncidentResponseContract.model_validate(row)
-                    self._incidents[incident_id] = fetched
-                    return fetched
-                self._incidents.pop(incident_id, None)
-                return None
+        from app.services.persistence_repository import persistence_repo
 
-            incident = self._incidents.get(incident_id)
-            if incident is not None:
-                return incident
-            if persistence_repo.is_configured or persistence_repo.is_storage_configured:
-                row = persistence_repo.query_incident_by_id_sync(incident_id)
-                if row:
-                    fetched = IncidentResponseContract.model_validate(row)
-                    self._incidents[incident_id] = fetched
-                    return fetched
-            return None
+        cloud_enabled = bool(
+            persistence_repo.is_configured or persistence_repo.is_storage_configured
+        )
+        with self._lock:
+            start_clear_gen = self._incidents_clear_generation
+            start_version = self._incident_versions.get(incident_id, 0)
+            local_incident = self._incidents.get(incident_id)
+            start_present = local_incident is not None
+            start_updated_at = (
+                local_incident.updated_at if local_incident is not None else None
+            )
+            if not authoritative_cloud and local_incident is not None:
+                return local_incident
+
+        if not cloud_enabled:
+            return local_incident if authoritative_cloud else None
+
+        row = persistence_repo.query_incident_by_id_sync(incident_id)
+        fetched = IncidentResponseContract.model_validate(row) if row else None
+
+        with self._lock:
+            return self._reconcile_cloud_incident_locked(
+                incident_id,
+                fetched,
+                authoritative_cloud=authoritative_cloud,
+                start_clear_gen=start_clear_gen,
+                start_version=start_version,
+                start_present=start_present,
+                start_updated_at=start_updated_at,
+            )
+
+    def get_incidents_by_ids(
+        self,
+        incident_ids: Sequence[str],
+        *,
+        authoritative_cloud: bool = False,
+    ) -> dict[str, Optional[IncidentResponseContract]]:
+        """
+        Bounded bulk incident resolution for duplicate queues.
+        Captures local versions under self._lock, performs any required cloud bulk
+        query completely outside self._lock, and reconciles under self._lock without
+        allowing stale cloud rows to overwrite newer local mutations or resurrections.
+        """
+        unique_ids = list(dict.fromkeys(inc_id for inc_id in incident_ids if inc_id))
+        if not unique_ids:
+            return {}
+
+        from app.services.persistence_repository import persistence_repo
+
+        cloud_enabled = bool(
+            persistence_repo.is_configured or persistence_repo.is_storage_configured
+        )
+        with self._lock:
+            start_clear_gen = self._incidents_clear_generation
+            snapshots: dict[
+                str,
+                tuple[int, bool, Optional[datetime], Optional[IncidentResponseContract]],
+            ] = {}
+            for inc_id in unique_ids:
+                local_inc = self._incidents.get(inc_id)
+                snapshots[inc_id] = (
+                    self._incident_versions.get(inc_id, 0),
+                    local_inc is not None,
+                    local_inc.updated_at if local_inc is not None else None,
+                    local_inc,
+                )
+
+            if not cloud_enabled:
+                return {inc_id: snapshots[inc_id][3] for inc_id in unique_ids}
+
+            ids_to_fetch = (
+                unique_ids
+                if authoritative_cloud
+                else [inc_id for inc_id in unique_ids if snapshots[inc_id][3] is None]
+            )
+
+        if not ids_to_fetch:
+            return {inc_id: snapshots[inc_id][3] for inc_id in unique_ids}
+
+        raw_rows_by_id = persistence_repo.query_incidents_by_ids_sync(ids_to_fetch)
+        if not isinstance(raw_rows_by_id, dict):
+            raise RuntimeError("Bulk incident lookup returned invalid response shape.")
+
+        fetched_by_id: dict[str, IncidentResponseContract] = {
+            inc_id: IncidentResponseContract.model_validate(row)
+            for inc_id, row in raw_rows_by_id.items()
+            if row is not None
+        }
+
+        fetch_set = set(ids_to_fetch)
+        with self._lock:
+            resolved: dict[str, Optional[IncidentResponseContract]] = {}
+            for inc_id in unique_ids:
+                start_version, start_present, start_updated_at, local_inc = snapshots[inc_id]
+                if inc_id not in fetch_set:
+                    resolved[inc_id] = local_inc
+                    continue
+                resolved[inc_id] = self._reconcile_cloud_incident_locked(
+                    inc_id,
+                    fetched_by_id.get(inc_id),
+                    authoritative_cloud=authoritative_cloud,
+                    start_clear_gen=start_clear_gen,
+                    start_version=start_version,
+                    start_present=start_present,
+                    start_updated_at=start_updated_at,
+                )
+            return resolved
 
     def get_incident_kpis(self) -> dict[str, Any]:
         """
@@ -1143,6 +2282,7 @@ class StateStore:
                 logger.error(f"Audit append failed for incident {incident_id}. Rolled back in-memory mutation.")
                 raise RuntimeError(f"Failed to record durable audit event for incident '{incident_id}'. Incident mutation was rolled back.")
 
+            self._bump_incident_version_locked(incident_id)
             self._incident_audits.setdefault(incident.id, []).append(audit_entry)
             return incident
 
@@ -1161,18 +2301,18 @@ class StateStore:
     def get_incident_audits(self, incident_id: str) -> list[IncidentAuditContract]:
         """
         Returns chronological audit ledger for an incident.
-        In cloud mode with configured Supabase, fetches authoritative records from Supabase Cloud.
-        Falls back seamlessly to local in-memory/journal records.
+        In cloud mode with configured Supabase, fetches authoritative records from Supabase Cloud
+        outside self._lock. Falls back seamlessly to local in-memory/journal records.
         """
-        with self._lock:
-            from app.services.persistence_repository import persistence_repo
-            if persistence_repo.is_configured:
-                cloud_records = persistence_repo.query_incident_audits_sync(incident_id, strict=True)
-                if cloud_records:
-                    parsed_audits = [IncidentAuditContract(**rec) for rec in cloud_records]
-                    return sorted(parsed_audits, key=lambda a: a.timestamp)
-                return []
+        from app.services.persistence_repository import persistence_repo
+        if persistence_repo.is_configured:
+            cloud_records = persistence_repo.query_incident_audits_sync(incident_id, strict=True)
+            if cloud_records:
+                parsed_audits = [IncidentAuditContract(**rec) for rec in cloud_records]
+                return sorted(parsed_audits, key=lambda a: a.timestamp)
+            return []
 
+        with self._lock:
             audits = self._incident_audits.get(incident_id, [])
             return sorted(audits, key=lambda a: a.timestamp)
 
@@ -1191,15 +2331,23 @@ class StateStore:
     ) -> Optional[IncidentResponseContract]:
         with self._lock:
             incident = self._incidents.get(incident_id)
-            if not incident:
+            if incident is None:
                 from app.services.persistence_repository import persistence_repo
-                if persistence_repo.is_configured:
-                    row = persistence_repo.query_incident_by_id_sync(incident_id)
-                    if row:
-                        incident = IncidentResponseContract.model_validate(row)
-                        self._incidents[incident_id] = incident
-                if not incident:
-                    return None
+                need_cloud_lookup = bool(
+                    persistence_repo.is_configured or persistence_repo.is_storage_configured
+                )
+            else:
+                need_cloud_lookup = False
+
+        if need_cloud_lookup:
+            fetched = self.get_incident(incident_id, authoritative_cloud=False)
+            if not fetched:
+                return None
+
+        with self._lock:
+            incident = self._incidents.get(incident_id)
+            if not incident:
+                return None
 
             added_photos: list[str] = []
             for p in new_photos:
@@ -1245,6 +2393,7 @@ class StateStore:
 
                 self._incident_audits.setdefault(incident_id, []).append(audit_entry)
 
+            self._bump_incident_version_locked(incident_id)
             return incident
 
     def is_photo_registered(self, filename: str) -> bool:
@@ -1272,6 +2421,235 @@ class StateStore:
                 self._sim_active_blockage = None
                 self._sim_latest_prediction = None
                 self._sim_latest_gate_directive = None
+
+    # Duplicate Incident Links Management
+    def record_duplicate_link(self, link: DuplicateLinkContract) -> bool:
+        """
+        Stores a canonical undirected duplicate link in memory if the pair does
+        not already exist (mirrors ON CONFLICT (incident_low_id, incident_high_id) DO NOTHING).
+        Preserves all existing SUSPECTED, CONFIRMED, and DISMISSED records.
+        """
+        with self._lock:
+            for existing in self._duplicate_links.values():
+                if (
+                    existing.incident_low_id == link.incident_low_id
+                    and existing.incident_high_id == link.incident_high_id
+                ):
+                    return False
+            self._duplicate_links[link.link_id] = link
+            return True
+
+    def get_duplicate_links(self, status: Optional[str] = None) -> list[DuplicateLinkContract]:
+        """Returns all duplicate links in memory, optionally filtered by link_status."""
+        with self._lock:
+            links = list(self._duplicate_links.values())
+            if status:
+                clean_status = status.upper().strip()
+                links = [
+                    l for l in links
+                    if l.link_status.value == clean_status or str(l.link_status) == clean_status
+                ]
+            return sorted(
+                links,
+                key=lambda l: (-_normalize_utc_timestamp(l.created_at).timestamp(), l.link_id),
+            )
+
+    def get_incident_duplicate_links(self, incident_id: str) -> list[DuplicateLinkContract]:
+        """Returns all duplicate links involving incident_id (as low or high member)."""
+        with self._lock:
+            links = [
+                l for l in self._duplicate_links.values()
+                if l.incident_low_id == incident_id or l.incident_high_id == incident_id
+            ]
+            return sorted(
+                links,
+                key=lambda l: (-_normalize_utc_timestamp(l.created_at).timestamp(), l.link_id),
+            )
+
+    def review_duplicate_link(
+        self,
+        link_id: str,
+        target_status: str,
+        actor_id: str,
+        actor_role: str,
+        reason: str,
+        primary_incident_id: Optional[str] = None,
+        internal_notes: Optional[str] = None,
+        override: bool = False,
+        expected_version: Optional[int] = None,
+    ) -> DuplicateLinkContract:
+        """
+        Reviews a canonical duplicate link in memory, mirroring Migration 007's
+        review_incident_duplicate_link_rpc validation, optimistic locking, cycle
+        detection, override enforcement, and atomic dual-incident audit appends.
+        """
+        with self._lock:
+            link = self._duplicate_links.get(link_id)
+            if not link:
+                raise LookupError(f"Duplicate link '{link_id}' not found.")
+
+            clean_status = (target_status or "").upper().strip()
+            if clean_status not in ("CONFIRMED", "DISMISSED"):
+                raise ValueError("Review action must be 'CONFIRMED' or 'DISMISSED'.")
+
+            clean_role = (actor_role or "").lower().strip()
+            if clean_role not in ("municipality", "admin", "service_role"):
+                raise PermissionError(
+                    "Unauthorized: duplicate review requires municipality, admin, or service_role credentials."
+                )
+
+            clean_reason = (reason or "").strip()
+            if len(clean_reason) < 3 or len(clean_reason) > 500:
+                raise ValueError("A mandatory review reason between 3 and 500 characters is required.")
+
+            if expected_version is not None and link.review_version != expected_version:
+                raise ValueError(
+                    f"Version conflict on duplicate link {link_id}: expected {expected_version}, found {link.review_version}."
+                )
+
+            is_override = link.link_status != DuplicateLinkStatus.SUSPECTED
+            if is_override and not override:
+                raise ValueError(
+                    f"Duplicate link {link_id} is already {link.link_status.value}; supervisor override is required to modify."
+                )
+
+            if is_override:
+                if clean_status == "DISMISSED" and link.link_status == DuplicateLinkStatus.DISMISSED:
+                    raise ValueError(f"Redundant override: link {link_id} is already DISMISSED.")
+                if (
+                    clean_status == "CONFIRMED"
+                    and link.link_status == DuplicateLinkStatus.CONFIRMED
+                    and link.primary_incident_id == primary_incident_id
+                ):
+                    raise ValueError(
+                        f"Redundant override: link {link_id} is already CONFIRMED with primary {primary_incident_id}."
+                    )
+
+            inc_low = self._incidents.get(link.incident_low_id)
+            inc_high = self._incidents.get(link.incident_high_id)
+            if inc_low is None or inc_high is None:
+                raise LookupError("One or both linked incidents no longer exist.")
+
+            duplicate_id: Optional[str] = None
+            if clean_status == "CONFIRMED":
+                if not primary_incident_id:
+                    raise ValueError("primary_incident_id is required when confirming a duplicate link.")
+                if primary_incident_id == link.incident_low_id:
+                    duplicate_id = link.incident_high_id
+                    primary_inc = inc_low
+                elif primary_incident_id == link.incident_high_id:
+                    duplicate_id = link.incident_low_id
+                    primary_inc = inc_high
+                else:
+                    raise ValueError(
+                        f"Primary incident {primary_incident_id} does not belong to link {link_id}."
+                    )
+
+                if primary_inc.status == IncidentStatus.REJECTED:
+                    raise ValueError(
+                        f"Cannot confirm REJECTED incident {primary_incident_id} as primary incident."
+                    )
+
+                for existing_id, existing_link in self._duplicate_links.items():
+                    if (
+                        existing_id != link_id
+                        and existing_link.duplicate_incident_id == duplicate_id
+                        and existing_link.link_status == DuplicateLinkStatus.CONFIRMED
+                    ):
+                        raise ValueError(
+                            f"Incident {duplicate_id} is already confirmed as a duplicate of another primary incident."
+                        )
+
+                # Unlimited-depth transitive cycle check over CONFIRMED edges
+                curr: Optional[str] = primary_incident_id
+                visited: set[str] = set()
+                while curr:
+                    if curr == duplicate_id:
+                        raise ValueError(
+                            f"Confirming {duplicate_id} as duplicate of {primary_incident_id} would create circular dependency."
+                        )
+                    if curr in visited:
+                        break
+                    visited.add(curr)
+                    next_primary: Optional[str] = None
+                    for eid, l in self._duplicate_links.items():
+                        if (
+                            eid != link_id
+                            and l.duplicate_incident_id == curr
+                            and l.link_status == DuplicateLinkStatus.CONFIRMED
+                        ):
+                            next_primary = l.primary_incident_id
+                            break
+                    curr = next_primary
+
+            link_snapshot = link.model_copy(deep=True)
+            now = datetime.now(timezone.utc)
+            clean_notes = internal_notes.strip() if isinstance(internal_notes, str) and internal_notes.strip() else None
+
+            link.link_status = DuplicateLinkStatus(clean_status)
+            link.primary_incident_id = primary_incident_id if clean_status == "CONFIRMED" else None
+            link.duplicate_incident_id = duplicate_id if clean_status == "CONFIRMED" else None
+            link.review_version = link.review_version + 1
+            link.reviewed_at = now
+            link.reviewed_by = actor_id.strip()[:128]
+            link.reviewed_role = clean_role
+            link.review_reason = clean_reason
+            link.internal_notes = clean_notes
+            link.updated_at = now
+
+            if is_override:
+                audit_action = (
+                    "DUPLICATE_OVERRIDE_CONFIRMED"
+                    if clean_status == "CONFIRMED"
+                    else "DUPLICATE_OVERRIDE_DISMISSED"
+                )
+            else:
+                audit_action = (
+                    "DUPLICATE_CONFIRMED"
+                    if clean_status == "CONFIRMED"
+                    else "DUPLICATE_DISMISSED"
+                )
+
+            structured_reason = (
+                f"link={link_id};status={clean_status}"
+                + (f";primary={primary_incident_id};duplicate={duplicate_id}" if clean_status == "CONFIRMED" else "")
+                + f";reason={clean_reason}"
+            )
+
+            audit_low = IncidentAuditContract(
+                incident_id=link.incident_low_id,
+                actor_id=link.reviewed_by,
+                actor_role=clean_role,
+                action=audit_action,
+                previous_status=None,
+                new_status=None,
+                reason=structured_reason,
+                internal_notes=clean_notes,
+                timestamp=now,
+            )
+            audit_high = IncidentAuditContract(
+                incident_id=link.incident_high_id,
+                actor_id=link.reviewed_by,
+                actor_role=clean_role,
+                action=audit_action,
+                previous_status=None,
+                new_status=None,
+                reason=structured_reason,
+                internal_notes=clean_notes,
+                timestamp=now,
+            )
+
+            ok_low = self._audit_durability.append_audit(audit_low)
+            ok_high = self._audit_durability.append_audit(audit_high) if ok_low else False
+            if not (ok_low and ok_high):
+                self._duplicate_links[link_id] = link_snapshot
+                raise RuntimeError(
+                    f"Failed to persist durable audit events for duplicate link '{link_id}'. Mutation rolled back."
+                )
+
+            self._incident_audits.setdefault(link.incident_low_id, []).append(audit_low)
+            self._incident_audits.setdefault(link.incident_high_id, []).append(audit_high)
+            return link
 
 # Global singleton store instance
 state_store = StateStore()

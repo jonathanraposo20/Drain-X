@@ -139,11 +139,11 @@ async def test_persistence_handles_uninstalled_sensor():
 @pytest.mark.anyio
 async def test_persistence_network_failure_is_soft_and_safe():
     """Verify that when a network failure occurs against Supabase URL, application does not crash."""
-    # Point to an unreachable mock endpoint with aggressive 0.1s timeout
+    # Point to an unreachable mock endpoint with minimal valid 0.5s timeout
     failing_repo = PersistenceRepository(
         supabase_url="http://192.0.2.1:9999", # TEST-NET non-routable address
         supabase_key="mock_invalid_key",
-        timeout_sec=0.1
+        timeout_sec=0.5
     )
     assert failing_repo.is_configured is True
 

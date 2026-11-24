@@ -218,7 +218,7 @@ def test_sit_suite_b_persistence_degradation_and_timeout(client: TestClient):
     simulated_repo = PersistenceRepository(
         supabase_url="https://mock.supabase.co",
         supabase_key="mock_service_role_key",
-        timeout_sec=0.1,
+        timeout_sec=0.5,
     )
     with patch("httpx.AsyncClient.post", side_effect=httpx.ConnectTimeout("Cloud unreachable")):
         # Persist should not throw exception; it fails soft and records error

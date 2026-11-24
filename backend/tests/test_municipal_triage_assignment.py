@@ -876,7 +876,8 @@ def test_atomic_cloud_citizen_creation_rpc(auth_client: TestClient):
     def mock_citizen_rpc(**kwargs):
         return {"id": kwargs["incident_id"]}
 
-    with patch.object(persistence_repo, "_is_configured", True), \
+    with patch("app.api.v1.incidents.check_rate_limit"), \
+         patch.object(persistence_repo, "_is_configured", True), \
          patch.object(
              persistence_repo,
              "execute_citizen_incident_creation_sync",

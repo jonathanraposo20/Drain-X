@@ -1,13 +1,14 @@
+import asyncio
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 import logging
 from typing import Optional, Dict, Any, Tuple
 from pydantic import BaseModel
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Header, Request, Response, Depends, status
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Header, Request, Response, Depends, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 from app.services.persistence_repository import (
@@ -15,18 +16,22 @@ from app.services.persistence_repository import (
     StorageError,
     StorageNotConfiguredError,
     StorageConflictError,
+    StorageLeaseLostError,
     StorageValidationError,
+    StorageNotFoundError,
     CANONICAL_V3_FILENAME_PATTERN,
     PHOTO_FILENAME_PATTERN,
     IDEMPOTENCY_KEY_PATTERN,
+    ALLOWED_DUPLICATE_LINK_STATUSES,
     _validate_incident_id,
 )
 
 logger = logging.getLogger("drainx.incidents")
 
 from app.core.config import settings
-from app.core.security import get_current_user_claims, get_optional_user_claims, require_roles
+from app.core.security import get_current_user_claims, get_optional_user_claims, require_roles, verify_supabase_jwt
 from app.services.rate_limiter import check_rate_limit, check_rate_limit_async, RateLimitAction
+from app.services.incident_stream_manager import incident_stream_manager
 from app.models.contracts import (
     IncidentCreateContract,
     IncidentUpdateContract,
@@ -45,6 +50,16 @@ from app.models.contracts import (
     IncidentSeverity,
     IncidentSource,
     AssignmentType,
+    DuplicateLinkContract,
+    MunicipalDuplicateIncidentSummaryContract,
+    MunicipalDuplicateLinkContract,
+    DuplicateLinkDetailContract,
+    DuplicateQueueResponseContract,
+    DuplicateConfirmRequest,
+    DuplicateDismissRequest,
+    DuplicateScanResponseContract,
+    DuplicateLinkStatus,
+    IncidentStreamEventType,
 )
 from app.services.state_store import state_store, validate_and_normalize_field_team
 from app.services.media_sanitizer import sanitize_and_clean_image, ImageProcessingError
@@ -64,6 +79,9 @@ ALLOWED_MIME_TYPES = {
 
 _EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
 _PHONE_REGEX = re.compile(r"(\+?\d[\d -]{7,}\d)")
+_UUID_REGEX = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def _sanitize_contact_info(text: Optional[str]) -> Optional[str]:
@@ -90,12 +108,17 @@ def _filter_incident_for_role(
         * municipal_notes: Sanitized to remove any accidental personal contact info.
     Returns a safe non-destructive copy, preserving state_store data integrity.
     """
+    user_role = claims.get("extracted_role", "citizen") if claims else "citizen"
+    user_sub = claims.get("sub") if claims else None
     if claims:
         if claims.get("is_dev_bypass") and settings.ENVIRONMENT != "production":
             return incident
-        user_role = claims.get("extracted_role", "citizen")
         if user_role in ["municipality", "admin", "service_role"]:
             return incident
+
+    worker_id_val = None
+    if user_role == "worker" and user_sub and incident.assigned_worker_id and user_sub.strip() == incident.assigned_worker_id.strip():
+        worker_id_val = incident.assigned_worker_id
 
     return incident.model_copy(
         update={
@@ -106,8 +129,137 @@ def _filter_incident_for_role(
             "municipal_notes": _sanitize_contact_info(incident.municipal_notes),
             "description": _sanitize_contact_info(incident.description),
             "rejection_reason": _sanitize_contact_info(incident.rejection_reason),
+            "assigned_worker_id": worker_id_val,
         }
     )
+
+
+@router.websocket("/stream")
+@router.websocket("/ws")
+async def incident_websocket_stream(
+    websocket: WebSocket,
+    token: Optional[str] = Query(default=None, description="Supabase JWT bearer token"),
+    last_seq_id: Optional[int] = Query(default=None, description="Optional last acknowledged event sequence number for replay"),
+    last_instance_id: Optional[str] = Query(default=None, description="Optional process instance identifier for replay validation"),
+):
+    """
+    Dedicated Backend-Authoritative Incident Real-Time Stream.
+    Phase 3 Milestone 2B:
+    - Cryptographic Supabase JWT verification on handshake.
+    - Role-based authorization & projection (citizen, worker, municipality).
+    - Monotonic process-local sequencing with bounded replay buffer.
+    - Resync signaling on instance restart or buffer eviction.
+    - Bounded per-client queues with slow-consumer backpressure disconnect.
+    """
+    auth_token = token
+    if not auth_token:
+        auth_header = websocket.headers.get("authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            auth_token = auth_header[7:].strip()
+
+    if not auth_token:
+        logger.warning("Incident stream connection rejected: missing authentication token.")
+        await websocket.close(code=1008, reason="Unauthorized: missing token")
+        return
+
+    try:
+        claims = verify_supabase_jwt(auth_token)
+    except HTTPException as exc:
+        logger.warning(f"Incident stream connection rejected: invalid JWT ({exc.detail})")
+        await websocket.close(code=1008, reason=f"Unauthorized: {exc.detail}")
+        return
+    except Exception as exc:
+        logger.warning(f"Incident stream connection rejected: verification error ({exc})")
+        await websocket.close(code=1008, reason="Unauthorized: token verification failed")
+        return
+
+    user_role = claims.get("extracted_role", "citizen")
+    if user_role not in ("citizen", "worker", "municipality", "admin", "service_role"):
+        logger.warning(f"Incident stream rejected unrecognized role '{user_role}'")
+        await websocket.close(code=1008, reason="Unauthorized: unrecognized role")
+        return
+
+    await websocket.accept()
+
+    try:
+        sub = await incident_stream_manager.register_client(websocket, claims)
+    except RuntimeError as exc:
+        await websocket.close(code=1013, reason=str(exc))
+        return
+
+    try:
+        await incident_stream_manager.handle_handshake_and_replay(
+            sub,
+            last_seq_id=last_seq_id,
+            last_instance_id=last_instance_id,
+        )
+    except Exception as exc:
+        logger.warning(f"Handshake failed for incident stream client {sub.client_id}: {exc}")
+        await incident_stream_manager.unregister_client(sub.client_id)
+        return
+
+    async def sender_worker():
+        try:
+            while not sub.is_closed:
+                payload = await sub.queue.get()
+                if payload is None or sub.is_closed:
+                    break
+                await websocket.send_json(payload)
+                sub.queue.task_done()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Incident sender worker ended for client {sub.client_id}: {e}")
+
+    sender_task = asyncio.create_task(sender_worker())
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if not isinstance(data, dict):
+                await websocket.send_json({
+                    "event_type": "ERROR",
+                    "message": "Malformed message frame: JSON object required.",
+                })
+                continue
+
+            action = data.get("action", "").lower()
+            if action == "ping":
+                await websocket.send_json({
+                    "event_type": "PONG",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "client_id": sub.client_id,
+                })
+            elif action == "replay":
+                req_seq = data.get("last_seq_id")
+                req_inst = data.get("last_instance_id")
+                await incident_stream_manager.handle_handshake_and_replay(
+                    sub,
+                    last_seq_id=req_seq,
+                    last_instance_id=req_inst,
+                )
+            elif action in ("command", "gate", "actuate", "override"):
+                await websocket.send_json({
+                    "event_type": "ERROR",
+                    "message": "Incident stream is strictly read-only monitoring.",
+                })
+            else:
+                await websocket.send_json({
+                    "event_type": "ERROR",
+                    "message": f"Unrecognized action '{action}'. Supported: 'ping', 'replay'.",
+                })
+    except WebSocketDisconnect:
+        logger.debug(f"Incident stream client {sub.client_id} disconnected normally.")
+    except Exception as exc:
+        logger.debug(f"Incident stream client {sub.client_id} error: {exc}")
+    finally:
+        sub.is_closed = True
+        sender_task.cancel()
+        try:
+            await sender_task
+        except asyncio.CancelledError:
+            pass
+        await incident_stream_manager.unregister_client(sub.client_id)
 
 
 @router.get("", response_model=list[IncidentResponseContract])
@@ -240,7 +392,25 @@ def create_incident(
         reporter_name=payload.reporter_name or "Citizen Anonymous",
         photos=payload.photos,
     )
-    return state_store.create_incident(incident)
+    created = state_store.create_incident(incident)
+    try:
+        from app.services.duplicate_detector import scan_incident_for_duplicates
+        scan_incident_for_duplicates(created.id, persistence_repo, state_store, settings)
+    except Exception as scan_err:
+        logger.warning("Post-incident-creation duplicate scan failed non-fatally: %s", scan_err)
+
+    try:
+        incident_stream_manager.broadcast_incident_event(
+            event_type=IncidentStreamEventType.INCIDENT_REPORTED,
+            incident_id=created.id,
+            action="CREATE",
+            new_status=str(created.status),
+            incident=created,
+        )
+    except Exception as stream_err:
+        logger.warning("Failed to broadcast INCIDENT_REPORTED event non-fatally: %s", stream_err)
+
+    return created
 
 
 @router.get("/field-teams", response_model=list[FieldTeamContract])
@@ -252,6 +422,509 @@ def get_field_teams(
     Open for municipal dispatchers, administrators, and field response crews.
     """
     return state_store.get_field_teams()
+
+
+def _resolve_duplicate_cloud_mode() -> bool:
+    """
+    Returns True if full service-role cloud duplicate persistence is configured.
+    Fails closed (HTTP 503) if partial cloud configuration is active without service-role key.
+    Returns False only in unconfigured local dev / mock test mode.
+    """
+    is_mock = getattr(persistence_repo, "is_mock", False)
+    if persistence_repo.is_storage_configured and not is_mock:
+        return True
+    if persistence_repo.is_configured and not is_mock:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Duplicate detection cloud persistence requires SUPABASE_SERVICE_ROLE_KEY.",
+        )
+    return False
+
+
+def _raise_duplicate_http_error(exc: Exception) -> None:
+    if isinstance(exc, HTTPException):
+        raise exc
+
+    sqlstate = getattr(exc, "sqlstate", None)
+    error_category = getattr(exc, "error_category", None)
+    exc_type = exc.__class__.__name__
+
+    if isinstance(exc, StorageNotFoundError) or type(exc) is LookupError:
+        logger.warning(
+            "Duplicate endpoint not found: error_type=%s sqlstate=%s category=%s",
+            exc_type,
+            sqlstate or "NONE",
+            error_category or "NOT_FOUND",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Requested duplicate link or incident was not found.",
+        )
+
+    if isinstance(exc, StorageLeaseLostError):
+        logger.warning(
+            "Duplicate endpoint lease lost: error_type=%s sqlstate=%s category=%s",
+            exc_type,
+            sqlstate or "P0412",
+            error_category or "LEASE_LOST",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate scan lease is expired or no longer owned.",
+        )
+
+    if isinstance(exc, StorageConflictError):
+        logger.warning(
+            "Duplicate endpoint conflict: error_type=%s sqlstate=%s category=%s",
+            exc_type,
+            sqlstate or "NONE",
+            error_category or "CONFLICT",
+        )
+        if sqlstate == "23505":
+            detail_msg = "Operation conflicts with an existing confirmed duplicate relationship."
+        elif sqlstate == "55P03":
+            detail_msg = "Duplicate record is temporarily locked; please retry."
+        else:
+            detail_msg = "Duplicate operation conflicts with current link state, version, or constraints."
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail_msg)
+
+    if isinstance(exc, PermissionError):
+        logger.warning("Duplicate endpoint forbidden: error_type=%s", exc_type)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient privileges for this duplicate management operation.",
+        )
+
+    if isinstance(exc, StorageValidationError):
+        logger.warning(
+            "Duplicate endpoint validation failure: error_type=%s sqlstate=%s category=%s",
+            exc_type,
+            sqlstate or "NONE",
+            error_category or "VALIDATION_ERROR",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid request parameters for duplicate management operation.",
+        )
+
+    if isinstance(exc, ValueError):
+        lower = str(exc).lower()
+        logger.warning("Duplicate endpoint value error classified internally (error_type=%s)", exc_type)
+        if "redundant override" in lower:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Redundant override: link is already in the requested state.",
+            )
+        if "version conflict" in lower:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Version conflict: duplicate link was modified by another reviewer.",
+            )
+        if "circular dependency" in lower:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Confirmation rejected because it would create a circular duplicate chain.",
+            )
+        if "rejected" in lower:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot confirm a rejected incident as the primary incident.",
+            )
+        if "already confirmed as a duplicate" in lower:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Incident is already confirmed as a duplicate of another primary incident.",
+            )
+        if "override" in lower or "already" in lower:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Duplicate link has already been reviewed; explicit override is required.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid duplicate management request.",
+        )
+
+    if isinstance(exc, (StorageNotConfiguredError, StorageError, RuntimeError)):
+        logger.error(
+            "Duplicate endpoint cloud service failure: error_type=%s sqlstate=%s category=%s",
+            exc_type,
+            sqlstate or "NONE",
+            error_category or "SERVICE_UNAVAILABLE",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Duplicate detection cloud service is temporarily unavailable.",
+        )
+
+    logger.error(
+        "Duplicate endpoint unexpected internal failure: error_type=%s",
+        exc_type,
+        exc_info=True,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="An unexpected internal error occurred while processing the duplicate request.",
+    )
+
+
+def _sanitize_actor_identifier(actor_id: Optional[str]) -> Optional[str]:
+    """Scrubs email/phone values from actor IDs while preserving valid UUIDs."""
+    if not actor_id:
+        return actor_id
+    if _UUID_REGEX.match(actor_id.strip()):
+        return actor_id
+    return _sanitize_contact_info(actor_id)
+
+
+def _build_duplicate_incident_summary(
+    incident: Optional[IncidentResponseContract],
+) -> Optional[MunicipalDuplicateIncidentSummaryContract]:
+    """Projects an incident onto the strictly allowlisted municipal duplicate summary model."""
+    if incident is None:
+        return None
+    return MunicipalDuplicateIncidentSummaryContract(
+        id=incident.id,
+        category=incident.category,
+        description=_sanitize_contact_info(incident.description) or "",
+        latitude=incident.latitude,
+        longitude=incident.longitude,
+        severity=incident.severity,
+        status=incident.status,
+        source=incident.source,
+        origin_operational_mode=incident.origin_operational_mode,
+        assigned_to=_sanitize_contact_info(incident.assigned_to),
+        assignment_type=incident.assignment_type,
+        assigned_team_id=incident.assigned_team_id,
+        municipal_notes=_sanitize_contact_info(incident.municipal_notes),
+        photo_count=len(incident.photos) if incident.photos else 0,
+        created_at=incident.created_at,
+        updated_at=incident.updated_at,
+    )
+
+
+def _build_municipal_duplicate_link(
+    link: DuplicateLinkContract,
+) -> MunicipalDuplicateLinkContract:
+    """Projects an internal duplicate link onto the allowlisted municipal response model."""
+    return MunicipalDuplicateLinkContract(
+        link_id=link.link_id,
+        incident_low_id=link.incident_low_id,
+        incident_high_id=link.incident_high_id,
+        link_status=link.link_status,
+        primary_incident_id=link.primary_incident_id,
+        duplicate_incident_id=link.duplicate_incident_id,
+        detection_origin=link.detection_origin,
+        detected_in_mode=link.detected_in_mode,
+        distance_meters=link.distance_meters,
+        time_delta_seconds=link.time_delta_seconds,
+        confidence_score=link.confidence_score,
+        confidence_band=link.confidence_band,
+        match_reasons=[_sanitize_contact_info(reason) or "" for reason in (link.match_reasons or [])],
+        review_version=link.review_version,
+        reviewed_by=_sanitize_actor_identifier(link.reviewed_by),
+        reviewed_role=link.reviewed_role,
+        reviewed_at=link.reviewed_at,
+        review_reason=_sanitize_contact_info(link.review_reason),
+        created_at=link.created_at,
+        updated_at=link.updated_at,
+    )
+
+
+def _build_municipal_duplicate_details_batch(
+    links: list[DuplicateLinkContract],
+    *,
+    is_cloud: bool,
+    preloaded_incidents: Optional[Dict[str, Optional[IncidentResponseContract]]] = None,
+) -> list[DuplicateLinkDetailContract]:
+    """
+    Hydrates a page of duplicate links using a bounded bulk incident lookup
+    and projects every entry through the Stage 2A allowlisted privacy models.
+    """
+    if not links:
+        return []
+
+    incidents_by_id: Dict[str, Optional[IncidentResponseContract]] = (
+        dict(preloaded_incidents) if preloaded_incidents else {}
+    )
+    needed_ids: list[str] = []
+    seen_ids: set[str] = set(incidents_by_id.keys())
+    for link in links:
+        for inc_id in (
+            link.incident_low_id,
+            link.incident_high_id,
+            link.primary_incident_id,
+            link.duplicate_incident_id,
+        ):
+            if inc_id and inc_id not in seen_ids:
+                seen_ids.add(inc_id)
+                needed_ids.append(inc_id)
+
+    if needed_ids:
+        fetched_map = state_store.get_incidents_by_ids(
+            needed_ids,
+            authoritative_cloud=is_cloud,
+        )
+        incidents_by_id.update(fetched_map)
+
+    details: list[DuplicateLinkDetailContract] = []
+    for link in links:
+        low_inc = incidents_by_id.get(link.incident_low_id)
+        high_inc = incidents_by_id.get(link.incident_high_id)
+        pri_inc = incidents_by_id.get(link.primary_incident_id) if link.primary_incident_id else None
+        dup_inc = incidents_by_id.get(link.duplicate_incident_id) if link.duplicate_incident_id else None
+        details.append(
+            DuplicateLinkDetailContract(
+                link=_build_municipal_duplicate_link(link),
+                incident_low=_build_duplicate_incident_summary(low_inc),
+                incident_high=_build_duplicate_incident_summary(high_inc),
+                primary_incident=_build_duplicate_incident_summary(pri_inc),
+                duplicate_incident=_build_duplicate_incident_summary(dup_inc),
+            )
+        )
+    return details
+
+
+def _build_municipal_duplicate_detail(
+    link: DuplicateLinkContract,
+    *,
+    is_cloud: bool,
+) -> DuplicateLinkDetailContract:
+    """Builds a single privacy-filtered duplicate link detail entry for municipal endpoints."""
+    return _build_municipal_duplicate_details_batch([link], is_cloud=is_cloud)[0]
+
+
+@router.get("/municipal/duplicates", response_model=DuplicateQueueResponseContract)
+def get_duplicate_queue(
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter links by status: SUSPECTED, CONFIRMED, DISMISSED"),
+    limit: int = Query(50, ge=1, le=100, description="Page limit"),
+    offset: int = Query(0, ge=0, description="Page offset"),
+    claims: Dict[str, Any] = Depends(require_roles(["municipality", "admin", "service_role"])),
+) -> DuplicateQueueResponseContract:
+    """
+    Authoritative municipal duplicate incident review queue.
+    Returns allowlisted candidate links with privacy-filtered incident summaries
+    hydrated in a bounded bulk lookup per page.
+    Count semantics:
+    - `total` reflects the exact matching population (filtered by `status` when supplied).
+    - `suspected_count`, `confirmed_count`, `dismissed_count` reflect queue-wide counts per status.
+    - In cloud mode, each count uses PostgreSQL `Prefer: count=exact` at query time (no 1,000-row
+      truncation), rather than a single cross-HTTP snapshot; in local mode, all counts come from
+      one atomic in-memory snapshot.
+    Restricted to municipal operators, administrators, and service role.
+    """
+    is_cloud = _resolve_duplicate_cloud_mode()
+
+    try:
+        clean_status_filter: Optional[str] = None
+        if status_filter is not None:
+            clean_status_filter = status_filter.strip().upper()
+            if clean_status_filter not in ALLOWED_DUPLICATE_LINK_STATUSES:
+                raise StorageValidationError(
+                    "status filter must be 'SUSPECTED', 'CONFIRMED', or 'DISMISSED'."
+                )
+
+        if is_cloud:
+            raw_links, total = persistence_repo.query_duplicate_links_sync(
+                link_status=clean_status_filter, limit=limit, offset=offset
+            )
+            known_counts = (
+                {clean_status_filter: total}
+                if clean_status_filter is not None
+                else None
+            )
+            status_counts = persistence_repo.query_duplicate_link_counts_sync(
+                known_status_counts=known_counts
+            )
+            link_contracts = [DuplicateLinkContract.model_validate(l) for l in raw_links]
+            detail_items = _build_municipal_duplicate_details_batch(
+                link_contracts,
+                is_cloud=True,
+            )
+            return DuplicateQueueResponseContract(
+                items=detail_items,
+                total=total,
+                suspected_count=status_counts["SUSPECTED"],
+                confirmed_count=status_counts["CONFIRMED"],
+                dismissed_count=status_counts["DISMISSED"],
+            )
+
+        all_links = state_store.get_duplicate_links()
+        suspected_count = sum(1 for l in all_links if l.link_status == DuplicateLinkStatus.SUSPECTED)
+        confirmed_count = sum(1 for l in all_links if l.link_status == DuplicateLinkStatus.CONFIRMED)
+        dismissed_count = sum(1 for l in all_links if l.link_status == DuplicateLinkStatus.DISMISSED)
+
+        filtered = (
+            [l for l in all_links if l.link_status.value == clean_status_filter]
+            if clean_status_filter is not None
+            else all_links
+        )
+        total = len(filtered)
+        slice_links = filtered[offset : offset + limit]
+
+        detail_items = _build_municipal_duplicate_details_batch(
+            slice_links,
+            is_cloud=False,
+        )
+        return DuplicateQueueResponseContract(
+            items=detail_items,
+            total=total,
+            suspected_count=suspected_count,
+            confirmed_count=confirmed_count,
+            dismissed_count=dismissed_count,
+        )
+    except Exception as exc:
+        _raise_duplicate_http_error(exc)
+
+
+def _execute_duplicate_link_review(
+    link_id: str,
+    target_status: str,
+    claims: Dict[str, Any],
+    reason: str,
+    primary_incident_id: Optional[str],
+    internal_notes: Optional[str],
+    override: bool,
+    expected_version: Optional[int],
+) -> MunicipalDuplicateLinkContract:
+    """Shared cloud/local execution path for duplicate link confirmation and dismissal."""
+    user_role = claims.get("extracted_role", "municipality")
+    actor_id = claims.get("sub", "municipal-supervisor")
+    is_cloud = _resolve_duplicate_cloud_mode()
+
+    try:
+        if is_cloud:
+            res = persistence_repo.review_incident_duplicate_link_sync(
+                link_id=link_id,
+                target_status=target_status,
+                actor_id=actor_id,
+                actor_role=user_role,
+                reason=reason,
+                audit_id_low=f"aud_{uuid.uuid4().hex[:24]}",
+                audit_id_high=f"aud_{uuid.uuid4().hex[:24]}",
+                primary_incident_id=primary_incident_id,
+                internal_notes=internal_notes,
+                override=override,
+                expected_version=expected_version,
+            )
+            reviewed_link = _build_municipal_duplicate_link(DuplicateLinkContract.model_validate(res))
+        else:
+            reviewed_link = _build_municipal_duplicate_link(
+                state_store.review_duplicate_link(
+                    link_id=link_id,
+                    target_status=target_status,
+                    actor_id=actor_id,
+                    actor_role=user_role,
+                    reason=reason,
+                    primary_incident_id=primary_incident_id,
+                    internal_notes=internal_notes,
+                    override=override,
+                    expected_version=expected_version,
+                )
+            )
+
+        try:
+            incident_stream_manager.broadcast_incident_event(
+                event_type=IncidentStreamEventType.DUPLICATE_REVIEWED,
+                incident_id=reviewed_link.primary_incident_id or reviewed_link.secondary_incident_id,
+                action=f"DUPLICATE_{target_status}",
+                duplicate_link=reviewed_link,
+                reason=reason,
+            )
+        except Exception as stream_err:
+            logger.warning("Failed to broadcast DUPLICATE_REVIEWED event non-fatally: %s", stream_err)
+
+        return reviewed_link
+    except Exception as exc:
+        _raise_duplicate_http_error(exc)
+
+
+@router.post("/municipal/duplicates/{link_id}/confirm", response_model=MunicipalDuplicateLinkContract)
+def confirm_duplicate_link(
+    link_id: str,
+    payload: DuplicateConfirmRequest,
+    claims: Dict[str, Any] = Depends(require_roles(["municipality", "admin", "service_role"])),
+) -> MunicipalDuplicateLinkContract:
+    """
+    Confirms a canonical duplicate incident link against a designated primary_incident_id.
+    Validates expected_version, cycle prevention, supervisor override rules, and
+    appends dual immutable audit records without mutating incident statuses or photos.
+    """
+    return _execute_duplicate_link_review(
+        link_id=link_id,
+        target_status="CONFIRMED",
+        claims=claims,
+        reason=payload.reason,
+        primary_incident_id=payload.primary_incident_id,
+        internal_notes=payload.internal_notes,
+        override=payload.override,
+        expected_version=payload.expected_version,
+    )
+
+
+@router.post("/municipal/duplicates/{link_id}/dismiss", response_model=MunicipalDuplicateLinkContract)
+def dismiss_duplicate_link(
+    link_id: str,
+    payload: DuplicateDismissRequest,
+    claims: Dict[str, Any] = Depends(require_roles(["municipality", "admin", "service_role"])),
+) -> MunicipalDuplicateLinkContract:
+    """
+    Dismisses a canonical duplicate incident link.
+    Validates expected_version, supervisor override rules if reversing prior decision,
+    and appends dual immutable audit records.
+    """
+    return _execute_duplicate_link_review(
+        link_id=link_id,
+        target_status="DISMISSED",
+        claims=claims,
+        reason=payload.reason,
+        primary_incident_id=None,
+        internal_notes=payload.internal_notes,
+        override=payload.override,
+        expected_version=payload.expected_version,
+    )
+
+
+@router.post("/maintenance/recover-duplicate-scans")
+def recover_duplicate_scans(
+    claims: Dict[str, Any] = Depends(require_roles(["admin", "service_role"])),
+) -> Dict[str, Any]:
+    """
+    Administrative maintenance endpoint to recover stalled duplicate scan jobs.
+    Claims pending/expired jobs once from the durable outbox and passes each
+    claimed job and its exact lease owner directly to the executor (no double-claim).
+    Cloud-only endpoint; returns HTTP 503 if Supabase Cloud storage persistence is unconfigured.
+    """
+    is_cloud = _resolve_duplicate_cloud_mode()
+    if not is_cloud:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Duplicate scan recovery requires configured Supabase Cloud persistence.",
+        )
+
+    if not settings.DUPLICATE_DETECTION_ENABLED:
+        return {
+            "status": "DISABLED",
+            "lease_owner": None,
+            "claimed_jobs": 0,
+            "completed_count": 0,
+            "retry_scheduled_count": 0,
+            "failed_permanent_count": 0,
+            "lease_lost_count": 0,
+        }
+
+    try:
+        from app.services.duplicate_detector import recover_pending_cloud_duplicate_scans
+        return recover_pending_cloud_duplicate_scans(
+            repo=persistence_repo,
+            state_store=state_store,
+            current_settings=settings,
+            batch_size=20,
+            lease_sec=120,
+        )
+    except Exception as exc:
+        _raise_duplicate_http_error(exc)
 
 
 @router.get("/{incident_id}", response_model=IncidentResponseContract)
@@ -370,6 +1043,19 @@ def verify_incident(
         )
         if not updated:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
+
+        try:
+            incident_stream_manager.broadcast_incident_event(
+                event_type=IncidentStreamEventType.INCIDENT_TRIAGED,
+                incident_id=updated.id,
+                action="VERIFY",
+                previous_status=str(existing.status),
+                new_status=str(updated.status),
+                incident=updated,
+            )
+        except Exception as stream_err:
+            logger.warning("Failed to broadcast INCIDENT_TRIAGED event non-fatally: %s", stream_err)
+
         return _filter_incident_for_role(updated, claims)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -434,6 +1120,22 @@ def assign_incident(
         )
         if not updated:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
+
+        try:
+            incident_stream_manager.broadcast_incident_event(
+                event_type=IncidentStreamEventType.INCIDENT_ASSIGNED,
+                incident_id=updated.id,
+                action="ASSIGN",
+                previous_status=str(existing.status),
+                new_status=str(updated.status),
+                team_id=updated.assigned_team_id,
+                worker_id=updated.assigned_worker_id,
+                incident=updated,
+                reason=payload.reason or f"Dispatched to {team.name}",
+            )
+        except Exception as stream_err:
+            logger.warning("Failed to broadcast INCIDENT_ASSIGNED event non-fatally: %s", stream_err)
+
         return _filter_incident_for_role(updated, claims)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -515,6 +1217,27 @@ def reassign_incident(
         )
         if not updated:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
+
+        previous_team_id = existing_team.team_id if existing_team else existing.assigned_team_id
+        previous_worker_id = existing.assigned_worker_id
+
+        try:
+            incident_stream_manager.broadcast_incident_event(
+                event_type=IncidentStreamEventType.INCIDENT_ASSIGNED,
+                incident_id=updated.id,
+                action="REASSIGN",
+                previous_status=str(existing.status),
+                new_status=str(updated.status),
+                team_id=updated.assigned_team_id,
+                worker_id=updated.assigned_worker_id,
+                previous_assigned_team_id=previous_team_id,
+                previous_assigned_worker_id=previous_worker_id,
+                incident=updated,
+                reason=payload.reason,
+            )
+        except Exception as stream_err:
+            logger.warning("Failed to broadcast INCIDENT_ASSIGNED event non-fatally: %s", stream_err)
+
         return _filter_incident_for_role(updated, claims)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -582,6 +1305,28 @@ def unassign_incident(
         )
         if not updated:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
+
+        previous_team = validate_and_normalize_field_team(existing.assigned_to)
+        previous_team_id = previous_team.team_id if previous_team else existing.assigned_team_id
+        previous_worker_id = existing.assigned_worker_id
+
+        try:
+            incident_stream_manager.broadcast_incident_event(
+                event_type=IncidentStreamEventType.INCIDENT_ASSIGNED,
+                incident_id=updated.id,
+                action="UNASSIGN",
+                previous_status=str(existing.status),
+                new_status=str(updated.status),
+                team_id=None,
+                worker_id=None,
+                previous_assigned_team_id=previous_team_id,
+                previous_assigned_worker_id=previous_worker_id,
+                incident=updated,
+                reason=payload.reason,
+            )
+        except Exception as stream_err:
+            logger.warning("Failed to broadcast INCIDENT_ASSIGNED event non-fatally: %s", stream_err)
+
         return _filter_incident_for_role(updated, claims)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -638,6 +1383,20 @@ def reject_incident(
         )
         if not updated:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
+
+        try:
+            incident_stream_manager.broadcast_incident_event(
+                event_type=IncidentStreamEventType.INCIDENT_REJECTED,
+                incident_id=updated.id,
+                action="REJECT",
+                previous_status=str(existing.status),
+                new_status=str(updated.status),
+                incident=updated,
+                reason=payload.reason.strip(),
+            )
+        except Exception as stream_err:
+            logger.warning("Failed to broadcast INCIDENT_REJECTED event non-fatally: %s", stream_err)
+
         return _filter_incident_for_role(updated, claims)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -677,6 +1436,91 @@ def get_incident_audit_trail(
         )
     return audits
 
+
+@router.get("/{incident_id}/duplicates", response_model=list[DuplicateLinkDetailContract])
+def get_incident_duplicates(
+    incident_id: str,
+    claims: Dict[str, Any] = Depends(require_roles(["municipality", "admin", "service_role"])),
+) -> list[DuplicateLinkDetailContract]:
+    """
+    Retrieve all allowlisted duplicate candidate links with privacy-filtered incident summaries
+    for a specific incident under the same privacy policy as the municipal duplicate queue.
+    Restricted to municipal operators, administrators, and service role.
+    """
+    is_cloud = _resolve_duplicate_cloud_mode()
+    try:
+        existing = state_store.get_incident(incident_id, authoritative_cloud=is_cloud)
+    except Exception as exc:
+        _raise_duplicate_http_error(exc)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident with ID '{incident_id}' not found",
+        )
+
+    try:
+        if is_cloud:
+            raw_links = persistence_repo.query_duplicate_links_for_incident_sync(incident_id)
+            link_contracts = [DuplicateLinkContract.model_validate(l) for l in raw_links]
+            return _build_municipal_duplicate_details_batch(
+                link_contracts,
+                is_cloud=True,
+                preloaded_incidents={incident_id: existing},
+            )
+        links = state_store.get_incident_duplicate_links(incident_id)
+        return _build_municipal_duplicate_details_batch(
+            links,
+            is_cloud=False,
+            preloaded_incidents={incident_id: existing},
+        )
+    except Exception as exc:
+        _raise_duplicate_http_error(exc)
+
+
+@router.post("/{incident_id}/duplicates/scan", response_model=DuplicateScanResponseContract)
+def trigger_incident_duplicate_scan(
+    incident_id: str,
+    claims: Dict[str, Any] = Depends(require_roles(["municipality", "admin", "service_role"])),
+) -> DuplicateScanResponseContract:
+    """
+    Triggers an immediate on-demand duplicate detection scan for an incident.
+    In cloud mode, resets any completed/failed outbox job (rejecting active leases)
+    and executes a fresh single-claim scan.
+    """
+    is_cloud = _resolve_duplicate_cloud_mode()
+    user_role = claims.get("extracted_role", "municipality")
+    actor_id = claims.get("sub", "municipal-supervisor")
+
+    try:
+        existing = state_store.get_incident(incident_id, authoritative_cloud=is_cloud)
+    except Exception as exc:
+        _raise_duplicate_http_error(exc)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident with ID '{incident_id}' not found",
+        )
+
+    try:
+        if not settings.DUPLICATE_DETECTION_ENABLED:
+            return DuplicateScanResponseContract(
+                incident_id=incident_id,
+                status="DISABLED",
+                candidates_found=0,
+                links_created=0,
+                total_links=0,
+            )
+        if is_cloud:
+            persistence_repo.reset_duplicate_scan_job_sync(
+                incident_id=incident_id,
+                actor_id=actor_id,
+                actor_role=user_role,
+                reason="Manual municipal duplicate rescan",
+            )
+        from app.services.duplicate_detector import scan_incident_for_duplicates
+        return scan_incident_for_duplicates(incident_id, persistence_repo, state_store, settings)
+    except Exception as exc:
+        _raise_duplicate_http_error(exc)
 
 
 @router.patch("/{incident_id}", response_model=IncidentResponseContract)
@@ -790,6 +1634,25 @@ def update_incident(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Incident with ID '{incident_id}' not found",
             )
+
+        try:
+            event_type = (
+                IncidentStreamEventType.INCIDENT_RESOLVED
+                if updated.status == IncidentStatus.RESOLVED
+                else IncidentStreamEventType.INCIDENT_IN_PROGRESS
+            )
+            incident_stream_manager.broadcast_incident_event(
+                event_type=event_type,
+                incident_id=updated.id,
+                action="UPDATE",
+                previous_status=str(existing.status),
+                new_status=str(updated.status),
+                team_id=updated.assigned_team_id,
+                worker_id=updated.assigned_worker_id,
+                incident=updated,
+            )
+        except Exception as stream_err:
+            logger.warning("Failed to broadcast update event non-fatally: %s", stream_err)
 
         return _filter_incident_for_role(updated, claims)
 
@@ -1026,6 +1889,20 @@ async def upload_incident_photos(
             updated_contract = IncidentResponseContract.model_validate(updated_dict)
             with state_store._lock:
                 state_store._incidents[incident_id] = updated_contract
+
+            try:
+                incident_stream_manager.broadcast_incident_event(
+                    event_type=IncidentStreamEventType.INCIDENT_PHOTOS_ATTACHED,
+                    incident_id=updated_contract.id,
+                    action="ATTACH_PHOTOS",
+                    new_status=str(updated_contract.status),
+                    team_id=updated_contract.assigned_team_id,
+                    worker_id=updated_contract.assigned_worker_id,
+                    incident=updated_contract,
+                )
+            except Exception as stream_err:
+                logger.warning("Failed to broadcast INCIDENT_PHOTOS_ATTACHED event non-fatally: %s", stream_err)
+
             return updated_contract
         except StorageValidationError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -1083,6 +1960,20 @@ async def upload_incident_photos(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident with ID '{incident_id}' not found",
         )
+
+    try:
+        incident_stream_manager.broadcast_incident_event(
+            event_type=IncidentStreamEventType.INCIDENT_PHOTOS_ATTACHED,
+            incident_id=updated.id,
+            action="ATTACH_PHOTOS",
+            new_status=str(updated.status),
+            team_id=updated.assigned_team_id,
+            worker_id=updated.assigned_worker_id,
+            incident=updated,
+        )
+    except Exception as stream_err:
+        logger.warning("Failed to broadcast INCIDENT_PHOTOS_ATTACHED event non-fatally: %s", stream_err)
+
     return updated
 
 

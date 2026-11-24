@@ -63,29 +63,17 @@ def reset_state_store(monkeypatch, tmp_path):
     from app.services.rate_limiter import in_memory_rate_limiter
 
     def _reset_persistence_repo():
-        persistence_repo._in_memory_records.clear()
-        persistence_repo._mode_history_records.clear()
-        persistence_repo._in_memory_devices = {
-            "DRAINX-ESP32-NODE-01": {
-                "device_id": "DRAINX-ESP32-NODE-01",
-                "name": "Primary Flume ESP32 Node",
-                "hardware_model": "ESP32 DevKit V1 (ESP-WROOM-32)",
-                "firmware_version": "0.3.7-p0.3g",
-                "is_active": True,
-                "validation_stage": "CONNECTIVITY_READY",
-                "last_seen_at": datetime.now(timezone.utc).isoformat(),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "metadata": {"location": "Flume Primary Sump"},
-            }
-        }
-        persistence_repo._total_persisted_count = 0
-        persistence_repo._failed_persistence_count = 0
-        persistence_repo._last_persistence_error = None
-        persistence_repo._connection_status = "UNCONFIGURED"
-        persistence_repo._last_ping_ms = None
+        persistence_repo.reset_in_memory_state()
 
-    # Prevent tests from contacting Supabase unless they explicitly enable and mock cloud persistence.
+    # Explicitly isolate persistence_repo for offline unit/API tests so local .env
+    # cloud settings cannot cause partial/invalid cloud-mode drift across test suites.
+    monkeypatch.setattr(persistence_repo, "_supabase_url", "")
+    monkeypatch.setattr(persistence_repo, "_supabase_key", "")
+    monkeypatch.setattr(persistence_repo, "_supabase_service_role_key", "")
+    monkeypatch.setattr(persistence_repo, "_active_key", "")
     monkeypatch.setattr(persistence_repo, "_is_configured", False)
+    monkeypatch.setattr(persistence_repo, "_config_conflict_reason", None)
+    monkeypatch.setattr(persistence_repo, "_explicit_in_memory_isolation", True)
     monkeypatch.setattr(settings, "RATE_LIMIT_STORAGE_BACKEND", "memory")
     in_memory_rate_limiter.clear()
 
@@ -96,10 +84,18 @@ def reset_state_store(monkeypatch, tmp_path):
     state_store._audit_durability._known_audit_ids.clear()
 
     # Clear in-memory state and repository buffers
+    from app.services.scenario_benchmark import scenario_runner
+
+    def _reset_scenario_runner():
+        scenario_runner.current_scenario = None
+        scenario_runner.is_running = False
+        scenario_runner.simulation_time_s = 0.0
+
     with state_store._lock:
         state_store._incident_audits.clear()
     state_store.clear()
     state_store.set_mode("SIMULATION", reason="Test reset")
+    _reset_scenario_runner()
     _reset_persistence_repo()
 
     yield
@@ -109,6 +105,7 @@ def reset_state_store(monkeypatch, tmp_path):
         state_store._incident_audits.clear()
     state_store.clear()
     state_store.set_mode("SIMULATION", reason="Test teardown")
+    _reset_scenario_runner()
     state_store._audit_durability._known_audit_ids.clear()
     _reset_persistence_repo()
 
@@ -127,6 +124,36 @@ def admin_client(monkeypatch):
     monkeypatch.setattr(settings, "SUPABASE_URL", TEST_SUPABASE_URL)
 
     token = create_test_token(role="admin")
+
+    return TestClient(
+        app,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+@pytest.fixture
+def municipal_client(monkeypatch):
+    """Authenticated test client with a trusted municipal JWT."""
+    monkeypatch.setattr(settings, "SUPABASE_AUTH_ENABLED", True)
+    monkeypatch.setattr(settings, "SUPABASE_JWT_SECRET", TEST_JWT_SECRET)
+    monkeypatch.setattr(settings, "SUPABASE_URL", TEST_SUPABASE_URL)
+
+    token = create_test_token(role="municipality", subject="test-municipal-officer")
+
+    return TestClient(
+        app,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+@pytest.fixture
+def citizen_client(monkeypatch):
+    """Authenticated test client with a citizen JWT."""
+    monkeypatch.setattr(settings, "SUPABASE_AUTH_ENABLED", True)
+    monkeypatch.setattr(settings, "SUPABASE_JWT_SECRET", TEST_JWT_SECRET)
+    monkeypatch.setattr(settings, "SUPABASE_URL", TEST_SUPABASE_URL)
+
+    token = create_test_token(role="citizen", subject="test-citizen-user")
 
     return TestClient(
         app,

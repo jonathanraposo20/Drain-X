@@ -589,6 +589,7 @@ def test_production_fail_closed_startup_validation():
         SUPABASE_URL="https://valid.supabase.co",
         SUPABASE_SERVICE_ROLE_KEY="valid_service_role_key_long",
         SUPABASE_JWT_SECRET="valid_jwt_secret_with_sufficient_entropy_123",
+        RATE_LIMIT_KEY_PEPPER="sufficiently_long_production_pepper_1234",
     )
     # Should not raise any exception
     validate_production_configuration(valid_prod_cfg)

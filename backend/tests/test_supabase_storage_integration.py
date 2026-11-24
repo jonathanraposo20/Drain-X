@@ -25,6 +25,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 import httpx
 
+from app.core.config import settings
 from app.services.persistence_repository import (
     PersistenceRepository,
     StorageError,
@@ -1223,6 +1224,7 @@ from fastapi.testclient import TestClient
 from app.services.state_store import state_store
 from app.services.persistence_repository import persistence_repo
 from app.main import app
+from app.core.config import settings
 from app.services.persistence_repository import (
     CANONICAL_V3_FILENAME_PATTERN,
     CANONICAL_V3_OBJECT_PATH_PATTERN,
@@ -2499,36 +2501,37 @@ def test_sec_dur_07_maintenance_cleanup_recovery_endpoint():
         "lease_sec": 60,
     }
 
-    with patch("app.core.security.verify_supabase_jwt", return_value={"sub": "worker1", "role": "worker", "extracted_role": "worker"}):
-        resp_worker = client.post(
-            "/api/v1/incidents/maintenance/recover-storage-cleanup",
-            json=payload,
-            headers={"Authorization": "Bearer worker-token"},
-        )
-        assert resp_worker.status_code == 403
-
-    with patch("app.core.security.verify_supabase_jwt", return_value={"sub": "admin_sub", "role": "admin", "extracted_role": "admin"}):
-        with patch.object(
-            persistence_repo,
-            "execute_cleanup_recovery_workflow_sync",
-            return_value={"status": "CLEANUP_RECOVERY_COMPLETED", "reconciled_count": 0},
-        ) as mock_recovery:
-            resp_admin = client.post(
+    with patch.object(settings, "SUPABASE_AUTH_ENABLED", True):
+        with patch("app.core.security.verify_supabase_jwt", return_value={"sub": "worker1", "role": "worker", "extracted_role": "worker"}):
+            resp_worker = client.post(
                 "/api/v1/incidents/maintenance/recover-storage-cleanup",
                 json=payload,
-                headers={"Authorization": "Bearer admin-token"},
+                headers={"Authorization": "Bearer worker-token"},
             )
-            assert resp_admin.status_code == 200
-            assert resp_admin.json()["status"] == "CLEANUP_RECOVERY_COMPLETED"
-            mock_recovery.assert_called_once_with(
-                cleanup_id="clean_recovery_01",
-                incident_id="INC-01",
-                idempotency_key="recovery_key_12345",
-                scope="incident_attachment",
-                recovery_actor_id="admin_sub",
-                recovery_actor_role="admin",
-                lease_sec=60,
-            )
+            assert resp_worker.status_code == 403
+
+        with patch("app.core.security.verify_supabase_jwt", return_value={"sub": "admin_sub", "role": "admin", "extracted_role": "admin"}):
+            with patch.object(
+                persistence_repo,
+                "execute_cleanup_recovery_workflow_sync",
+                return_value={"status": "CLEANUP_RECOVERY_COMPLETED", "reconciled_count": 0},
+            ) as mock_recovery:
+                resp_admin = client.post(
+                    "/api/v1/incidents/maintenance/recover-storage-cleanup",
+                    json=payload,
+                    headers={"Authorization": "Bearer admin-token"},
+                )
+                assert resp_admin.status_code == 200
+                assert resp_admin.json()["status"] == "CLEANUP_RECOVERY_COMPLETED"
+                mock_recovery.assert_called_once_with(
+                    cleanup_id="clean_recovery_01",
+                    incident_id="INC-01",
+                    idempotency_key="recovery_key_12345",
+                    scope="incident_attachment",
+                    recovery_actor_id="admin_sub",
+                    recovery_actor_role="admin",
+                    lease_sec=60,
+                )
 
 
 def test_sec_dur_07_recovery_per_object_deletion_failure_records_uncertain_and_continues():

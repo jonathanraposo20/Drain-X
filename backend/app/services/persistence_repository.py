@@ -24,18 +24,33 @@ Architecture Principles:
 
 import hashlib
 import logging
+import math
 import uuid
 import os
 import re
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import urllib.parse
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from app.core.config import settings
-from app.models.contracts import SensorReadingContract, DataSource
+from app.core.config import settings, inspect_service_role_credential
+from app.models.contracts import (
+    SensorReadingContract,
+    DataSource,
+    ActuatorDirectiveEventContract,
+    DIRECTIVE_AUDIT_DB_COLUMNS,
+    DIRECTIVE_AUDIT_IMMUTABLE_COLUMNS,
+    DirectiveEventType,
+    DirectiveIssuerType,
+    build_startup_cancellation_audit_id,
+    build_verification_timeout_audit_id,
+    normalize_audit_timestamp_utc,
+    quantize_numeric_5_2_decimal,
+    compute_verification_timeout_timestamp,
+)
 
 logger = logging.getLogger("drainx.persistence")
 _UNSET = object()
@@ -47,7 +62,17 @@ _UNSET = object()
 
 class StorageError(RuntimeError):
     """Base exception for all Supabase Storage repository errors."""
-    pass
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        sqlstate: Optional[str] = None,
+        error_category: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+        self.error_category = error_category
 
 
 class StorageNotConfiguredError(StorageError):
@@ -62,6 +87,16 @@ class StorageValidationError(StorageError):
 
 class StorageConflictError(StorageError):
     """Raised when attempting to upload an object that already exists (x-upsert: false)."""
+    pass
+
+
+class DirectiveAuditConflictError(StorageConflictError, ValueError):
+    """Raised when a duplicate audit_id conflicts with an existing immutable directive audit row."""
+    pass
+
+
+class StorageLeaseLostError(StorageConflictError):
+    """Raised when a worker lease is stale, expired, or no longer owned (SQLSTATE P0412)."""
     pass
 
 
@@ -113,6 +148,29 @@ IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{8,64}$")
 CLEANUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 REQUEST_FINGERPRINT_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 BUCKET_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+DUP_LEASE_PATTERN = re.compile(r"^dup_lease_[a-f0-9]{32}$")
+DUP_LINK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{5,32}$")
+ALLOWED_DUPLICATE_REVIEW_ROLES: FrozenSet[str] = frozenset({"municipality", "admin", "service_role"})
+ALLOWED_DUPLICATE_LINK_STATUSES: FrozenSet[str] = frozenset({"SUSPECTED", "CONFIRMED", "DISMISSED"})
+ALLOWED_OPERATIONAL_MODES: FrozenSet[str] = frozenset({"SIMULATION", "PHYSICAL", "SAFE_HOLD"})
+
+_CONTENT_RANGE_TOTAL_PATTERN = re.compile(
+    r"^(?:[A-Za-z]+\s+)?(?:\*|\d+-\d+)/(\d+)$"
+)
+
+
+def _parse_postgrest_content_range_total(content_range: Optional[str]) -> Optional[int]:
+    """Parses an exact non-negative total count from a PostgREST Content-Range header."""
+    if not isinstance(content_range, str):
+        return None
+    cleaned = content_range.strip()
+    if not cleaned:
+        return None
+    match = _CONTENT_RANGE_TOTAL_PATTERN.match(cleaned)
+    if not match:
+        return None
+    total = int(match.group(1))
+    return total if total >= 0 else None
 
 
 def _validate_bucket_name(bucket: Optional[str]) -> str:
@@ -357,12 +415,207 @@ def _parse_record_datetime(ts_val: Any) -> Optional[datetime]:
         return None
 
 
+def _quantize_numeric_5_2(value: Optional[Union[int, float, Decimal]]) -> Optional[float]:
+    """Quantizes NUMERIC(5, 2) angles/divergences consistently via Decimal without -0.0."""
+    quantized = quantize_numeric_5_2_decimal(value, "numeric_5_2", allow_none=True)
+    if quantized is None:
+        return None
+    if quantized == 0:
+        return 0.0
+    return float(quantized)
+
+
+def serialize_directive_audit_row(
+    audit: Union[ActuatorDirectiveEventContract, Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Validates and serializes an actuator directive audit event into the exact
+    23 typed columns of public.actuator_directive_audits (Migration 008).
+    Rejects missing required fields (including omitted timestamps in dict input)
+    and legacy/unknown keys before persistence.
+    """
+    if isinstance(audit, ActuatorDirectiveEventContract):
+        try:
+            validated = ActuatorDirectiveEventContract.model_validate(audit.model_dump())
+        except ValidationError as exc:
+            raise ValueError(f"Invalid ActuatorDirectiveEventContract: {exc}") from exc
+    elif isinstance(audit, dict):
+        if "timestamp" not in audit or audit["timestamp"] is None:
+            raise ValueError("Directive audit payload must explicitly include a timezone-aware 'timestamp'.")
+        try:
+            validated = ActuatorDirectiveEventContract.model_validate(audit)
+        except ValidationError as exc:
+            raise ValueError(f"Invalid directive audit payload: {exc}") from exc
+    else:
+        raise TypeError(
+            f"Expected ActuatorDirectiveEventContract or dict, got {type(audit).__name__}"
+        )
+
+    ts_utc = validated.timestamp.astimezone(timezone.utc).isoformat()
+    row: Dict[str, Any] = {
+        "audit_id": validated.audit_id,
+        "directive_id": validated.directive_id,
+        "event_type": validated.event_type.value,
+        "device_id": validated.device_id,
+        "section_id": validated.section_id,
+        "operational_mode": validated.operational_mode,
+        "directive_type": validated.directive_type,
+        "action": validated.action,
+        "gate_target_angle": _quantize_numeric_5_2(validated.gate_target_angle),
+        "reason": validated.reason,
+        "risk_level": validated.risk_level.value,
+        "emergency_stop": validated.emergency_stop,
+        "measured_gate_angle": _quantize_numeric_5_2(validated.measured_gate_angle),
+        "measured_gate_state": validated.measured_gate_state,
+        "execution_divergence_deg": _quantize_numeric_5_2(validated.execution_divergence_deg),
+        "issuer_type": validated.issuer_type.value,
+        "issuer_id": validated.issuer_id,
+        "correlation_id": validated.correlation_id,
+        "device_session_epoch": validated.device_session_epoch,
+        "baseline_device_sequence_number": validated.baseline_device_sequence_number,
+        "device_sequence_number": validated.device_sequence_number,
+        "device_uptime_ms": validated.device_uptime_ms,
+        "timestamp": ts_utc,
+    }
+    if tuple(row.keys()) != DIRECTIVE_AUDIT_DB_COLUMNS:
+        raise RuntimeError("Serialized directive audit keys do not match Migration 008 schema.")
+    return row
+
+
+_NUMERIC_5_2_FIELDS: FrozenSet[str] = frozenset({
+    "gate_target_angle",
+    "measured_gate_angle",
+    "execution_divergence_deg",
+})
+_INT_AUDIT_FIELDS: FrozenSet[str] = frozenset({
+    "device_session_epoch",
+    "baseline_device_sequence_number",
+    "device_sequence_number",
+    "device_uptime_ms",
+})
+
+
+def _normalize_immutable_field_value(field_name: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "value"):
+        value = value.value
+    if field_name == "timestamp":
+        try:
+            return normalize_audit_timestamp_utc(value)
+        except (ValueError, TypeError):
+            return ("invalid_timestamp", type(value).__name__)
+    if field_name in _NUMERIC_5_2_FIELDS:
+        if isinstance(value, bool):
+            return ("bool", value)
+        try:
+            if isinstance(value, Decimal):
+                if not value.is_finite():
+                    return ("non_finite", str(value))
+                dec = value
+            elif isinstance(value, int):
+                dec = Decimal(value)
+            elif isinstance(value, float):
+                if not math.isfinite(value):
+                    return ("non_finite", str(value))
+                dec = Decimal(str(value))
+            elif isinstance(value, str):
+                dec = Decimal(value.strip())
+                if not dec.is_finite():
+                    return ("non_finite", value)
+            else:
+                return ("non_numeric", type(value).__name__)
+            quantized = dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            return Decimal("0.00") if quantized == 0 else quantized
+        except (InvalidOperation, ValueError):
+            return ("invalid_decimal", type(value).__name__)
+    if field_name in _INT_AUDIT_FIELDS:
+        if isinstance(value, bool):
+            return ("bool", value)
+        return int(value)
+    if field_name == "emergency_stop":
+        return value if isinstance(value, bool) else ("non_bool", value)
+    if isinstance(value, str):
+        return value
+    return value
+
+
+def _verify_immutable_directive_audit_match(
+    existing: Dict[str, Any], incoming: Dict[str, Any]
+) -> None:
+    """
+    Compares all 23 immutable columns (including UTC microsecond-normalized timestamp
+    and nullable fields) of an existing ledger row against an incoming row.
+    Raises DirectiveAuditConflictError on any divergence; never silently masks conflicts.
+    """
+    mismatched: List[str] = []
+    for col in DIRECTIVE_AUDIT_IMMUTABLE_COLUMNS:
+        ex_val = _normalize_immutable_field_value(col, existing.get(col))
+        in_val = _normalize_immutable_field_value(col, incoming.get(col))
+        if ex_val != in_val:
+            mismatched.append(col)
+    if mismatched:
+        raise DirectiveAuditConflictError(
+            f"Directive audit conflict for audit_id='{incoming.get('audit_id')}' on immutable field(s): {', '.join(mismatched)}"
+        )
+
+
+_POSTGREST_RESERVED_VALUE_CHARS = frozenset(',.:()"\\')
+
+
+def _quote_postgrest_value(value: str) -> str:
+    """
+    Safely renders a value for a PostgREST filter. Values containing PostgREST reserved
+    characters (, . : ( ) ") , backslashes or whitespace are double-quoted with backslash
+    escaping; control characters are rejected outright. HTTP URL-encoding is applied
+    afterwards by httpx when the value is passed through `params`.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError("PostgREST filter value must be a non-empty string.")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError("PostgREST filter value contains control characters.")
+    if any(ch in _POSTGREST_RESERVED_VALUE_CHARS or ch.isspace() for ch in value):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return value
+
+
+def _format_audit_id_postgrest_filter(audit_ids: Sequence[str]) -> str:
+    if not audit_ids:
+        raise ValueError("At least one audit_id is required for a PostgREST filter.")
+    if len(audit_ids) == 1:
+        return f"eq.{_quote_postgrest_value(audit_ids[0])}"
+    return f"in.({','.join(_quote_postgrest_value(a) for a in audit_ids)})"
+
+
+def _chunk_audit_ids(
+    audit_ids: Sequence[str], max_ids: int, max_chars: int
+) -> List[List[str]]:
+    """Splits ids (preserving order) into chunks bounded by id count and rendered filter length."""
+    chunks: List[List[str]] = []
+    current: List[str] = []
+    current_len = 0
+    for a_id in audit_ids:
+        piece_len = len(_quote_postgrest_value(a_id)) + 1
+        if current and (len(current) >= max_ids or current_len + piece_len > max_chars):
+            chunks.append(current)
+            current, current_len = [], 0
+        current.append(a_id)
+        current_len += piece_len
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 class PersistenceRepository:
     """
     Modular persistence client interfacing FastAPI with Supabase Cloud PostgREST.
     Operates in fallback/mock mode when unconfigured.
     """
     POSTGREST_PAGE_SIZE: int = 1000
+    # Conservative bounds for directive-audit verification SELECTs (ids per request / rendered chars).
+    DIRECTIVE_AUDIT_VERIFY_CHUNK_SIZE: int = 50
+    DIRECTIVE_AUDIT_VERIFY_MAX_QUERY_CHARS: int = 3000
 
     def __init__(
         self,
@@ -387,7 +640,7 @@ class PersistenceRepository:
             url_from_settings = False
 
         if supabase_key is _UNSET:
-            if url_from_settings or resolved_url == (settings.SUPABASE_URL or "").rstrip("/"):
+            if url_from_settings or (resolved_url and resolved_url == (settings.SUPABASE_URL or "").rstrip("/")):
                 resolved_key = (settings.SUPABASE_KEY or "").strip()
             else:
                 resolved_key = ""
@@ -400,7 +653,7 @@ class PersistenceRepository:
             key_from_settings = False
 
         if service_role_key is _UNSET:
-            if url_from_settings or resolved_url == (settings.SUPABASE_URL or "").rstrip("/"):
+            if url_from_settings or (resolved_url and resolved_url == (settings.SUPABASE_URL or "").rstrip("/")):
                 resolved_service_key = (settings.SUPABASE_SERVICE_ROLE_KEY or "").strip()
             else:
                 resolved_service_key = ""
@@ -420,6 +673,7 @@ class PersistenceRepository:
         settings_service_key = (
             settings.SUPABASE_SERVICE_ROLE_KEY or ""
         ).strip()
+        config_conflict_reason: Optional[str] = None
 
         if (
             not key_from_settings
@@ -430,6 +684,10 @@ class PersistenceRepository:
             resolved_url = ""
             if service_key_from_settings:
                 resolved_service_key = ""
+            config_conflict_reason = (
+                "Conflicting Supabase configuration: custom anon key override provided "
+                "without matching SUPABASE_URL."
+            )
 
         if (
             not service_key_from_settings
@@ -440,10 +698,16 @@ class PersistenceRepository:
             resolved_url = ""
             if key_from_settings:
                 resolved_key = ""
+            config_conflict_reason = (
+                "Conflicting Supabase configuration: custom service_role credential override "
+                "provided without matching SUPABASE_URL."
+            )
 
         self._supabase_url = resolved_url
         self._supabase_key = resolved_key
         self._supabase_service_role_key = resolved_service_key
+        self._config_conflict_reason = config_conflict_reason
+        self._explicit_in_memory_isolation = False
 
         resolved_timeout = timeout_sec if timeout_sec is not None else settings.PERSISTENCE_TIMEOUT_SEC
         if resolved_timeout is not None:
@@ -462,19 +726,8 @@ class PersistenceRepository:
 
         self._in_memory_records: List[Dict[str, Any]] = []
         self._mode_history_records: List[Dict[str, Any]] = []
-        self._in_memory_devices: Dict[str, Dict[str, Any]] = {
-            "DRAINX-ESP32-NODE-01": {
-                "device_id": "DRAINX-ESP32-NODE-01",
-                "name": "Primary Flume ESP32 Node",
-                "hardware_model": "ESP32 DevKit V1 (ESP-WROOM-32)",
-                "firmware_version": "0.3.7-p0.3g",
-                "is_active": True,
-                "validation_stage": "CONNECTIVITY_READY",
-                "last_seen_at": datetime.now(timezone.utc).isoformat(),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "metadata": {"location": "Flume Primary Sump"},
-            }
-        }
+        self._in_memory_directive_audits: List[Dict[str, Any]] = []
+        self._in_memory_devices: Dict[str, Dict[str, Any]] = self._default_in_memory_devices()
 
         self._last_persistence_error: Optional[str] = None
         self._total_persisted_count: int = 0
@@ -486,7 +739,41 @@ class PersistenceRepository:
         )
         self._last_ping_ms: Optional[float] = None
 
+    @staticmethod
+    def _default_in_memory_devices() -> Dict[str, Dict[str, Any]]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return {
+            "DRAINX-ESP32-NODE-01": {
+                "device_id": "DRAINX-ESP32-NODE-01",
+                "name": "Primary Flume ESP32 Node",
+                "hardware_model": "ESP32 DevKit V1 (ESP-WROOM-32)",
+                "firmware_version": "0.3.7-p0.3g",
+                "is_active": True,
+                "validation_stage": "CONNECTIVITY_READY",
+                "last_seen_at": now_iso,
+                "created_at": now_iso,
+                "metadata": {"location": "Flume Primary Sump"},
+            }
+        }
 
+    @classmethod
+    def create_isolated_in_memory(cls, timeout_sec: float = 5.0) -> "PersistenceRepository":
+        """Explicitly constructs an isolated in-memory repository for unit testing."""
+        repo = cls(supabase_url="", supabase_key="", service_role_key="", timeout_sec=timeout_sec)
+        repo._explicit_in_memory_isolation = True
+        return repo
+
+    def reset_in_memory_state(self) -> None:
+        """Clears local in-memory buffers, directive audits, device registry, and counters."""
+        self._in_memory_records.clear()
+        self._mode_history_records.clear()
+        self._in_memory_directive_audits.clear()
+        self._in_memory_devices = self._default_in_memory_devices()
+        self._total_persisted_count = 0
+        self._failed_persistence_count = 0
+        self._last_persistence_error = None
+        self._connection_status = "UNCONFIGURED" if not self._is_configured else "CONFIGURED_UNCHECKED"
+        self._last_ping_ms = None
 
     @property
     def is_configured(self) -> bool:
@@ -495,14 +782,19 @@ class PersistenceRepository:
     @property
     def is_storage_configured(self) -> bool:
         """
-        True only when both PostgREST URL and SUPABASE_SERVICE_ROLE_KEY are configured.
-        Storage and rate-limit RPC operations require service-role privileges.
+        True only when PostgREST URL and a validated SUPABASE_SERVICE_ROLE_KEY are
+        configured without credential conflicts. Storage, rate-limit RPC, and directive
+        audit ledger operations require validated service-role privileges.
         """
-        return bool(
-            self._is_configured
-            and (self._supabase_url or "").strip()
-            and (self._supabase_service_role_key or "").strip()
+        if not self._is_configured or self._config_conflict_reason:
+            return False
+        if not (self._supabase_url or "").strip():
+            return False
+        valid_sr, _ = inspect_service_role_credential(
+            self._supabase_service_role_key,
+            self._supabase_key,
         )
+        return valid_sr
 
     @property
     def upload_lease_sec(self) -> int:
@@ -517,11 +809,15 @@ class PersistenceRepository:
         return self._supabase_url
 
     def get_status(self) -> DatabaseConfigStatus:
+        sr_valid, _ = inspect_service_role_credential(
+            self._supabase_service_role_key,
+            self._supabase_key,
+        )
         return DatabaseConfigStatus(
             configured=self._is_configured,
             url_present=bool(self._supabase_url),
             key_present=bool(self._supabase_key),
-            service_role_key_present=bool(self._supabase_service_role_key),
+            service_role_key_present=sr_valid,
             mode="SUPABASE_CLOUD" if self._is_configured else "IN_MEMORY_FALLBACK",
             target_table="sensor_readings",
             last_persistence_error=self._last_persistence_error,
@@ -940,10 +1236,15 @@ class PersistenceRepository:
             logger.warning("Device registration network error: %s", exc.__class__.__name__)
             return record
 
-    async def get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+    async def get_device(self, device_id: str, strict: bool = False) -> Optional[Dict[str, Any]]:
         """
         Retrieve device metadata by device_id.
+        When `strict=True`, fails closed by propagating ValueError/RuntimeError on invalid IDs
+        or cloud persistence errors instead of falling back to in-memory state.
         """
+        if strict:
+            self._validate_directive_filter_token(device_id, "device_id", max_len=64)
+
         if not self._is_configured:
             return self._in_memory_devices.get(device_id)
 
@@ -962,15 +1263,28 @@ class PersistenceRepository:
                 )
                 if resp.status_code == 200:
                     items = resp.json()
+                    if not isinstance(items, list):
+                        if strict:
+                            raise RuntimeError("Supabase device lookup returned malformed non-list payload.")
+                        logger.warning("Get device returned non-list payload.")
+                        return self._in_memory_devices.get(device_id)
                     return items[0] if items else None
+                if strict:
+                    raise RuntimeError(f"Supabase device lookup failed with HTTP {resp.status_code}")
                 return self._in_memory_devices.get(device_id)
+        except RuntimeError:
+            raise
         except Exception as exc:
+            if strict:
+                raise RuntimeError(f"Supabase device lookup error: {exc.__class__.__name__}") from exc
             logger.warning("Get device network error: %s", exc.__class__.__name__)
             return self._in_memory_devices.get(device_id)
 
-    async def list_devices(self) -> List[Dict[str, Any]]:
+    async def list_devices(self, strict: bool = False) -> List[Dict[str, Any]]:
         """
         List all registered IoT edge nodes.
+        When `strict=True` and cloud persistence is configured, fails closed by raising
+        RuntimeError rather than falling back to potentially stale in-memory assignments.
         """
         if not self._is_configured:
             return list(self._in_memory_devices.values())
@@ -987,9 +1301,21 @@ class PersistenceRepository:
                     },
                 )
                 if resp.status_code == 200:
-                    return resp.json()
+                    items = resp.json()
+                    if not isinstance(items, list):
+                        if strict:
+                            raise RuntimeError("Supabase device registry returned malformed non-list payload.")
+                        logger.warning("List devices returned non-list payload.")
+                        return list(self._in_memory_devices.values())
+                    return items
+                if strict:
+                    raise RuntimeError(f"Supabase device registry query failed with HTTP {resp.status_code}")
                 return list(self._in_memory_devices.values())
+        except RuntimeError:
+            raise
         except Exception as exc:
+            if strict:
+                raise RuntimeError(f"Supabase device registry query error: {exc.__class__.__name__}") from exc
             logger.warning("List devices network error: %s", exc.__class__.__name__)
             return list(self._in_memory_devices.values())
 
@@ -1101,6 +1427,554 @@ class PersistenceRepository:
             logger.warning("Supabase synchronous incident audit query error: %s", exc.__class__.__name__)
             return []
 
+    def directive_audit_cloud_mode(self) -> bool:
+        """
+        Single authoritative determination of whether directive audit reads and writes
+        target cloud PostgreSQL. Distinguishes explicit in-memory test isolation from
+        partial, conflicting, or invalid cloud credentials, and always fails closed.
+        """
+        if self._config_conflict_reason:
+            raise StorageNotConfiguredError(self._config_conflict_reason)
+
+        has_url = bool((self._supabase_url or "").strip())
+        has_anon = bool((self._supabase_key or "").strip())
+        has_service = bool((self._supabase_service_role_key or "").strip())
+
+        if self._explicit_in_memory_isolation and not (
+            self._is_configured or has_url or has_anon or has_service
+        ):
+            return False
+
+        if not self._is_configured and not has_url and not has_anon and not has_service:
+            if settings.ENVIRONMENT == "production":
+                raise StorageNotConfiguredError(
+                    "Production environment requires configured SUPABASE_URL and "
+                    "SUPABASE_SERVICE_ROLE_KEY for actuator directive audit persistence."
+                )
+            return False
+
+        if not has_url:
+            raise StorageNotConfiguredError(
+                "Partial Supabase configuration: credential provided without SUPABASE_URL."
+            )
+
+        valid_sr, sr_reason = inspect_service_role_credential(
+            self._supabase_service_role_key,
+            self._supabase_key,
+        )
+        if not valid_sr:
+            raise StorageNotConfiguredError(
+                f"Actuator directive audit ledger requires a valid SUPABASE_SERVICE_ROLE_KEY: {sr_reason}"
+            )
+
+        if not self._is_configured:
+            raise StorageNotConfiguredError(
+                "Actuator directive audit ledger configuration is disabled while cloud credentials remain set."
+            )
+
+        return True
+
+    def _directive_audit_cloud_mode(self) -> bool:
+        return self.directive_audit_cloud_mode()
+
+    def persist_directive_audit_sync(
+        self, audit: Union[ActuatorDirectiveEventContract, Dict[str, Any]], *, strict: bool = False
+    ) -> bool:
+        """Persists a single actuator directive audit event synchronously."""
+        return self.persist_directive_audit_batch_sync([audit], strict=strict)
+
+    def persist_directive_audit_batch_sync(
+        self,
+        audits: Sequence[Union[ActuatorDirectiveEventContract, Dict[str, Any]]],
+        *,
+        strict: bool = False,
+    ) -> bool:
+        """
+        Persists a batch of actuator directive audit events synchronously using the exact
+        23-column Migration 008 schema and explicit service_role credentials.
+        Verifies all 23 immutable fields on any duplicate audit_id conflict before reporting success.
+        """
+        if not audits:
+            return True
+
+        serialized_rows = [serialize_directive_audit_row(a) for a in audits]
+
+        # Intra-batch duplicate verification and deduplication
+        deduped_by_id: Dict[str, Dict[str, Any]] = {}
+        deduped_rows: List[Dict[str, Any]] = []
+        for row in serialized_rows:
+            a_id = row["audit_id"]
+            if a_id in deduped_by_id:
+                _verify_immutable_directive_audit_match(deduped_by_id[a_id], row)
+            else:
+                deduped_by_id[a_id] = row
+                deduped_rows.append(row)
+
+        use_cloud = self.directive_audit_cloud_mode()
+        if not use_cloud:
+            # In-memory storage: verify entire batch atomically before appending new rows
+            rows_to_insert: List[Dict[str, Any]] = []
+            for ad in deduped_rows:
+                existing = next(
+                    (rec for rec in self._in_memory_directive_audits if rec["audit_id"] == ad["audit_id"]),
+                    None,
+                )
+                if existing is not None:
+                    _verify_immutable_directive_audit_match(existing, ad)
+                else:
+                    rows_to_insert.append(dict(ad))
+            self._in_memory_directive_audits.extend(rows_to_insert)
+            return True
+
+        endpoint = f"{self._supabase_url}/rest/v1/actuator_directive_audits"
+        all_ids = [r["audit_id"] for r in deduped_rows]
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                # Phase 1 (pre-flight): verify every already-persisted row across the COMPLETE batch
+                # BEFORE any write, so a conflicting duplicate can never leave sibling rows committed.
+                existing_by_id = self._fetch_directive_audits_by_ids(client, endpoint, all_ids)
+                new_rows: List[Dict[str, Any]] = []
+                for row in deduped_rows:
+                    existing = existing_by_id.get(row["audit_id"])
+                    if existing is None:
+                        new_rows.append(row)
+                    else:
+                        _verify_immutable_directive_audit_match(existing, row)
+                if not new_rows:
+                    return True
+
+                # Phase 2: single bulk INSERT (one PostgREST request == one SQL statement/transaction).
+                headers = self._get_storage_headers(content_type="application/json")
+                headers["Prefer"] = "resolution=ignore-duplicates,return=representation"
+                resp = client.post(endpoint, json=new_rows, headers=headers)
+                if resp.status_code in (200, 201):
+                    returned = resp.json()
+                    if not isinstance(returned, list):
+                        self._failed_persistence_count += 1
+                        self._last_persistence_error = "Supabase directive audit insert returned malformed non-list payload."
+                        if strict:
+                            raise StorageError(self._last_persistence_error)
+                        logger.warning(self._last_persistence_error)
+                        return False
+                    new_by_id = {r["audit_id"]: r for r in new_rows}
+                    inserted_ids = set()
+                    for r in returned:
+                        if isinstance(r, dict) and r.get("audit_id") in new_by_id:
+                            try:
+                                _verify_immutable_directive_audit_match(r, new_by_id[r["audit_id"]])
+                            except DirectiveAuditConflictError as exc:
+                                self._failed_persistence_count += 1
+                                self._last_persistence_error = (
+                                    "Directive audit insert returned a representation that diverges from the submitted row."
+                                )
+                                raise StorageError(self._last_persistence_error) from exc
+                            inserted_ids.add(r["audit_id"])
+                    missing_rows = [ad for ad in new_rows if ad["audit_id"] not in inserted_ids]
+                elif resp.status_code == 409:
+                    missing_rows = list(new_rows)
+                else:
+                    self._failed_persistence_count += 1
+                    self._last_persistence_error = f"Supabase directive audit persistence HTTP {resp.status_code}"
+                    logger.warning(self._last_persistence_error)
+                    if strict:
+                        raise StorageError(self._last_persistence_error)
+                    return False
+
+                if missing_rows:
+                    # Phase 3 (post-flight): rows skipped by ignore-duplicates were inserted concurrently
+                    # by another writer after pre-flight; verify them across all 23 columns.
+                    raced = self._fetch_directive_audits_by_ids(
+                        client, endpoint, [ad["audit_id"] for ad in missing_rows]
+                    )
+                    for incoming in missing_rows:
+                        existing = raced.get(incoming["audit_id"])
+                        if existing is None:
+                            raise StorageError(
+                                f"Directive audit '{incoming['audit_id']}' was neither inserted nor found for immutable verification."
+                            )
+                        _verify_immutable_directive_audit_match(existing, incoming)
+
+                self._total_persisted_count += len(new_rows) - len(missing_rows)
+                return True
+        except (DirectiveAuditConflictError, StorageNotConfiguredError, ValueError, TypeError):
+            raise
+        except StorageError:
+            raise
+        except Exception as exc:
+            self._failed_persistence_count += 1
+            self._last_persistence_error = f"Supabase directive audit batch persistence error: {exc.__class__.__name__}"
+            logger.warning("Supabase synchronous directive audit batch persistence error: %s", exc.__class__.__name__)
+            if strict:
+                raise StorageError(self._last_persistence_error) from exc
+            return False
+
+    def _fetch_directive_audits_by_ids(
+        self, client: Any, endpoint: str, audit_ids: Sequence[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Fetches existing directive audit rows for `audit_ids` using bounded, safely-quoted
+        PostgREST filters and merges results across chunks. Any transport/HTTP/shape failure
+        raises StorageError (fail closed) regardless of `strict`.
+        """
+        max_ids = int(getattr(self, "directive_audit_verify_chunk_size", self.DIRECTIVE_AUDIT_VERIFY_CHUNK_SIZE))
+        max_chars = int(self.DIRECTIVE_AUDIT_VERIFY_MAX_QUERY_CHARS)
+        if max_ids < 1:
+            raise StorageError("Directive audit verification chunk size must be at least 1.")
+        merged: Dict[str, Dict[str, Any]] = {}
+        headers = self._get_storage_headers()
+        for chunk in _chunk_audit_ids(list(audit_ids), max_ids, max_chars):
+            chunk_set = set(chunk)
+            try:
+                resp = client.get(
+                    endpoint,
+                    params={"select": "*", "audit_id": _format_audit_id_postgrest_filter(chunk)},
+                    headers=headers,
+                )
+            except httpx.HTTPError as exc:
+                self._failed_persistence_count += 1
+                self._last_persistence_error = (
+                    f"Directive audit verification query error: {exc.__class__.__name__}"
+                )
+                raise StorageError(self._last_persistence_error) from exc
+            if resp.status_code != 200:
+                self._failed_persistence_count += 1
+                self._last_persistence_error = (
+                    f"Directive audit duplicate verification query failed with HTTP {resp.status_code}"
+                )
+                raise StorageError(self._last_persistence_error)
+            try:
+                rows = resp.json()
+            except ValueError as exc:
+                self._failed_persistence_count += 1
+                self._last_persistence_error = "Directive audit duplicate verification query returned invalid JSON."
+                raise StorageError(self._last_persistence_error) from exc
+            if not isinstance(rows, list):
+                self._failed_persistence_count += 1
+                self._last_persistence_error = "Directive audit duplicate verification query returned malformed payload."
+                raise StorageError(self._last_persistence_error)
+            for r in rows:
+                if isinstance(r, dict) and r.get("audit_id") in chunk_set:
+                    merged[r["audit_id"]] = r
+        return merged
+
+    def _validate_directive_filter_token(self, value: str, field_name: str, max_len: int = 64) -> str:
+        """Validates directive query filter tokens to prevent PostgREST query operator injection."""
+        if not isinstance(value, str) or value != value.strip() or not value:
+            raise ValueError(f"Invalid {field_name}: must be a non-empty trimmed string.")
+        if not re.match(rf"^[A-Za-z0-9_.:-]{{1,{max_len}}}$", value):
+            raise ValueError(f"Invalid {field_name}: contains disallowed characters or exceeds length {max_len}.")
+        return value
+
+    def _validate_directive_filter_collection(
+        self, values: Any, field_name: str, max_len: int = 64
+    ) -> List[str]:
+        """Validates every element of a directive filter collection before constructing PostgREST predicates."""
+        if isinstance(values, (str, bytes)):
+            raise ValueError(f"Invalid {field_name}: must be a collection of strings.")
+        try:
+            iterator = iter(values)
+        except TypeError as exc:
+            raise ValueError(f"Invalid {field_name}: must be a collection of strings.") from exc
+        validated = [
+            self._validate_directive_filter_token(item, field_name, max_len=max_len)
+            for item in iterator
+        ]
+        return sorted(set(validated))
+
+    def query_directive_audits_sync(
+        self,
+        directive_id: Optional[str] = None,
+        operational_mode: Optional[str] = None,
+        section_id: Optional[str] = None,
+        device_id: Optional[str] = None,
+        limit: int = 100,
+        strict: bool = False,
+        allowed_sections: Optional[Iterable[str]] = None,
+        allowed_devices: Optional[Iterable[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Queries actuator directive audit ledger synchronously with strict filter validation.
+        Pushes optional `allowed_sections` and `allowed_devices` scope filters into the query
+        before ordering and limiting.
+        When configured for Supabase/PostgREST, queries the latest `limit` matching rows
+        (ordered descending) and returns them in chronological ascending order.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 1000:
+            raise ValueError(f"Invalid limit '{limit}': must be an integer between 1 and 1000.")
+
+        clean_directive_id = (
+            self._validate_directive_filter_token(directive_id, "directive_id", max_len=36)
+            if directive_id is not None
+            else None
+        )
+        clean_section_id = (
+            self._validate_directive_filter_token(section_id, "section_id", max_len=64)
+            if section_id is not None
+            else None
+        )
+        clean_device_id = (
+            self._validate_directive_filter_token(device_id, "device_id", max_len=64)
+            if device_id is not None
+            else None
+        )
+        clean_allowed_sections = (
+            self._validate_directive_filter_collection(allowed_sections, "allowed_sections", max_len=64)
+            if allowed_sections is not None
+            else None
+        )
+        clean_allowed_devices = (
+            self._validate_directive_filter_collection(allowed_devices, "allowed_devices", max_len=64)
+            if allowed_devices is not None
+            else None
+        )
+        clean_mode: Optional[str] = None
+        if operational_mode is not None:
+            if not isinstance(operational_mode, str) or operational_mode not in ALLOWED_OPERATIONAL_MODES:
+                raise ValueError(
+                    f"Invalid operational_mode '{operational_mode}'. Allowed: {sorted(ALLOWED_OPERATIONAL_MODES)}."
+                )
+            clean_mode = operational_mode
+
+        # Fail closed before querying if an explicit allowlist is empty or excludes requested filter
+        if clean_allowed_sections is not None:
+            if not clean_allowed_sections:
+                return []
+            if clean_section_id is not None and clean_section_id not in clean_allowed_sections:
+                return []
+        if clean_allowed_devices is not None:
+            if not clean_allowed_devices:
+                return []
+            if clean_device_id is not None and clean_device_id not in clean_allowed_devices:
+                return []
+
+        use_cloud = self._directive_audit_cloud_mode()
+        if not use_cloud:
+            records = list(self._in_memory_directive_audits)
+            if clean_directive_id is not None:
+                records = [r for r in records if r.get("directive_id") == clean_directive_id]
+            if clean_mode is not None:
+                records = [r for r in records if r.get("operational_mode") == clean_mode]
+            if clean_section_id is not None:
+                records = [r for r in records if r.get("section_id") == clean_section_id]
+            elif clean_allowed_sections is not None:
+                allowed_section_set = set(clean_allowed_sections)
+                records = [r for r in records if r.get("section_id") in allowed_section_set]
+            if clean_device_id is not None:
+                records = [r for r in records if r.get("device_id") == clean_device_id]
+            elif clean_allowed_devices is not None:
+                allowed_device_set = set(clean_allowed_devices)
+                records = [r for r in records if r.get("device_id") in allowed_device_set]
+            records.sort(key=lambda x: (str(x.get("timestamp", "")), str(x.get("audit_id", ""))))
+            return records[-limit:]
+
+        endpoint = f"{self._supabase_url}/rest/v1/actuator_directive_audits"
+        params: Dict[str, str] = {
+            "order": "timestamp.desc,audit_id.desc",
+            "limit": str(limit),
+        }
+        if clean_directive_id is not None:
+            params["directive_id"] = f"eq.{clean_directive_id}"
+        if clean_mode is not None:
+            params["operational_mode"] = f"eq.{clean_mode}"
+        if clean_section_id is not None:
+            params["section_id"] = f"eq.{clean_section_id}"
+        elif clean_allowed_sections is not None:
+            if len(clean_allowed_sections) == 1:
+                params["section_id"] = f"eq.{clean_allowed_sections[0]}"
+            else:
+                params["section_id"] = f"in.({','.join(clean_allowed_sections)})"
+        if clean_device_id is not None:
+            params["device_id"] = f"eq.{clean_device_id}"
+        elif clean_allowed_devices is not None:
+            if len(clean_allowed_devices) == 1:
+                params["device_id"] = f"eq.{clean_allowed_devices[0]}"
+            else:
+                params["device_id"] = f"in.({','.join(clean_allowed_devices)})"
+
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.get(endpoint, params=params, headers=self._get_storage_headers())
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if not isinstance(rows, list):
+                        if strict:
+                            raise RuntimeError("Supabase directive audit query returned malformed non-list payload.")
+                        logger.warning("Supabase directive audit query returned non-list payload.")
+                        return []
+                    return list(reversed(rows))
+                if strict:
+                    raise RuntimeError(f"Supabase directive audit query failed with HTTP {resp.status_code}")
+                logger.warning("Supabase directive audit query failed with HTTP %s", resp.status_code)
+                return []
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(f"Supabase directive audit query error: {exc.__class__.__name__}") from exc
+            logger.warning("Supabase directive audit query error: %s", exc.__class__.__name__)
+            return []
+
+    def recover_incomplete_directives_sync(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """
+        Determines the latest event for each directive_id.
+        Identifies every directive whose latest event is non-terminal (ISSUED, FEEDBACK_RECEIVED).
+        Recovers each incomplete directive idempotently:
+          - Validates required persisted fields; fails closed and skips invalid rows.
+          - If expired (>= 30s): transitions to deterministic VERIFICATION_TIMEOUT and persists it.
+          - If within deadline (< 30s) and operational_mode == 'PHYSICAL':
+              An incomplete physical directive from a previous process must NEVER be reactivated.
+              Transitions to deterministic CANCELLED (SAFETY_INTERLOCK, 'startup_recovery') and persists it.
+          - If within deadline (< 30s) and non-PHYSICAL (SIMULATION / SAFE_HOLD):
+              Returns directive dictionary for active state restoration.
+        """
+        all_audits = self.query_directive_audits_sync(limit=1000)
+        if not all_audits:
+            return []
+
+        # Group by directive_id
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for a in all_audits:
+            d_id = a.get("directive_id")
+            if d_id:
+                grouped.setdefault(d_id, []).append(a)
+
+        terminal_events = {
+            "ALIGNMENT_OBSERVED",
+            "REJECTED",
+            "EXECUTION_FAILED",
+            "VERIFICATION_TIMEOUT",
+            "CANCELLED",
+            "SUPERSEDED",
+        }
+        recovered_directives: List[Dict[str, Any]] = []
+
+        now_utc = normalize_audit_timestamp_utc(now) if now is not None else datetime.now(timezone.utc)
+
+        for d_id, events in grouped.items():
+            def _recovery_sort_key(evt: Dict[str, Any]) -> Tuple[datetime, str]:
+                try:
+                    dt = normalize_audit_timestamp_utc(evt.get("timestamp"))
+                except (ValueError, TypeError):
+                    dt = datetime.min.replace(tzinfo=timezone.utc)
+                return (dt, str(evt.get("audit_id", "")))
+
+            sorted_events = sorted(events, key=_recovery_sort_key)
+            latest = sorted_events[-1]
+            latest_type = latest.get("event_type")
+
+            if latest_type not in terminal_events:
+                # Fail closed on missing/invalid mandatory columns
+                sec_id = latest.get("section_id")
+                op_mode = latest.get("operational_mode")
+                act = latest.get("action")
+                g_angle = latest.get("gate_target_angle")
+                rsn = latest.get("reason")
+                if not d_id or not sec_id or not op_mode or act is None or g_angle is None or rsn is None:
+                    logger.error(
+                        "recover_incomplete_directives_sync: incomplete directive '%s' missing mandatory columns; skipping.",
+                        d_id or "<missing_id>",
+                    )
+                    continue
+
+                latest_dt = None
+                if latest.get("timestamp") is not None:
+                    try:
+                        latest_dt = normalize_audit_timestamp_utc(latest.get("timestamp"))
+                    except (ValueError, TypeError):
+                        latest_dt = None
+                if latest_dt is None:
+                    logger.error(
+                        "recover_incomplete_directives_sync: directive '%s' has null/invalid timestamp; skipping.",
+                        d_id,
+                    )
+                    continue
+
+                issued_anchor = next(
+                    (e for e in sorted_events if e.get("event_type") == "ISSUED"),
+                    latest,
+                )
+                anchor_dt = None
+                if issued_anchor.get("timestamp") is not None:
+                    try:
+                        anchor_dt = normalize_audit_timestamp_utc(issued_anchor.get("timestamp"))
+                    except (ValueError, TypeError):
+                        anchor_dt = None
+                effective_anchor_dt = anchor_dt if anchor_dt is not None else latest_dt
+
+                age_s = (now_utc - effective_anchor_dt).total_seconds()
+
+                if age_s >= settings.ACTUATOR_VERIFICATION_TIMEOUT_SEC:
+                    timeout_dt = compute_verification_timeout_timestamp(
+                        effective_anchor_dt, settings.ACTUATOR_VERIFICATION_TIMEOUT_SEC
+                    )
+                    timeout_audit = {
+                        "audit_id": build_verification_timeout_audit_id(d_id),
+                        "directive_id": d_id,
+                        "event_type": "VERIFICATION_TIMEOUT",
+                        "device_id": latest.get("device_id"),
+                        "section_id": sec_id,
+                        "operational_mode": op_mode,
+                        "directive_type": latest.get("directive_type", "DIVERSION_GATE"),
+                        "action": act,
+                        "gate_target_angle": g_angle,
+                        "reason": (
+                            f"Verification timeout after {settings.ACTUATOR_VERIFICATION_TIMEOUT_SEC:.0f}s "
+                            "window without observed physical alignment."
+                        ),
+                        "risk_level": latest.get("risk_level", "INFO"),
+                        "emergency_stop": latest.get("emergency_stop", False),
+                        "measured_gate_angle": None,
+                        "measured_gate_state": None,
+                        "execution_divergence_deg": None,
+                        "issuer_type": latest.get("issuer_type", "AUTOMATED_ENGINE"),
+                        "issuer_id": latest.get("issuer_id"),
+                        "correlation_id": latest.get("correlation_id"),
+                        "device_session_epoch": latest.get("device_session_epoch"),
+                        "baseline_device_sequence_number": latest.get("baseline_device_sequence_number"),
+                        "device_sequence_number": None,
+                        "device_uptime_ms": None,
+                        "timestamp": timeout_dt.isoformat(),
+                    }
+                    self.persist_directive_audit_sync(timeout_audit)
+                elif op_mode == "PHYSICAL":
+                    # Recent incomplete PHYSICAL directive (< 30s):
+                    # An incomplete PHYSICAL directive from a previous backend process must NEVER be reactivated.
+                    # Create deterministic CANCELLED event with SAFETY_INTERLOCK and startup_recovery issuer.
+                    cancel_ts = now_utc if now_utc > effective_anchor_dt else (effective_anchor_dt + timedelta(microseconds=1000))
+                    cancel_audit = {
+                        "audit_id": build_startup_cancellation_audit_id(d_id),
+                        "directive_id": d_id,
+                        "event_type": "CANCELLED",
+                        "device_id": latest.get("device_id"),
+                        "section_id": sec_id,
+                        "operational_mode": "PHYSICAL",
+                        "directive_type": latest.get("directive_type", "DIVERSION_GATE"),
+                        "action": act,
+                        "gate_target_angle": g_angle,
+                        "reason": (
+                            "Backend restarted while physical directive was pending verification; "
+                            "cancelled pending directive to prevent unverified physical actuation."
+                        ),
+                        "risk_level": latest.get("risk_level", "INFO"),
+                        "emergency_stop": latest.get("emergency_stop", False),
+                        "measured_gate_angle": None,
+                        "measured_gate_state": None,
+                        "execution_divergence_deg": None,
+                        "issuer_type": DirectiveIssuerType.SAFETY_INTERLOCK.value,
+                        "issuer_id": "startup_recovery",
+                        "correlation_id": latest.get("correlation_id"),
+                        "device_session_epoch": latest.get("device_session_epoch"),
+                        "baseline_device_sequence_number": latest.get("baseline_device_sequence_number"),
+                        "device_sequence_number": None,
+                        "device_uptime_ms": None,
+                        "timestamp": cancel_ts.isoformat(),
+                    }
+                    self.persist_directive_audit_sync(cancel_audit)
+                else:
+                    recovered_directives.append(latest)
+
+        return recovered_directives
+
     def query_incident_by_id_sync(self, incident_id: str) -> Optional[Dict[str, Any]]:
         """
         Authoritative synchronous single incident lookup from PostgreSQL via PostgREST.
@@ -1123,6 +1997,86 @@ class PersistenceRepository:
         except httpx.RequestError as exc:
             logger.error("Query incident by id network error: %s", exc.__class__.__name__)
             raise RuntimeError(f"PostgREST query incident network error: {exc.__class__.__name__}") from exc
+
+    def query_incidents_by_ids_sync(
+        self,
+        incident_ids: Sequence[str],
+        *,
+        max_ids_per_chunk: int = 200,
+        max_query_chars: int = 4000,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Authoritative synchronous bulk incident lookup from PostgreSQL via PostgREST `id=in.(...)`.
+        Deduplicates and validates all IDs, splits into bounded URL-safe chunks (1 request for
+        standard duplicate-queue pages up to 200 typical incident IDs), and raises StorageError
+        on cloud failures to preserve fail-closed semantics.
+        """
+        if not isinstance(max_ids_per_chunk, int) or isinstance(max_ids_per_chunk, bool) or max_ids_per_chunk < 1:
+            raise StorageValidationError("max_ids_per_chunk must be a positive integer.")
+        if not isinstance(max_query_chars, int) or isinstance(max_query_chars, bool) or max_query_chars < 64:
+            raise StorageValidationError("max_query_chars must be at least 64.")
+
+        unique_ids = sorted({_validate_incident_id(inc_id) for inc_id in incident_ids if inc_id is not None})
+        if not unique_ids:
+            return {}
+        if not self._is_configured and not self.is_storage_configured:
+            return {}
+
+        chunks: List[List[str]] = []
+        current_chunk: List[str] = []
+        current_len = 0
+        for inc_id in unique_ids:
+            added_len = len(inc_id) + (1 if current_chunk else 0)
+            if current_chunk and (
+                len(current_chunk) >= max_ids_per_chunk or (current_len + added_len) > max_query_chars
+            ):
+                chunks.append(current_chunk)
+                current_chunk = [inc_id]
+                current_len = len(inc_id)
+            else:
+                current_chunk.append(inc_id)
+                current_len += added_len
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        endpoint = f"{self._supabase_url}/rest/v1/incidents"
+        headers = (
+            self._get_storage_headers(content_type="application/json")
+            if self.is_storage_configured
+            else self._get_headers()
+        )
+        results: Dict[str, Dict[str, Any]] = {}
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                for chunk in chunks:
+                    params = {
+                        "id": f"in.({','.join(chunk)})",
+                        "select": "*",
+                    }
+                    resp = client.get(endpoint, headers=headers, params=params)
+                    if resp.status_code in (200, 206):
+                        rows = resp.json()
+                        if not isinstance(rows, list):
+                            raise StorageError("PostgREST bulk incident query returned invalid JSON shape.")
+                        for row in rows:
+                            if isinstance(row, dict) and row.get("id"):
+                                results[str(row["id"])] = row
+                        continue
+                    if resp.status_code in (401, 403):
+                        raise StorageError(
+                            f"PostgREST bulk incident query unauthorized: HTTP {resp.status_code}",
+                            error_category="AUTH_ERROR",
+                        )
+                    logger.error("Bulk query incidents failed with HTTP %s", resp.status_code)
+                    raise StorageError(f"PostgREST bulk incident query failed with HTTP {resp.status_code}")
+            return results
+        except StorageError:
+            raise
+        except httpx.RequestError as exc:
+            logger.error("Bulk query incidents network error: %s", exc.__class__.__name__)
+            raise StorageError(
+                f"PostgREST bulk incident query network error: {exc.__class__.__name__}"
+            ) from exc
 
     def query_incidents_by_photo_entry_sync(self, photo_name: str) -> List[Dict[str, Any]]:
         """
@@ -1376,6 +2330,7 @@ class PersistenceRepository:
         reporter_name: str,
         photos: List[str],
         audit_id: str,
+        origin_operational_mode: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Executes the atomic citizen incident creation RPC.
@@ -1407,6 +2362,7 @@ class PersistenceRepository:
             "p_reporter_name": reporter_name,
             "p_photos": photos,
             "p_audit_id": audit_id,
+            "p_origin_operational_mode": origin_operational_mode,
         }
 
         try:
@@ -1488,12 +2444,19 @@ class PersistenceRepository:
 
     def _ensure_storage_configured(self) -> None:
         """
-        Ensures Supabase Storage is configured with required URL and service_role key.
-        Private evidence operations must NEVER execute under anon key.
+        Ensures Supabase Storage is configured with required URL and validated service_role key.
+        Private evidence and directive audit operations must NEVER execute under anon key.
         """
         if not self.is_storage_configured:
+            if self._config_conflict_reason:
+                detail = self._config_conflict_reason
+            else:
+                _, detail = inspect_service_role_credential(
+                    self._supabase_service_role_key,
+                    self._supabase_key,
+                )
             raise StorageNotConfiguredError(
-                "Supabase Storage requires service-role credentials. Anon key cannot be used for private evidence operations."
+                f"Supabase Storage requires service-role credentials. {detail}"
             )
 
     def _get_storage_headers(
@@ -2292,49 +3255,104 @@ class PersistenceRepository:
                     try:
                         return resp.json()
                     except ValueError as exc:
-                        raise StorageError(f"RPC {rpc_name} returned invalid JSON.") from exc
+                        raise StorageError(
+                            "Database service returned an invalid response payload.",
+                            error_category="INVALID_JSON",
+                        ) from exc
 
                 try:
                     error_body = resp.json()
                 except ValueError:
                     error_body = {}
 
-                error_code = (
+                raw_code = (
                     error_body.get("code")
                     if isinstance(error_body, dict)
                     else None
                 )
-                error_msg = (
-                    error_body.get("message")
-                    if isinstance(error_body, dict)
-                    else resp.text
+                error_code = str(raw_code).strip() if raw_code else ""
+
+                logger.error(
+                    "Database RPC error: rpc=%s http_status=%s sqlstate=%s",
+                    rpc_name,
+                    resp.status_code,
+                    error_code or "UNKNOWN",
                 )
 
                 if resp.status_code == 404 and error_code == "PGRST202":
                     raise StorageError(
-                        f"RPC {rpc_name} is unavailable. Check function and schema cache."
+                        "Database service function is currently unavailable.",
+                        sqlstate=error_code,
+                        error_category="RPC_UNAVAILABLE",
                     )
-                if resp.status_code == 409 or error_code == "23505":
+                if error_code == "P0412":
+                    raise StorageLeaseLostError(
+                        "Processing lease is expired or no longer owned.",
+                        sqlstate="P0412",
+                        error_category="LEASE_LOST",
+                    )
+                if error_code == "02000":
+                    raise StorageNotFoundError(
+                        "Requested record was not found.",
+                        sqlstate="02000",
+                        error_category="NOT_FOUND",
+                    )
+                if error_code == "42501":
+                    raise PermissionError(
+                        "Operation is not permitted for the current credentials."
+                    )
+                if error_code == "23505":
                     raise StorageConflictError(
-                        f"RPC {rpc_name} conflict: {error_msg}"
+                        "Operation conflicts with an existing record.",
+                        sqlstate="23505",
+                        error_category="UNIQUE_VIOLATION",
+                    )
+                if error_code == "23514":
+                    raise StorageConflictError(
+                        "Operation conflicts with current record state or constraints.",
+                        sqlstate="23514",
+                        error_category="CHECK_OR_STATE_CONFLICT",
+                    )
+                if error_code == "55P03":
+                    raise StorageConflictError(
+                        "Resource is temporarily locked by another operation.",
+                        sqlstate="55P03",
+                        error_category="LOCK_CONFLICT",
+                    )
+                if resp.status_code == 409:
+                    raise StorageConflictError(
+                        "Operation conflicts with current resource state.",
+                        sqlstate=error_code or None,
+                        error_category="CONFLICT",
                     )
                 if error_code == "22023":
                     raise StorageValidationError(
-                        f"RPC {rpc_name} validation error: {error_msg}"
+                        "Request parameters failed validation.",
+                        sqlstate="22023",
+                        error_category="VALIDATION_ERROR",
+                    )
+                if error_code in ("23503", "23001"):
+                    raise StorageValidationError(
+                        "Referenced record does not exist or cannot be modified.",
+                        sqlstate=error_code,
+                        error_category="FOREIGN_KEY_VIOLATION",
                     )
 
-                logger.error(
-                    "RPC %s failed with HTTP %s: %s",
-                    rpc_name,
-                    resp.status_code,
-                    error_msg,
-                )
                 raise StorageError(
-                    f"RPC {rpc_name} failed with HTTP {resp.status_code}: {error_msg}"
+                    "Database operation failed.",
+                    sqlstate=error_code or None,
+                    error_category="RPC_ERROR",
                 )
         except httpx.RequestError as exc:
-            logger.error("RPC %s network error: %s", rpc_name, exc.__class__.__name__)
-            raise StorageError(f"RPC {rpc_name} network error: {exc.__class__.__name__}") from exc
+            logger.error(
+                "Database RPC network error: rpc=%s error_type=%s",
+                rpc_name,
+                exc.__class__.__name__,
+            )
+            raise StorageError(
+                "Database service is temporarily unreachable.",
+                error_category="NETWORK_ERROR",
+            ) from exc
 
     def reserve_photo_attachment_sync(
         self,
@@ -3036,6 +4054,104 @@ class PersistenceRepository:
             "uncertain_paths": uncertain_paths,
         }
 
+    def query_expired_cleanup_operations_sync(
+        self,
+        limit: int = 10,
+        exclude_cleanup_ids: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, str]]:
+        """
+        Read-only discovery of storage cleanup operations whose lease has expired and which are
+        not yet terminal (status PENDING / PARTIAL / UNCERTAIN), oldest lease expiry first.
+
+        This is a DISCOVERY helper only. It never deletes anything and never decides which
+        objects may be deleted: every returned operation must still be claimed through
+        `execute_cleanup_recovery_workflow_sync`, whose claim RPC re-validates lease expiry,
+        idempotency-key state and registry reference counts under row locks on the database
+        clock. The local-clock cutoff used here can therefore only affect WHEN an operation
+        is noticed, never whether an object is deleted.
+
+        Returns a list of dicts with keys cleanup_id, incident_id, idempotency_key, scope.
+        Rows failing identifier validation are skipped. At most 100 rows are returned.
+        """
+        self._ensure_storage_configured()
+        if not isinstance(limit, int) or isinstance(limit, bool) or not (1 <= limit <= 100):
+            raise StorageValidationError("limit must be an integer between 1 and 100.")
+
+        excluded: List[str] = []
+        for cid in list(exclude_cleanup_ids or [])[:30]:
+            if not isinstance(cid, str) or not CLEANUP_ID_PATTERN.match(cid):
+                raise StorageValidationError("Invalid excluded cleanup ID format.")
+            excluded.append(cid)
+
+        cutoff = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        params: List[Tuple[str, str]] = [
+            ("select", "cleanup_id,incident_id,idempotency_key,scope"),
+            ("status", "in.(PENDING,PARTIAL,UNCERTAIN)"),
+            ("expires_at", f"lt.{cutoff}"),
+            ("order", "expires_at.asc,cleanup_id.asc"),
+            ("limit", str(limit)),
+        ]
+        if excluded:
+            params.append(("cleanup_id", f"not.in.({','.join(excluded)})"))
+
+        endpoint = f"{self._supabase_url}/rest/v1/storage_cleanup_operations"
+        headers = self._get_storage_headers(content_type="application/json")
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.get(endpoint, headers=headers, params=params)
+        except httpx.RequestError as exc:
+            raise StorageError(
+                f"Expired cleanup discovery network error: {exc.__class__.__name__}"
+            ) from exc
+
+        if resp.status_code in (401, 403):
+            raise StorageError(
+                f"Expired cleanup discovery unauthorized: HTTP {resp.status_code}",
+                error_category="AUTH_ERROR",
+            )
+        if resp.status_code != 200:
+            raise StorageError(
+                f"Expired cleanup discovery failed: HTTP {resp.status_code}"
+            )
+        try:
+            rows = resp.json()
+        except ValueError as exc:
+            raise StorageError("Expired cleanup discovery returned invalid JSON.") from exc
+        if not isinstance(rows, list):
+            raise StorageError("Expired cleanup discovery returned invalid JSON shape.")
+
+        result: List[Dict[str, str]] = []
+        skipped = 0
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
+            cid = row.get("cleanup_id")
+            inc = row.get("incident_id")
+            key = row.get("idempotency_key")
+            scope = row.get("scope")
+            if (
+                isinstance(cid, str) and CLEANUP_ID_PATTERN.match(cid)
+                and isinstance(inc, str) and INCIDENT_ID_PATTERN.match(inc)
+                and isinstance(key, str) and IDEMPOTENCY_KEY_PATTERN.match(key)
+                and isinstance(scope, str) and re.match(r"^[A-Za-z0-9_.:-]{1,64}$", scope)
+            ):
+                result.append(
+                    {
+                        "cleanup_id": cid,
+                        "incident_id": inc,
+                        "idempotency_key": key,
+                        "scope": scope,
+                    }
+                )
+            else:
+                skipped += 1
+        if skipped:
+            logger.warning(
+                "Expired cleanup discovery skipped %d row(s) with invalid identifiers.", skipped
+            )
+        return result
+
     def check_and_increment_rate_limit_sync(
         self, key_hash: str, action: str, limit: int, window_sec: int
     ) -> Dict[str, Any]:
@@ -3078,6 +4194,421 @@ class PersistenceRepository:
             "p_window_sec": window_sec,
         }
         return self._call_rpc_sync("check_and_increment_rate_limit_rpc", payload)
+
+    def claim_duplicate_scan_jobs_sync(
+        self,
+        lease_owner: str,
+        incident_id: Optional[str] = None,
+        batch_size: int = 10,
+        lease_sec: int = 60,
+    ) -> List[Dict[str, Any]]:
+        self._ensure_storage_configured()
+        if not isinstance(lease_owner, str) or not DUP_LEASE_PATTERN.match(lease_owner.strip()):
+            raise StorageValidationError(
+                "lease_owner must match 'dup_lease_<32 lowercase hex characters>'."
+            )
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or not (1 <= batch_size <= 100):
+            raise StorageValidationError("batch_size must be an integer between 1 and 100.")
+        if not isinstance(lease_sec, int) or isinstance(lease_sec, bool) or not (5 <= lease_sec <= 3600):
+            raise StorageValidationError("lease_sec must be an integer between 5 and 3600.")
+        clean_inc_id = _validate_incident_id(incident_id) if incident_id is not None else None
+
+        payload = {
+            "p_lease_owner": lease_owner.strip(),
+            "p_incident_id": clean_inc_id,
+            "p_batch_size": batch_size,
+            "p_lease_sec": lease_sec,
+        }
+        res = self._call_rpc_sync("claim_duplicate_scan_jobs_rpc", payload)
+        return res if isinstance(res, list) else []
+
+    def fetch_duplicate_candidates_sync(
+        self,
+        incident_id: str,
+        max_radius_m: float = 150.0,
+        time_window_sec: int = 21600,
+        allowed_categories: Optional[List[str]] = None,
+        include_resolved: bool = False,
+        match_citizen_physical_sensor: bool = True,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        self._ensure_storage_configured()
+        clean_inc_id = _validate_incident_id(incident_id)
+        if (
+            not isinstance(max_radius_m, (int, float))
+            or isinstance(max_radius_m, bool)
+            or not (0.0 < float(max_radius_m) <= 10000.0)
+        ):
+            raise StorageValidationError("max_radius_m must be between 0 and 10000 meters.")
+        if (
+            not isinstance(time_window_sec, int)
+            or isinstance(time_window_sec, bool)
+            or not (60 <= time_window_sec <= 2_592_000)
+        ):
+            raise StorageValidationError("time_window_sec must be an integer between 60 and 2592000.")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not (1 <= limit <= 200):
+            raise StorageValidationError("limit must be an integer between 1 and 200.")
+
+        payload = {
+            "p_incident_id": clean_inc_id,
+            "p_max_radius_m": float(max_radius_m),
+            "p_time_window_sec": time_window_sec,
+            "p_allowed_categories": list(allowed_categories) if allowed_categories else [],
+            "p_include_resolved": bool(include_resolved),
+            "p_match_citizen_physical_sensor": bool(match_citizen_physical_sensor),
+            "p_limit": limit,
+        }
+        res = self._call_rpc_sync("fetch_duplicate_candidates_rpc", payload)
+        if not isinstance(res, dict):
+            raise StorageError("fetch_duplicate_candidates_rpc returned invalid JSON shape.")
+        return {
+            "source_incident": res.get("source_incident"),
+            "candidates": res.get("candidates") if isinstance(res.get("candidates"), list) else [],
+        }
+
+    def record_duplicate_candidates_sync(
+        self,
+        incident_id: str,
+        detected_in_mode: str,
+        candidates: List[Dict[str, Any]],
+        lease_owner: str,
+    ) -> Dict[str, Any]:
+        self._ensure_storage_configured()
+        clean_inc_id = _validate_incident_id(incident_id)
+        clean_mode = (detected_in_mode or "").strip().upper()
+        if clean_mode not in ALLOWED_OPERATIONAL_MODES:
+            raise StorageValidationError(
+                "detected_in_mode must be 'SIMULATION', 'PHYSICAL', or 'SAFE_HOLD'."
+            )
+        if not isinstance(lease_owner, str) or not DUP_LEASE_PATTERN.match(lease_owner.strip()):
+            raise StorageValidationError(
+                "lease_owner must match 'dup_lease_<32 lowercase hex characters>'."
+            )
+        if not isinstance(candidates, list):
+            raise StorageValidationError("candidates must be a list.")
+
+        payload = {
+            "p_incident_id": clean_inc_id,
+            "p_detected_in_mode": clean_mode,
+            "p_candidates": candidates,
+            "p_lease_owner": lease_owner.strip(),
+        }
+        res = self._call_rpc_sync("record_duplicate_candidates_rpc", payload)
+        if not isinstance(res, dict):
+            raise StorageError("record_duplicate_candidates_rpc returned invalid JSON shape.")
+        return res
+
+    def release_duplicate_scan_job_sync(
+        self,
+        incident_id: str,
+        lease_owner: str,
+        error_code: str,
+        backoff_sec: Optional[int] = None,
+        permanent: bool = False,
+    ) -> Dict[str, Any]:
+        self._ensure_storage_configured()
+        clean_inc_id = _validate_incident_id(incident_id)
+        if not isinstance(lease_owner, str) or not DUP_LEASE_PATTERN.match(lease_owner.strip()):
+            raise StorageValidationError(
+                "lease_owner must match 'dup_lease_<32 lowercase hex characters>'."
+            )
+        if not isinstance(error_code, str) or not error_code.strip():
+            raise StorageValidationError("error_code must be a non-empty string.")
+        if backoff_sec is not None and (
+            not isinstance(backoff_sec, int)
+            or isinstance(backoff_sec, bool)
+            or not (1 <= backoff_sec <= 86400)
+        ):
+            raise StorageValidationError("backoff_sec must be between 1 and 86400 seconds.")
+
+        payload = {
+            "p_incident_id": clean_inc_id,
+            "p_lease_owner": lease_owner.strip(),
+            "p_error_code": error_code.strip()[:64],
+            "p_backoff_sec": backoff_sec,
+            "p_permanent": bool(permanent),
+        }
+        res = self._call_rpc_sync("release_duplicate_scan_job_rpc", payload)
+        if not isinstance(res, dict):
+            raise StorageError("release_duplicate_scan_job_rpc returned invalid JSON shape.")
+        return res
+
+    def reset_duplicate_scan_job_sync(
+        self,
+        incident_id: str,
+        actor_id: str,
+        actor_role: str,
+        reason: str = "Manual duplicate scan job reset",
+    ) -> Dict[str, Any]:
+        self._ensure_storage_configured()
+        clean_inc_id = _validate_incident_id(incident_id)
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            raise StorageValidationError("actor_id must be a non-empty string.")
+        clean_role = actor_role.strip().lower() if isinstance(actor_role, str) else ""
+        if clean_role not in ALLOWED_DUPLICATE_REVIEW_ROLES:
+            raise StorageValidationError(
+                "actor_role must be 'municipality', 'admin', or 'service_role'."
+            )
+
+        payload = {
+            "p_incident_id": clean_inc_id,
+            "p_actor_id": actor_id.strip()[:128],
+            "p_actor_role": clean_role,
+            "p_reason": reason.strip()[:500] if isinstance(reason, str) and reason.strip() else "Manual duplicate scan job reset",
+        }
+        res = self._call_rpc_sync("reset_duplicate_scan_job_rpc", payload)
+        if not isinstance(res, dict):
+            raise StorageError("reset_duplicate_scan_job_rpc returned invalid JSON shape.")
+        return res
+
+    def review_incident_duplicate_link_sync(
+        self,
+        link_id: str,
+        target_status: str,
+        actor_id: str,
+        actor_role: str,
+        reason: str,
+        audit_id_low: str,
+        audit_id_high: str,
+        primary_incident_id: Optional[str] = None,
+        internal_notes: Optional[str] = None,
+        override: bool = False,
+        expected_version: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_storage_configured()
+        if not isinstance(link_id, str) or not DUP_LINK_ID_PATTERN.match(link_id.strip()):
+            raise StorageValidationError("link_id must be 5-32 alphanumeric/underscore/hyphen characters.")
+        clean_status = target_status.strip().upper() if isinstance(target_status, str) else ""
+        if clean_status not in ("CONFIRMED", "DISMISSED"):
+            raise StorageValidationError("target_status must be 'CONFIRMED' or 'DISMISSED'.")
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            raise StorageValidationError("actor_id must be a non-empty string.")
+        clean_role = actor_role.strip().lower() if isinstance(actor_role, str) else ""
+        if clean_role not in ALLOWED_DUPLICATE_REVIEW_ROLES:
+            raise StorageValidationError(
+                "actor_role must be 'municipality', 'admin', or 'service_role' for duplicate review."
+            )
+        clean_reason = reason.strip() if isinstance(reason, str) else ""
+        if len(clean_reason) < 3 or len(clean_reason) > 500:
+            raise StorageValidationError("reason must be between 3 and 500 characters.")
+        clean_audit_low = _validate_audit_id(audit_id_low)
+        clean_audit_high = _validate_audit_id(audit_id_high)
+        if clean_audit_low == clean_audit_high:
+            raise StorageValidationError("audit_id_low and audit_id_high must be distinct.")
+        clean_primary = (
+            _validate_incident_id(primary_incident_id)
+            if primary_incident_id is not None
+            else None
+        )
+        if clean_status == "CONFIRMED" and not clean_primary:
+            raise StorageValidationError("primary_incident_id is required when target_status is 'CONFIRMED'.")
+        if expected_version is not None and (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise StorageValidationError("expected_version must be a non-negative integer.")
+
+        payload = {
+            "p_link_id": link_id.strip(),
+            "p_target_status": clean_status,
+            "p_actor_id": actor_id.strip()[:128],
+            "p_actor_role": clean_role,
+            "p_reason": clean_reason,
+            "p_audit_id_low": clean_audit_low,
+            "p_audit_id_high": clean_audit_high,
+            "p_primary_incident_id": clean_primary,
+            "p_internal_notes": internal_notes.strip()[:1000] if isinstance(internal_notes, str) and internal_notes.strip() else None,
+            "p_override": bool(override),
+            "p_expected_version": expected_version,
+        }
+        res = self._call_rpc_sync("review_incident_duplicate_link_rpc", payload)
+        if not isinstance(res, dict):
+            raise StorageError("review_incident_duplicate_link_rpc returned invalid JSON shape.")
+        return res
+
+    def query_duplicate_links_sync(
+        self,
+        link_status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Queries a deterministically ordered page (`created_at.desc,link_id.asc`) of duplicate
+        links from PostgREST with `Prefer: count=exact`.
+
+        HTTP 416 contract:
+        - If Content-Range provides an exact total `N` and `offset >= N` (valid out-of-range page
+          or empty dataset `*/0`), returns `([], N)`.
+        - If Content-Range lacks an exact total or `offset < N` (malformed or invalid range error),
+          raises StorageError instead of silently converting a failure into an empty result.
+        """
+        self._ensure_storage_configured()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
+            raise StorageValidationError("limit must be an integer between 1 and 100.")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise StorageValidationError("offset must be a non-negative integer.")
+
+        endpoint = f"{self._supabase_url}/rest/v1/incident_duplicate_links"
+        headers = self._get_storage_headers(content_type="application/json")
+        headers["Prefer"] = "count=exact"
+        headers["Range-Unit"] = "items"
+        headers["Range"] = f"{offset}-{offset + limit - 1}"
+
+        params: Dict[str, str] = {
+            "select": "*",
+            "order": "created_at.desc,link_id.asc",
+        }
+        if link_status is not None:
+            clean_status = link_status.strip().upper()
+            if clean_status not in ALLOWED_DUPLICATE_LINK_STATUSES:
+                raise StorageValidationError(
+                    "link_status must be 'SUSPECTED', 'CONFIRMED', or 'DISMISSED'."
+                )
+            params["link_status"] = f"eq.{clean_status}"
+
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.get(endpoint, headers=headers, params=params)
+                if resp.status_code in (200, 206):
+                    items = resp.json()
+                    if not isinstance(items, list):
+                        raise StorageError("Duplicate links query returned invalid JSON shape.")
+                    exact_total = _parse_postgrest_content_range_total(resp.headers.get("Content-Range"))
+                    if exact_total is not None:
+                        return items, exact_total
+                    if offset == 0 and len(items) < limit:
+                        return items, len(items)
+                    raise StorageError(
+                        "Duplicate links query missing exact Content-Range total.",
+                        error_category="RANGE_ERROR",
+                    )
+                if resp.status_code == 416:
+                    exact_total = _parse_postgrest_content_range_total(resp.headers.get("Content-Range"))
+                    if exact_total is None:
+                        raise StorageError(
+                            "Duplicate links query failed with HTTP 416 and missing exact Content-Range total.",
+                            error_category="RANGE_ERROR",
+                        )
+                    if offset < exact_total:
+                        raise StorageError(
+                            "Duplicate links query rejected in-bounds range with HTTP 416.",
+                            error_category="RANGE_ERROR",
+                        )
+                    return [], exact_total
+                if resp.status_code == 400:
+                    raise StorageValidationError(
+                        "Duplicate links query rejected with HTTP 400.",
+                        error_category="VALIDATION_ERROR",
+                    )
+                if resp.status_code in (401, 403):
+                    raise StorageError(
+                        f"Duplicate links query unauthorized: HTTP {resp.status_code}",
+                        error_category="AUTH_ERROR",
+                    )
+                raise StorageError(f"Failed to query duplicate links: HTTP {resp.status_code}")
+        except StorageError:
+            raise
+        except httpx.RequestError as exc:
+            raise StorageError(f"Duplicate links query network error: {exc.__class__.__name__}") from exc
+
+    def query_duplicate_link_counts_sync(
+        self,
+        *,
+        known_status_counts: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, int]:
+        """
+        Computes exact PostgreSQL counts for SUSPECTED, CONFIRMED, and DISMISSED duplicate
+        links using PostgREST HEAD queries with `Prefer: count=exact` (zero row payload,
+        no 1,000-row cap). Reuses any pre-supplied status count to avoid duplicate requests.
+
+        Concurrency note: each status count is an exact PostgreSQL `COUNT(*)` at query
+        execution time rather than a single cross-HTTP snapshot.
+        """
+        self._ensure_storage_configured()
+        endpoint = f"{self._supabase_url}/rest/v1/incident_duplicate_links"
+        base_headers = self._get_storage_headers(content_type="application/json")
+        base_headers["Prefer"] = "count=exact"
+
+        counts: Dict[str, int] = {}
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                for status_val in ("SUSPECTED", "CONFIRMED", "DISMISSED"):
+                    if known_status_counts is not None and status_val in known_status_counts:
+                        known_val = known_status_counts[status_val]
+                        if isinstance(known_val, int) and not isinstance(known_val, bool) and known_val >= 0:
+                            counts[status_val] = known_val
+                            continue
+
+                    resp = client.head(
+                        endpoint,
+                        headers=base_headers,
+                        params={
+                            "select": "link_id",
+                            "link_status": f"eq.{status_val}",
+                        },
+                    )
+                    if resp.status_code in (200, 206):
+                        exact_count = _parse_postgrest_content_range_total(resp.headers.get("Content-Range"))
+                        if exact_count is None:
+                            raise StorageError(
+                                "Duplicate link count query missing exact Content-Range total.",
+                                error_category="RANGE_ERROR",
+                            )
+                        counts[status_val] = exact_count
+                        continue
+                    if resp.status_code == 416:
+                        exact_count = _parse_postgrest_content_range_total(resp.headers.get("Content-Range"))
+                        if exact_count == 0:
+                            counts[status_val] = 0
+                            continue
+                        raise StorageError(
+                            "Duplicate link count query failed with HTTP 416.",
+                            error_category="RANGE_ERROR",
+                        )
+                    if resp.status_code in (401, 403):
+                        raise StorageError(
+                            f"Duplicate link count query unauthorized: HTTP {resp.status_code}",
+                            error_category="AUTH_ERROR",
+                        )
+                    raise StorageError(f"Failed to count duplicate links: HTTP {resp.status_code}")
+            return counts
+        except StorageError:
+            raise
+        except httpx.RequestError as exc:
+            raise StorageError(f"Duplicate link count query network error: {exc.__class__.__name__}") from exc
+
+    def query_duplicate_links_for_incident_sync(
+        self,
+        incident_id: str,
+    ) -> List[Dict[str, Any]]:
+        self._ensure_storage_configured()
+        clean_inc_id = _validate_incident_id(incident_id)
+        endpoint = f"{self._supabase_url}/rest/v1/incident_duplicate_links"
+        headers = self._get_storage_headers(content_type="application/json")
+        params = {
+            "select": "*",
+            "or": f"(incident_low_id.eq.{clean_inc_id},incident_high_id.eq.{clean_inc_id})",
+            "order": "created_at.desc,link_id.asc",
+        }
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as client:
+                resp = client.get(endpoint, headers=headers, params=params)
+                if resp.status_code in (200, 206):
+                    rows = resp.json()
+                    if not isinstance(rows, list):
+                        raise StorageError("Incident duplicate links query returned invalid JSON shape.")
+                    return rows
+                if resp.status_code in (401, 403):
+                    raise StorageError(
+                        f"Incident duplicate links query unauthorized: HTTP {resp.status_code}",
+                        error_category="AUTH_ERROR",
+                    )
+                raise StorageError(f"Failed to query duplicate links for incident: HTTP {resp.status_code}")
+        except StorageError:
+            raise
+        except httpx.RequestError as exc:
+            raise StorageError(f"Incident duplicate links query network error: {exc.__class__.__name__}") from exc
 
 
 # Global persistence client instance
