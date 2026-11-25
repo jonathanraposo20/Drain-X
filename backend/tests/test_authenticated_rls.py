@@ -298,3 +298,77 @@ def test_algorithm_support_and_rejection():
         verify_supabase_jwt(tok_none)
 
     assert "401" in str(exc_none)
+
+
+def test_status_history_requires_municipality_or_admin(auth_client: TestClient):
+    """Operational history is unavailable to anonymous and citizen callers."""
+    anonymous = auth_client.get("/api/v1/status/mode/history")
+    assert anonymous.status_code == 401
+
+    citizen_token = _craft_test_jwt({
+        "sub": "status-history-citizen",
+        "exp": time.time() + 3600,
+        "app_metadata": {"role": "citizen"},
+        "aud": "authenticated",
+    })
+    citizen = auth_client.get(
+        "/api/v1/status/mode/history",
+        headers={"Authorization": f"Bearer {citizen_token}"},
+    )
+    assert citizen.status_code == 403
+
+    municipality_token = _craft_test_jwt({
+        "sub": "status-history-municipality",
+        "exp": time.time() + 3600,
+        "app_metadata": {"role": "municipality"},
+        "aud": "authenticated",
+    })
+    municipality = auth_client.get(
+        "/api/v1/status/mode/history",
+        headers={"Authorization": f"Bearer {municipality_token}"},
+    )
+    assert municipality.status_code == 200
+    assert "history" in municipality.json()
+
+
+def test_operational_state_mutation_requires_municipality_or_admin(auth_client: TestClient):
+    """Only municipality/admin roles may mutate the operational state."""
+    from app.models.contracts import SystemOperationalState
+
+    original_state = state_store.operational_state
+
+    anonymous = auth_client.post(
+        "/api/v1/status/state",
+        json={"operational_state": "MONITORING"},
+    )
+    assert anonymous.status_code == 401
+    assert state_store.operational_state == original_state
+
+    citizen_token = _craft_test_jwt({
+        "sub": "status-state-citizen",
+        "exp": time.time() + 3600,
+        "app_metadata": {"role": "citizen"},
+        "aud": "authenticated",
+    })
+    citizen = auth_client.post(
+        "/api/v1/status/state",
+        headers={"Authorization": f"Bearer {citizen_token}"},
+        json={"operational_state": "MONITORING"},
+    )
+    assert citizen.status_code == 403
+    assert state_store.operational_state == original_state
+
+    municipality_token = _craft_test_jwt({
+        "sub": "status-state-municipality",
+        "exp": time.time() + 3600,
+        "app_metadata": {"role": "municipality"},
+        "aud": "authenticated",
+    })
+    municipality = auth_client.post(
+        "/api/v1/status/state",
+        headers={"Authorization": f"Bearer {municipality_token}"},
+        json={"operational_state": "MONITORING"},
+    )
+    assert municipality.status_code == 200
+    assert municipality.json()["operational_state"] == SystemOperationalState.MONITORING
+    state_store.operational_state = original_state
