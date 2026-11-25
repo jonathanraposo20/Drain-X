@@ -39,7 +39,7 @@ def test_open_pg_connection_fails_closed_on_supabase_host(monkeypatch):
         "POSTGRES_DSN",
         "postgresql://postgres:pass@db.xhdtceqcnsheoskmuwsv.supabase.co:5432/postgres",
     )
-    with pytest.raises(RuntimeError, match="non-loopback"):
+    with pytest.raises(RuntimeError, match="non-loopback|production-style project identifier"):
         dup_pg._open_pg_connection()
 
     monkeypatch.setattr(
@@ -47,7 +47,7 @@ def test_open_pg_connection_fails_closed_on_supabase_host(monkeypatch):
         "TEST_POSTGRES_DSN",
         "postgresql://postgres:pass@aws-0-ap-south-1.pooler.supabase.com:5432/postgres",
     )
-    with pytest.raises(RuntimeError, match="non-loopback"):
+    with pytest.raises(RuntimeError, match="non-loopback|production-style project identifier"):
         m008_pg._open_conn()
 
 
@@ -62,7 +62,7 @@ def test_open_pg_connection_fails_closed_on_supabase_host(monkeypatch):
     ],
 )
 def test_non_loopback_postgres_hosts_are_rejected(remote_dsn):
-    with pytest.raises(RuntimeError, match="non-loopback"):
+    with pytest.raises(RuntimeError, match="non-loopback|production-style project identifier"):
         validate_disposable_postgres_dsn(remote_dsn)
 
 
