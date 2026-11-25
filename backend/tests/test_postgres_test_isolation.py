@@ -59,6 +59,11 @@ def test_open_pg_connection_fails_closed_on_supabase_host(monkeypatch):
         "host=10.0.0.12 port=5432 dbname=testdb user=postgres",
         "host=host.docker.internal port=5432 dbname=testdb user=postgres",
         "postgresql://user:pass@127.0.0.1.example.com:5432/testdb",
+        "postgresql://user:pass@db.example.com:5432/testdb?host=127.0.0.1",
+        "postgresql://user:pass@localhost:5432/testdb?host=db.example.supabase.co",
+        "host=db.example.supabase.co,127.0.0.1 port=5432 dbname=testdb user=postgres",
+        "host=localhost port=5432 dbname=testdb user=postgres host=db.example.com",
+        "host=db.example.supabase.co. port=5432 dbname=testdb user=postgres",
     ],
 )
 def test_non_loopback_postgres_hosts_are_rejected(remote_dsn):
@@ -72,6 +77,12 @@ def test_loopback_ipv6_and_localhost_are_accepted():
     )
     assert validate_disposable_postgres_dsn(
         "host=localhost port=5432 dbname=drainx_test user=postgres"
+    )
+    assert validate_disposable_postgres_dsn(
+        "postgresql://postgres:postgres@localhost:5432/drainx_test?host=127.0.0.1"
+    )
+    assert validate_disposable_postgres_dsn(
+        "host=localhost. port=5432 dbname=drainx_test user=postgres"
     )
 
 
