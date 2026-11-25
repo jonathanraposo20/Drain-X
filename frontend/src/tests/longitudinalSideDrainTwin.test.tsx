@@ -712,4 +712,41 @@ describe('LongitudinalSideDrainTwin Component', () => {
     const offlineBanner = container.querySelector('#hardwareOfflineBanner');
     expect(offlineBanner).toBeTruthy();
   });
+
+  it('keeps telemetry in a dedicated side panel without covering the physical model', () => {
+    const { container } = render(
+      <LongitudinalSideDrainTwin
+        upstreamDepth={6.8}
+        inflow={10.0}
+        mode="SIMULATION"
+      />
+    );
+
+    const panel = screen.getByTestId('telemetry-side-panel');
+    expect(panel).toBeTruthy();
+    expect(panel.tagName.toLowerCase()).toBe('aside');
+    expect(container.querySelector('svg')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /TELEMETRY ON/i }));
+    expect(screen.queryByTestId('telemetry-side-panel')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /TELEMETRY OFF/i }));
+    expect(screen.getByTestId('telemetry-side-panel')).toBeTruthy();
+  });
+
+  it('keeps the telemetry side panel visible in the SCADA DigitalTwin prototype view', () => {
+    render(
+      <DigitalTwin
+        upstreamDepth={7.4}
+        weirHead={1.5}
+        pumpInflow={12.8}
+        mechanism={dummyMechanism}
+        blockage={null}
+        prediction={null}
+        mode="SIMULATION"
+      />
+    );
+
+    expect(screen.getByTestId('telemetry-side-panel')).toBeTruthy();
+    expect(screen.getByText('SCADA TWIN DISPLAY MODE:')).toBeTruthy();
+  });
 });
