@@ -257,7 +257,7 @@ void main() {
     ));
 
     var apiCalls = 0;
-    auth.httpClient = MockClient((request) async {
+    final mockClient = MockClient((request) async {
       if (request.url.path == '/auth/v1/token') {
         return http.Response(
           jsonEncode(authResponse(
@@ -275,7 +275,8 @@ void main() {
       return http.Response('[]', 200);
     });
 
-    final api = ApiClient(httpClient: auth.httpClient, authService: auth);
+    auth.httpClient = mockClient;
+    final api = ApiClient(httpClient: mockClient, authService: auth);
     final incidents = await api.getIncidents();
 
     expect(incidents, isEmpty);
