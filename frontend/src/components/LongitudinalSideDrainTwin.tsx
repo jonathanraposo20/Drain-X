@@ -107,6 +107,7 @@ export const LongitudinalSideDrainTwin: React.FC<LongitudinalSideDrainTwinProps>
   const [acrylicOpacity, setAcrylicOpacity] = useState<number>(0.35);
   const [showDimensions, setShowDimensions] = useState<boolean>(true);
   const [showCallouts, setShowCallouts] = useState<boolean>(true);
+  const [showTelemetry, setShowTelemetry] = useState<boolean>(true);
 
   // 3. Simulation State Machine
   const [simState, setSimState] = useState<SimulationState>('NORMAL_FLOW');
@@ -851,8 +852,23 @@ export const LongitudinalSideDrainTwin: React.FC<LongitudinalSideDrainTwinProps>
           >
             LABELS
           </button>
+
+          <button
+            type="button"
+            onClick={() => setShowTelemetry((visible) => !visible)}
+            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+              showTelemetry ? 'bg-cyan-950 text-cyan-300 border border-cyan-800' : 'bg-slate-800 text-slate-400 border border-slate-700'
+            }`}
+            aria-expanded={showTelemetry}
+            aria-controls="physical-twin-telemetry"
+          >
+            TELEMETRY {showTelemetry ? 'ON' : 'OFF'}
+          </button>
         </div>
 
+        {/* Model canvas and telemetry are separate layout columns; telemetry never covers the model. */}
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_280px] gap-3 p-3 pt-14 items-start">
+          <div className="min-w-0 rounded border border-slate-800/70 bg-[#05080f] overflow-hidden">
         {/* SVG Drawing Canvas */}
         <svg
           viewBox={`0 0 ${svgWidth} ${svgHeight}`}
@@ -2005,9 +2021,10 @@ export const LongitudinalSideDrainTwin: React.FC<LongitudinalSideDrainTwinProps>
             </g>
           )}
         </svg>
+          </div>
 
-        {/* Real-time Telemetry & Sensor Readout Overlay (Bottom-Left) */}
-        <div className="absolute bottom-3 left-3 z-10 bg-slate-950/85 backdrop-blur border border-slate-800 p-3 rounded-lg shadow-xl font-mono text-xs max-w-md">
+        {showTelemetry ? (
+        <aside id="physical-twin-telemetry" data-testid="telemetry-side-panel" className="w-full min-w-0 bg-slate-950/90 border border-slate-800 p-3 rounded-lg shadow-xl font-mono text-xs lg:sticky lg:top-3">
           <div className="flex items-center justify-between border-b border-slate-800 pb-2 mb-2">
             <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
               <Zap className="w-3.5 h-3.5 text-cyan-400" />
@@ -2131,6 +2148,14 @@ export const LongitudinalSideDrainTwin: React.FC<LongitudinalSideDrainTwinProps>
               )}
             </div>
           </div>
+        </aside>
+        ) : (
+          <div className="flex items-start">
+            <button type="button" onClick={() => setShowTelemetry(true)} className="w-full px-3 py-2 rounded border border-cyan-800 bg-cyan-950/70 text-cyan-300 text-xs font-mono font-bold hover:bg-cyan-900 transition" aria-expanded={false}>
+              SHOW TELEMETRY
+            </button>
+          </div>
+        )}
         </div>
       </div>
 
