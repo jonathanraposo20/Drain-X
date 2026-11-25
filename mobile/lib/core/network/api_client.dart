@@ -57,6 +57,16 @@ class ApiClient {
   Future<void> _preflightSessionCheck() async {
     final session = _authService.currentSession;
     if (session != null && session.isAuthenticated && session.isTokenExpired) {
+      // A JWT without a refresh token cannot be renewed. Invalidate it before
+      // any protected request is dispatched, preserving the pre-refresh
+      // contract for legacy/partially provisioned sessions.
+      if (session.refreshToken == null || session.refreshToken!.isEmpty) {
+        _authService.handleUnauthorized(redirect: false);
+        throw ApiException(
+          401,
+          'Authentication token expired and no refresh credentials are available. Please sign in again.',
+        );
+      }
       try {
         await _authService.refreshSession();
       } on AuthException catch (error) {
