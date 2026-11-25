@@ -39,7 +39,9 @@ async def get_current_mode():
 
 
 @router.get("/mode/history", summary="Get auditable mode transition history")
-async def get_mode_history():
+async def get_mode_history(
+    claims: Dict[str, Any] = Depends(require_roles(["admin", "municipality"])),
+):
     """
     Returns the complete auditable log of operational mode transitions,
     including timestamps, source modes, target modes, and transition reasons.
@@ -114,7 +116,10 @@ async def set_system_mode(
 
 
 @router.post("/state", summary="Set operational state")
-async def set_operational_state(operational_state: SystemOperationalState = Body(..., embed=True)):
+async def set_operational_state(
+    operational_state: SystemOperationalState = Body(..., embed=True),
+    claims: Dict[str, Any] = Depends(require_roles(["admin", "municipality"])),
+):
     """
     Set operational state (e.g. STANDBY, MONITORING, INTERVENING, FAULT, EMERGENCY_STOP).
     """
