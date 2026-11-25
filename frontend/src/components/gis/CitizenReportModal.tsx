@@ -111,10 +111,10 @@ export const CitizenReportModal: React.FC<CitizenReportModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
-      <div className="w-full max-w-lg bg-slate-900 border border-slate-700 rounded-lg shadow-2xl overflow-hidden font-mono text-sm">
+    <div className="fixed inset-0 z-[2000] flex items-center justify-center overflow-y-auto bg-black/75 backdrop-blur-sm p-3 sm:p-4">
+      <div className="flex max-h-[calc(100dvh-1.5rem)] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-slate-700 bg-slate-900 font-mono text-sm shadow-2xl sm:max-h-[calc(100dvh-2rem)]">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 bg-slate-800/90 border-b border-slate-700">
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-700 bg-slate-800/90 px-4 py-3">
           <div className="flex items-center space-x-2">
             <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse"></span>
             <h3 className="text-white font-bold tracking-wider text-sm uppercase">
@@ -132,7 +132,7 @@ export const CitizenReportModal: React.FC<CitizenReportModalProps> = ({
 
         {/* Success Confirmation View */}
         {createdIncident ? (
-          <div className="p-6 space-y-4">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-6 space-y-4">
             <div className="p-4 bg-emerald-950/60 border border-emerald-500/50 rounded-lg flex items-start space-x-3">
               <CheckCircle className="w-6 h-6 text-emerald-400 shrink-0 mt-0.5" />
               <div className="space-y-1">
@@ -183,7 +183,8 @@ export const CitizenReportModal: React.FC<CitizenReportModalProps> = ({
           </div>
         ) : (
           /* Form View */
-          <form onSubmit={handleSubmit} className="p-5 space-y-4 max-h-[85vh] overflow-y-auto">
+          <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4 sm:p-5">
             {errorMessage && (
               <div className="p-3 bg-rose-950/70 border border-rose-500 rounded text-rose-200 text-xs flex items-center space-x-2">
                 <AlertCircle className="w-4 h-4 shrink-0" />
@@ -334,8 +335,10 @@ export const CitizenReportModal: React.FC<CitizenReportModalProps> = ({
               />
             </div>
 
-            {/* Buttons */}
-            <div className="flex justify-end space-x-2 pt-2 border-t border-slate-800">
+            </div>
+
+            {/* Fixed form actions remain visible while the form fields scroll. */}
+            <div className="flex shrink-0 justify-end space-x-2 border-t border-slate-800 bg-slate-900 px-4 py-3 sm:px-5">
               <button
                 type="button"
                 onClick={handleResetAndClose}
