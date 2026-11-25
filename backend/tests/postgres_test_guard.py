@@ -35,6 +35,12 @@ def validate_disposable_postgres_dsn(dsn: str | None) -> str | None:
         return None
     cleaned = dsn.strip()
     host = _extract_host(cleaned)
+    # Supabase project references are 20 lowercase alphanumeric characters.
+    # Reject them anywhere in the DSN, even when a misleading host is loopback.
+    if re.search(r"(?<![a-z0-9])[a-z0-9]{20}(?![a-z0-9])", cleaned.lower()):
+        raise RuntimeError(
+            "Refusing PostgreSQL test DSN containing a production-style project identifier."
+        )
     if host == "localhost":
         return cleaned
     try:
