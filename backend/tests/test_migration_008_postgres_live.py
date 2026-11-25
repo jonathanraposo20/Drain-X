@@ -9,6 +9,8 @@ SAFETY INVARIANT:
 import importlib.util
 import json
 import os
+import re
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -17,7 +19,35 @@ import uuid
 import httpx
 import pytest
 
-TEST_POSTGRES_DSN = os.getenv("DRAINX_TEST_POSTGRES_DSN")
+_FORBIDDEN_PROD_HOST_SUFFIXES = (
+    ".supabase.co",
+    ".supabase.com",
+    ".supabase.net",
+    ".pooler.supabase.com",
+)
+_FORBIDDEN_PROD_PROJECT_REFS = ("xhdtceqcnsheoskmuwsv",)
+
+
+def validate_disposable_postgres_dsn(dsn: str | None) -> str | None:
+    """Fail-closed validator rejecting production Supabase hosts."""
+    if not dsn or not dsn.strip():
+        return None
+    cleaned = dsn.strip()
+    parsed = urllib.parse.urlparse(cleaned)
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    if not host:
+        m = re.search(r"(?:^|\s)host\s*=\s*['\"]?([^\s'\"]+)", cleaned, re.IGNORECASE)
+        host = m.group(1).lower() if m else ""
+    if any(host.endswith(suffix) or suffix.lstrip(".") == host for suffix in _FORBIDDEN_PROD_HOST_SUFFIXES):
+        raise RuntimeError(f"Refusing to run migration 008 tests against Supabase host '{host}'.")
+    if any(ref in cleaned.lower() for ref in _FORBIDDEN_PROD_PROJECT_REFS):
+        raise RuntimeError("Refusing to run migration 008 tests against production project reference.")
+    if not host:
+        raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: unable to determine target host.")
+    return cleaned
+
+
+TEST_POSTGRES_DSN = validate_disposable_postgres_dsn(os.getenv("DRAINX_TEST_POSTGRES_DSN"))
 _HAS_PSYCOPG3 = importlib.util.find_spec("psycopg") is not None
 
 if _HAS_PSYCOPG3:
@@ -34,7 +64,10 @@ pytestmark = pytest.mark.skipif(
 
 
 def _open_conn():
-    return psycopg.connect(TEST_POSTGRES_DSN, autocommit=False)
+    dsn = validate_disposable_postgres_dsn(TEST_POSTGRES_DSN)
+    if not dsn:
+        raise RuntimeError("DRAINX_TEST_POSTGRES_DSN is not configured.")
+    return psycopg.connect(dsn, autocommit=False)
 
 
 def _sqlstate(exc: BaseException) -> str | None:
@@ -120,13 +153,13 @@ def test_pg_migration_008_fk_reconciliation_and_on_delete_restrict():
             cur.execute("SAVEPOINT sp_del_dev")
             with pytest.raises(PG_ERROR) as exc_del_dev:
                 cur.execute("DELETE FROM public.devices WHERE device_id = 'DRAINX-ESP32-NODE-01'")
-            assert _sqlstate(exc_del_dev.value) == "23001"
+            assert _sqlstate(exc_del_dev.value) == "23503"
             cur.execute("ROLLBACK TO SAVEPOINT sp_del_dev")
 
             cur.execute("SAVEPOINT sp_del_sec")
             with pytest.raises(PG_ERROR) as exc_del_sec:
                 cur.execute("DELETE FROM public.drainage_sections WHERE section_id = 'SEC_SCREENING_01'")
-            assert _sqlstate(exc_del_sec.value) == "23001"
+            assert _sqlstate(exc_del_sec.value) == "23503"
             cur.execute("ROLLBACK TO SAVEPOINT sp_del_sec")
 
             assert d_sec01.startswith("dir_")
