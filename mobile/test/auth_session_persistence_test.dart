@@ -8,6 +8,7 @@ import 'package:http/testing.dart';
 import 'package:drainx_mobile/core/auth/auth_service.dart';
 import 'package:drainx_mobile/core/auth/secure_session_store.dart';
 import 'package:drainx_mobile/core/config/api_config.dart';
+import 'package:drainx_mobile/core/network/api_client.dart';
 import 'package:drainx_mobile/models/user_session.dart';
 
 class MemorySessionStore implements SecureSessionStore {
@@ -29,6 +30,89 @@ class MemorySessionStore implements SecureSessionStore {
     value = null;
     clears++;
   }
+  test('API GET refreshes after a server 401 and retries once with the new token', () async {
+    final expiry = (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 3600;
+    auth.setSessionForTesting(UserSession(
+      userId: 'user-1',
+      name: 'DRAIN-X User',
+      role: UserRole.citizen,
+      authType: AuthType.authenticated,
+      token: testJwt(expiresAt: expiry),
+      refreshToken: 'refresh-before-401',
+    ));
+
+    var apiCalls = 0;
+    auth.httpClient = MockClient((request) async {
+      if (request.url.path == '/auth/v1/token') {
+        return http.Response(
+          jsonEncode(authResponse(
+            accessToken: 'access-after-refresh',
+            refreshToken: 'refresh-after-refresh',
+          )),
+          200,
+        );
+      }
+      apiCalls++;
+      if (apiCalls == 1) {
+        return http.Response('expired access token', 401);
+      }
+      expect(request.headers['Authorization'], 'Bearer access-after-refresh');
+      return http.Response('[]', 200);
+    });
+
+    final api = ApiClient(httpClient: auth.httpClient, authService: auth);
+    final incidents = await api.getIncidents();
+
+    expect(incidents, isEmpty);
+    expect(apiCalls, 2);
+    expect(auth.currentToken, 'access-after-refresh');
+  });
+
+  test('API mutation refreshes on 401 but is not replayed automatically', () async {
+    final expiry = (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 3600;
+    auth.setSessionForTesting(UserSession(
+      userId: 'user-1',
+      name: 'DRAIN-X User',
+      role: UserRole.citizen,
+      authType: AuthType.authenticated,
+      token: testJwt(expiresAt: expiry),
+      refreshToken: 'refresh-before-mutation',
+    ));
+
+    var mutationCalls = 0;
+    auth.httpClient = MockClient((request) async {
+      if (request.url.path == '/auth/v1/token') {
+        return http.Response(
+          jsonEncode(authResponse(
+            accessToken: 'access-after-refresh',
+            refreshToken: 'refresh-after-refresh',
+          )),
+          200,
+        );
+      }
+      mutationCalls++;
+      return http.Response('unauthorized', 401);
+    });
+
+    final api = ApiClient(httpClient: auth.httpClient, authService: auth);
+    await expectLater(
+      api.createIncident(
+        category: 'DRAIN_BLOCKAGE',
+        description: 'Blocked drain near road',
+        latitude: 15.5,
+        longitude: 73.8,
+        severity: 'MEDIUM',
+      ),
+      throwsA(predicate((error) =>
+          error is ApiException &&
+          error.statusCode == 401 &&
+          error.message.contains('not replayed'))),
+    );
+
+    expect(mutationCalls, 1);
+    expect(auth.currentToken, 'access-after-refresh');
+  });
+
 }
 
 String testJwt({required int expiresAt}) {
