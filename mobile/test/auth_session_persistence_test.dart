@@ -296,7 +296,7 @@ void main() {
     ));
 
     var mutationCalls = 0;
-    auth.httpClient = MockClient((request) async {
+    final mutationClient = MockClient((request) async {
       if (request.url.path == '/auth/v1/token') {
         return http.Response(
           jsonEncode(authResponse(
@@ -310,7 +310,8 @@ void main() {
       return http.Response('unauthorized', 401);
     });
 
-    final api = ApiClient(httpClient: auth.httpClient, authService: auth);
+    auth.httpClient = mutationClient;
+    final api = ApiClient(httpClient: mutationClient, authService: auth);
     await expectLater(
       api.createIncident(
         category: 'DRAIN_BLOCKAGE',
