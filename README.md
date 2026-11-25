@@ -51,7 +51,7 @@ DRAIN-X transforms urban drainage into a proactive, intelligent, closed-loop cyb
 
 ## 📍 Current Development Status
 
-The current repository checkpoint includes the backend incident-security and municipal-operations expansion, a React municipal operations dashboard, Supabase-backed incident persistence, and role-aware operational APIs. Flutter/mobile end-to-end acceptance remains deferred until Phase 4 is formally closed.
+The current repository checkpoint includes the backend incident-security and municipal-operations expansion, a React municipal operations dashboard, Supabase-backed incident persistence, and role-aware operational APIs. Phase 4 is administratively closed with accepted production-verification deferrals; Phase 5 Flutter delivery is active. Deferred live checks remain documented and are not represented as passed.
 
 | Component / Layer | Status | Implementation Details |
 | :--- | :--- | :--- |
@@ -63,7 +63,7 @@ The current repository checkpoint includes the backend incident-security and mun
 | **Municipal Operations Dashboard** | **Implemented** | KPI cards, incident queue, filtering, pagination, incident inspection, triage actions, field-team assignment, and audit-history views. |
 | **Durable Incident Auditing** | **Implemented; Production RPC Path Configured** | Append-only local JSONL fallback, Supabase persistence integration, and transactional incident/audit RPCs. Production RPC execution is restricted to the backend service role. |
 | **GIS Tile Layer** | **Implemented** | OpenStreetMap Standard is the default key-free basemap; CARTO Dark remains an optional selectable layer. |
-| **Flutter Mobile Application** | **Deferred — Phase 4 Gate** | Mobile workflows are not treated as Phase 4 acceptance. End-to-end mobile verification is deferred until Phase 4 is formally closed. |
+| **Flutter Mobile Application** | **Active — Phase 5** | Existing citizen, municipality, and worker Flutter workflows are being audited and completed against the FastAPI contract. Auth refresh/session persistence and end-to-end verification remain work items. |
 | **Physical Prototype** | **Mechanical Preparation Complete; Electronics Integration Pending** | Chassis assembly, component placement, and mounting-hole preparation are complete. Sensors, ESP32, and actuator are not yet fully mounted, wired, and integrated with the backend. |
 
 ## 🏗 System Architecture
@@ -423,7 +423,7 @@ The physical prototype is being prepared as a controlled drainage-channel demons
 ```text
 [ IMPLEMENTED ] ==============================> Core backend, telemetry, digital twin, and operational modes
 [ IMPLEMENTED ] ==============================> Incident privacy, municipal triage, audit workflows, and role-aware dashboards
-[ ACTIVE DEVELOPMENT ] =======================> Flutter citizen, municipality, and worker application workflows
+[ ACTIVE — PHASE 5 ] ========================> Flutter citizen, municipality, and worker application workflows
 [ NEXT ] ======================================> Complete mobile workflow verification and refine API integration
 [ NEXT ] ======================================> Mount, wire, calibrate, and integrate ESP32 sensors and diversion actuator
 [ FUTURE / EXPLORATORY ] ======================> Field validation, computer-vision debris estimation, and edge AI
