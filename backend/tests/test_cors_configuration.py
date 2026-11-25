@@ -64,6 +64,11 @@ def test_cors_wildcard_is_rejected_and_stripped(monkeypatch):
     assert evil_resp.status_code == 400
     assert "access-control-allow-origin" not in evil_resp.headers
 
+    with pytest.raises(ValueError, match="wildcard origin"):
+        Settings(CORS_ORIGINS=["*"])
+    with pytest.raises(ValueError, match="wildcard origin"):
+        Settings(CORS_ORIGINS=["https://drain-x.vercel.app", " * "])
+
     with pytest.raises(ValueError, match="approved DRAIN-X"):
         Settings(CORS_ORIGIN_REGEX="*")
     with pytest.raises(ValueError, match="approved DRAIN-X"):
