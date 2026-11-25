@@ -348,13 +348,6 @@ async def lifespan(app: FastAPI):
     await telemetry_stream_manager.shutdown()
 
 
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.APP_VERSION,
-    description="DRAIN-X Modular Monolith Backend: Authoritative state, simulation engine, and predictive monitoring.",
-    lifespan=lifespan,
-)
-
 # CORS Middleware configuration
 def _get_cors_origins() -> list[str]:
     origins = list(settings.CORS_ORIGINS)
@@ -365,24 +358,42 @@ def _get_cors_origins() -> list[str]:
                 origins.append(origin)
     return origins
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_get_cors_origins(),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# Mount API Routers
-app.include_router(api_v1_router, prefix=settings.API_V1_PREFIX)
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application based on current settings."""
+    is_prod = settings.ENVIRONMENT == "production"
+    application = FastAPI(
+        title=settings.APP_NAME,
+        version=settings.APP_VERSION,
+        description="DRAIN-X Modular Monolith Backend: Authoritative state, simulation engine, and predictive monitoring.",
+        lifespan=lifespan,
+        docs_url=None if is_prod else "/docs",
+        redoc_url=None if is_prod else "/redoc",
+        openapi_url=None if is_prod else "/openapi.json",
+    )
+
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=_get_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Mount API Routers
+    application.include_router(api_v1_router, prefix=settings.API_V1_PREFIX)
+
+    @application.get("/", tags=["Root"])
+    async def root():
+        return {
+            "project": settings.APP_NAME,
+            "version": settings.APP_VERSION,
+            "mode": state_store.mode,
+            "docs_url": None if settings.ENVIRONMENT == "production" else "/docs",
+            "api_v1": settings.API_V1_PREFIX,
+        }
+
+    return application
 
 
-@app.get("/", tags=["Root"])
-async def root():
-    return {
-        "project": settings.APP_NAME,
-        "version": settings.APP_VERSION,
-        "mode": state_store.mode,
-        "docs_url": "/docs",
-        "api_v1": settings.API_V1_PREFIX
-    }
+app = create_app()

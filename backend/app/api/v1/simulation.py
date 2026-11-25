@@ -1,12 +1,17 @@
 from typing import Optional, Literal
-from fastapi import APIRouter, HTTPException, Query, Body, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, status
 from pydantic import BaseModel
 
+from app.core.security import require_roles
 from app.models.contracts import ScenarioType
 from app.services.scenario_benchmark import scenario_runner
 from app.services.state_store import state_store
 
-router = APIRouter(prefix="/simulation", tags=["Simulation & Digital Twin"])
+router = APIRouter(
+    prefix="/simulation",
+    tags=["Simulation & Digital Twin"],
+    dependencies=[Depends(require_roles(["municipality", "admin", "service_role"]))],
+)
 
 
 class StartScenarioPayload(BaseModel):

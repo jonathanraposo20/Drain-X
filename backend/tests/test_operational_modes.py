@@ -396,17 +396,17 @@ def test_simulation_analytics_cannot_influence_physical_gate_decisions():
     assert state_store.get_prediction().state == PredictionState.OVERFLOW
 
 
-def test_simulation_start_and_step_reject_physical_mode(client: TestClient):
+def test_simulation_start_and_step_reject_physical_mode(municipal_client: TestClient):
     """Verify POST /simulation/start and /simulation/step are rejected with 409 Conflict in PHYSICAL mode."""
     state_store.set_mode("PHYSICAL", reason="Physical bench active")
 
     # 1. POST /simulation/start
-    resp_start = client.post("/api/v1/simulation/start", json={"scenario": "CLEAN_DRAINAGE", "seed": 42})
+    resp_start = municipal_client.post("/api/v1/simulation/start", json={"scenario": "CLEAN_DRAINAGE", "seed": 42})
     assert resp_start.status_code == 409
     assert "Simulation cannot be started while in PHYSICAL mode" in resp_start.json()["detail"]
 
     # 2. POST /simulation/step
-    resp_step = client.post("/api/v1/simulation/step?dt=0.5")
+    resp_step = municipal_client.post("/api/v1/simulation/step?dt=0.5")
     assert resp_step.status_code == 409
     assert "Simulation cannot be stepped while in PHYSICAL mode" in resp_step.json()["detail"]
 
@@ -415,32 +415,32 @@ def test_simulation_start_and_step_reject_physical_mode(client: TestClient):
     assert step_res["status"] == "INHIBITED_NON_SIMULATION_MODE"
 
 
-def test_simulation_start_and_step_reject_safe_hold_mode(client: TestClient):
+def test_simulation_start_and_step_reject_safe_hold_mode(municipal_client: TestClient):
     """Verify POST /simulation/start and /simulation/step are rejected with 409 Conflict in SAFE_HOLD mode."""
     state_store.set_mode("SAFE_HOLD", reason="Maintenance safe hold")
 
     # 1. POST /simulation/start
-    resp_start = client.post("/api/v1/simulation/start", json={"scenario": "GRADUAL_DEBRIS", "seed": 42})
+    resp_start = municipal_client.post("/api/v1/simulation/start", json={"scenario": "GRADUAL_DEBRIS", "seed": 42})
     assert resp_start.status_code == 409
     assert "Simulation cannot be started while in SAFE_HOLD mode" in resp_start.json()["detail"]
 
     # 2. POST /simulation/step
-    resp_step = client.post("/api/v1/simulation/step?dt=0.5")
+    resp_step = municipal_client.post("/api/v1/simulation/step?dt=0.5")
     assert resp_step.status_code == 409
     assert "Simulation cannot be stepped while in SAFE_HOLD mode" in resp_step.json()["detail"]
 
 
-def test_simulation_behavior_remains_functional(client: TestClient):
+def test_simulation_behavior_remains_functional(municipal_client: TestClient):
     """Verify normal simulation functionality continues to work seamlessly in SIMULATION mode."""
     state_store.set_mode("SIMULATION", reason="Normal simulation verification")
 
     # Start CLEAN_DRAINAGE scenario
-    resp_start = client.post("/api/v1/simulation/start", json={"scenario": "CLEAN_DRAINAGE", "seed": 42})
+    resp_start = municipal_client.post("/api/v1/simulation/start", json={"scenario": "CLEAN_DRAINAGE", "seed": 42})
     assert resp_start.status_code == 200
     assert resp_start.json()["status"] == "success"
 
     # Step simulation
-    resp_step = client.post("/api/v1/simulation/step?dt=0.5")
+    resp_step = municipal_client.post("/api/v1/simulation/step?dt=0.5")
     assert resp_step.status_code == 200
     assert resp_step.json()["status"] == "success"
 
@@ -454,12 +454,12 @@ def test_simulation_behavior_remains_functional(client: TestClient):
         "source": "SIMULATED",
         "status": "OK",
     }
-    resp_telem = client.post("/api/v1/telemetry", json=payload)
+    resp_telem = municipal_client.post("/api/v1/telemetry", json=payload)
     assert resp_telem.status_code == 201
     assert resp_telem.json()["status"] == "success"
 
     # Stop simulation
-    resp_stop = client.post("/api/v1/simulation/stop")
+    resp_stop = municipal_client.post("/api/v1/simulation/stop")
     assert resp_stop.status_code == 200
 
 

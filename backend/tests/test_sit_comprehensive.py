@@ -517,17 +517,17 @@ def test_sit_suite_f_historical_playback_time_bounds_validation(client: TestClie
 # SUITE G: Simulation Integration
 # ==============================================================================
 
-def test_sit_suite_g_simulation_lifecycle_and_step(client: TestClient):
+def test_sit_suite_g_simulation_lifecycle_and_step(municipal_client: TestClient):
     """SIT-G1: Start, step, and stop scenario simulation lifecycle."""
-    start_res = client.post("/api/v1/simulation/start", json={"scenario": "GRADUAL_DEBRIS", "seed": 42})
+    start_res = municipal_client.post("/api/v1/simulation/start", json={"scenario": "GRADUAL_DEBRIS", "seed": 42})
     assert start_res.status_code == 200
     assert start_res.json()["scenario"] == "GRADUAL_DEBRIS"
 
-    step_res = client.post("/api/v1/simulation/step?dt=0.5")
+    step_res = municipal_client.post("/api/v1/simulation/step?dt=0.5")
     assert step_res.status_code == 200
     assert "step_result" in step_res.json()
 
-    stop_res = client.post("/api/v1/simulation/stop")
+    stop_res = municipal_client.post("/api/v1/simulation/stop")
     assert stop_res.status_code == 200
 
 

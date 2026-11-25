@@ -236,10 +236,10 @@ class TestDuplicateDetectionPostgresLive:
                     )
                     assert cur.fetchone() == (5, 5)
 
-                    # Runtime RESTRICT check: deleting referenced incident fails with SQLSTATE 23001 (restrict_violation)
+                    # Runtime RESTRICT check: deleting referenced incident fails with SQLSTATE 23503 (foreign_key_violation)
                     with pytest.raises(PG_DB_ERROR) as del_exc:
                         cur.execute("DELETE FROM public.incidents WHERE id = %s", (inc_id,))
-                    assert _extract_sqlstate(del_exc.value) == "23001"
+                    assert _extract_sqlstate(del_exc.value) == "23503"
                     conn.rollback()
             finally:
                 conn.rollback()
