@@ -3,7 +3,6 @@ import { Header } from './components/Header';
 import { DigitalTwin } from './components/DigitalTwin';
 import { ScenarioControls } from './components/ScenarioControls';
 import { BenchmarkingPanel } from './components/BenchmarkingPanel';
-import { KpiCards } from './components/KpiCards';
 import { LiveTelemetryTable } from './components/LiveTelemetryTable';
 import { AlertsPanel } from './components/AlertsPanel';
 import { TelemetrySimulator } from './components/TelemetrySimulator';
@@ -218,11 +217,6 @@ export const App: React.FC = () => {
               RECONNECT
             </button>
           </div>
-        )}
-
-        {/* Operational KPI Matrix (Hidden in historical playback and municipal operations to avoid metrics collision) */}
-        {dashboardView !== 'HISTORICAL_PLAYBACK' && dashboardView !== 'MUNICIPAL_OPERATIONS' && (
-          <KpiCards status={simState?.system || null} />
         )}
 
         {/* Dynamic View Switch: GIS Map vs Historical Playback vs Municipal Queue vs SCADA Twin */}
