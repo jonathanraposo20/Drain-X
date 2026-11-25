@@ -258,6 +258,14 @@ class Settings(BaseSettings):
             raise ValueError("Rate limit window is unreasonably long (>30 days).")
         return v
 
+    @field_validator("CORS_ORIGINS")
+    @classmethod
+    def validate_cors_origins(cls, v: list[str]) -> list[str]:
+        cleaned = [origin.strip() for origin in v]
+        if any(origin == "*" for origin in cleaned):
+            raise ValueError("CORS_ORIGINS must not contain the wildcard origin.")
+        return cleaned
+
     @field_validator("CORS_ORIGIN_REGEX")
     @classmethod
     def _validate_cors_origin_regex(cls, v: Optional[str]) -> Optional[str]:
