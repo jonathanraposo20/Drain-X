@@ -2178,10 +2178,25 @@ class StateStore:
             if update.assigned_worker_id is not None:
                 incident.assigned_worker_id = update.assigned_worker_id if update.assigned_worker_id.strip() else None
 
+            # A legacy PATCH may supply only assigned_to. Resolve that value
+            # through the authoritative team directory instead of leaving a
+            # non-empty assignee paired with assignment_type=NONE.
+            if (
+                update.assigned_to
+                and update.assigned_to.strip()
+                and update.assignment_type is None
+                and incident.assignment_type == AssignmentType.NONE
+            ):
+                team = validate_and_normalize_field_team(update.assigned_to)
+                if team is None:
+                    raise ValueError("A non-empty assignee must resolve to an active field team.")
+                incident.assigned_to = team.name
+                incident.assignment_type = AssignmentType.TEAM
+                incident.assigned_team_id = team.team_id
+                incident.assigned_worker_id = None
+
             # Canonicalize the complete assignment snapshot before persistence.
-            # Legacy/in-memory records can contain empty strings or stale assignment
-            # metadata even when their assignment type is NONE. The cloud RPC expects
-            # NONE to mean every assignment field is SQL NULL.
+            # The cloud RPC expects NONE to mean every assignment field is SQL NULL.
             if incident.assignment_type == AssignmentType.NONE:
                 incident.assigned_to = None
                 incident.assigned_team_id = None
