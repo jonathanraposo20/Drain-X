@@ -47,7 +47,7 @@ def _extract_hosts(dsn: str) -> list[str]:
         # Reject repeated host parameters and comma-separated host lists. The
         # keyword form accepts quoted values, including whitespace in hostnames.
         matches = list(re.finditer(
-            r"(?:^|\\s)host\\s*=\\s*(?:'([^']*)'|\"([^\"]*)\"|([^\\s]+))",
+            r"(?:^|\s)host\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s]+))",
             dsn,
             re.IGNORECASE,
         ))
