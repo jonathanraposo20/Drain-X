@@ -7,10 +7,28 @@ import 'package:drainx_mobile/app/routes.dart';
 import 'package:drainx_mobile/core/auth/auth_service.dart';
 import 'package:drainx_mobile/core/config/api_config.dart';
 import 'package:drainx_mobile/core/network/api_client.dart';
+import 'package:drainx_mobile/core/auth/secure_session_store.dart';
 import 'package:drainx_mobile/features/auth/unauthorized_screen.dart';
 import 'package:drainx_mobile/features/auth/worker_login_screen.dart';
 import 'package:drainx_mobile/features/worker/worker_dashboard_screen.dart';
 import 'package:drainx_mobile/models/user_session.dart';
+
+class _MemorySessionStore implements SecureSessionStore {
+  String? value;
+
+  @override
+  Future<String?> readSession() async => value;
+
+  @override
+  Future<void> writeSession(String session) async {
+    value = session;
+  }
+
+  @override
+  Future<void> clearSession() async {
+    value = null;
+  }
+}
 
 void main() {
   setUp(() {
@@ -116,6 +134,8 @@ void main() {
 
       // Test 1: In demo mode without token, no Bearer header is sent
       final auth = AuthService();
+      // Avoid invoking the platform secure-storage channel in this unit test.
+      auth.sessionStoreForTesting = _MemorySessionStore();
       auth.loginDemo(role: UserRole.municipality, displayName: 'Test Officer');
       final unauthedClient = ApiClient(httpClient: mockClient, authService: auth);
 
