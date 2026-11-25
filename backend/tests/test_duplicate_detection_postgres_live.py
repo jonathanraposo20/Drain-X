@@ -9,13 +9,17 @@ They are skipped automatically when no live PostgreSQL DSN or driver is configur
 import importlib.util
 import json
 import os
+import re
 import threading
 import time
+import urllib.parse
 import uuid
 
 import pytest
 
-POSTGRES_DSN = os.getenv("DRAINX_TEST_POSTGRES_DSN") or os.getenv("DATABASE_URL")
+from tests.postgres_test_guard import resolve_test_postgres_dsn, validate_disposable_postgres_dsn
+
+POSTGRES_DSN = resolve_test_postgres_dsn()
 _HAS_PSYCOPG3 = importlib.util.find_spec("psycopg") is not None
 _HAS_PSYCOPG2 = importlib.util.find_spec("psycopg2") is not None
 _HAS_PG_DRIVER = _HAS_PSYCOPG3 or _HAS_PSYCOPG2
@@ -34,8 +38,8 @@ else:
 pytestmark = pytest.mark.skipif(
     not POSTGRES_DSN or not _HAS_PG_DRIVER,
     reason=(
-        "Tier 2 Live PostgreSQL concurrency tests require DRAINX_TEST_POSTGRES_DSN/DATABASE_URL "
-        "and psycopg or psycopg2 installed."
+        "Tier 2 Live PostgreSQL concurrency tests require DRAINX_TEST_POSTGRES_DSN "
+        "(never DATABASE_URL) and psycopg or psycopg2 installed."
     ),
 )
 
@@ -51,13 +55,16 @@ EXPECTED_RPC_SIGNATURES = (
 
 
 def _open_pg_connection():
+    dsn = validate_disposable_postgres_dsn(POSTGRES_DSN)
+    if not dsn:
+        raise RuntimeError("DRAINX_TEST_POSTGRES_DSN is not configured.")
     if _HAS_PSYCOPG3:
         import psycopg
 
-        return psycopg.connect(POSTGRES_DSN, autocommit=False)
+        return psycopg.connect(dsn, autocommit=False)
     import psycopg2
 
-    return psycopg2.connect(POSTGRES_DSN)
+    return psycopg2.connect(dsn)
 
 
 def _extract_sqlstate(exc: BaseException) -> str | None:

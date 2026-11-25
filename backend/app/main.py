@@ -352,7 +352,11 @@ async def lifespan(app: FastAPI):
 def _get_cors_origins() -> list[str]:
     origins = list(settings.CORS_ORIGINS)
     if settings.ADDITIONAL_CORS_ORIGINS:
-        extra = [o.strip() for o in settings.ADDITIONAL_CORS_ORIGINS.split(",") if o.strip()]
+        extra = [
+            o.strip()
+            for o in settings.ADDITIONAL_CORS_ORIGINS.split(",")
+            if o.strip() and o.strip() != "*"
+        ]
         for origin in extra:
             if origin not in origins:
                 origins.append(origin)
@@ -372,13 +376,16 @@ def create_app() -> FastAPI:
         openapi_url=None if is_prod else "/openapi.json",
     )
 
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=_get_cors_origins(),
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    cors_kwargs = {
+        "allow_origins": _get_cors_origins(),
+        "allow_credentials": True,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+    if settings.CORS_ORIGIN_REGEX:
+        cors_kwargs["allow_origin_regex"] = settings.CORS_ORIGIN_REGEX
+
+    application.add_middleware(CORSMiddleware, **cors_kwargs)
 
     # Mount API Routers
     application.include_router(api_v1_router, prefix=settings.API_V1_PREFIX)

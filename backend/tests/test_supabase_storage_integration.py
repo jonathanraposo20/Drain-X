@@ -1131,83 +1131,44 @@ def test_audit_idempotency_simulation_and_conflict_handling():
         )
 
 
-def test_migration_005_draft_documents_trust_boundary_and_session_role_check():
+def test_migration_005_canonical_storage_migration_security_contract():
     repo_root = Path(__file__).resolve().parent.parent.parent
-    draft_path = repo_root / "database" / "migrations" / "005_attach_incident_photos_rpc_draft.sql"
-    assert draft_path.exists(), f"Migration 005 draft SQL file must exist at {draft_path}"
+    migration_path = repo_root / "database" / "migrations" / "005_incident_photo_storage_registry_and_rpcs.sql"
+    assert migration_path.exists(), f"Canonical Migration 005 SQL file must exist at {migration_path}"
 
-    sql_text = draft_path.read_text(encoding="utf-8")
+    sql_text = migration_path.read_text(encoding="utf-8")
 
-    # Verify trust boundary documentation
-    assert "ARCHITECTURAL TRUST BOUNDARY & ACTOR IDENTITY MODEL" in sql_text
-    assert "Dual-Layer Attribution & Verification Architecture" in sql_text
-    assert "CRITICAL UNDERSTANDING: This check authenticates the BACKEND CONNECTION" in sql_text
-
-    # Verify cryptographic / session authenticity check inside function body
-    assert "v_session_role <> 'service_role'" in sql_text
-    assert "request.jwt.claim.role" in sql_text
-
-    # Verify character hygiene checks using position() (avoiding ambiguous LIKE escaping)
-    assert "position('..' in v_clean_photo)" in sql_text
-    assert "position(E'\\\\' in v_clean_photo)" in sql_text
-    assert "position('//' in v_clean_photo)" in sql_text
-    assert "position('%' in v_clean_photo)" in sql_text
-
-    # Verify embedded NUL byte check was removed (inappropriate for PostgreSQL text)
-    assert "position(E'\\x00'" not in sql_text
-
-    # Verify strictly canonical scoping and no silent normalization
-    assert "substr(v_clean_photo, 1, length(p_incident_id) + 1) <> (p_incident_id || '/')" in sql_text
-    assert "position('/' in v_filename) > 0" in sql_text
-    assert "v_filename ~* '^[A-Za-z0-9_-]{1,64}\\.(jpg|jpeg|png|webp)$'" in sql_text
-
-    # Verify database parameter length and regex alignment
-    assert "p_incident_id VARCHAR(32)" in sql_text
-    assert "p_incident_id ~ '^[A-Za-z0-9_-]{1,32}$'" in sql_text
-    assert "p_audit_id VARCHAR(32)" in sql_text
-    assert "p_audit_id ~ '^[A-Za-z0-9_-]{1,32}$'" in sql_text
-    assert "p_actor_id VARCHAR(128)" in sql_text
-    assert "p_actor_id ~ '^[A-Za-z0-9_@.-]{1,128}$'" in sql_text
-    assert "p_actor_role VARCHAR(64)" in sql_text
-    assert "p_actor_role NOT IN ('citizen', 'municipal_officer', 'field_worker', 'admin', 'system')" in sql_text
-
-    # Verify SECURITY DEFINER and safe search_path
+    # Assert the current V3.1 storage registry and lease-based RPC contract,
+    # rather than a retired draft RPC that is no longer part of the repository.
+    assert "CREATE TABLE IF NOT EXISTS public.storage_object_registry" in sql_text
+    assert "CREATE TABLE IF NOT EXISTS public.api_idempotency_keys" in sql_text
+    assert "CREATE TABLE IF NOT EXISTS public.storage_cleanup_operations" in sql_text
+    assert "public.reserve_photo_attachment_rpc" in sql_text
+    assert "public.verify_and_register_storage_object_rpc" in sql_text
+    assert "public.finalize_photo_attachment_rpc" in sql_text
+    assert "public.claim_expired_cleanup_operation_rpc" in sql_text
+    assert "public.reconcile_storage_orphan_rpc" in sql_text
     assert "SECURITY DEFINER" in sql_text
     assert "SET search_path = pg_catalog, public, pg_temp" in sql_text
-
-    # Verify deterministic idempotency logic in SQL
-    assert "v_request_fingerprint := md5(array_to_string(v_sorted_photos, ','));" in sql_text
-    assert "v_existing_audit.reason <> v_expected_reason" in sql_text
-
-    # Verify no default parameters masking attribution
-    assert "p_actor_id VARCHAR(128) DEFAULT" not in sql_text
-    assert "p_actor_role VARCHAR(64) DEFAULT" not in sql_text
-
-    # Verify revoke from public/anon/authenticated and grant only to service_role
-    assert "REVOKE ALL ON FUNCTION public.attach_incident_photos_rpc" in sql_text
-    assert "GRANT EXECUTE ON FUNCTION public.attach_incident_photos_rpc" in sql_text
+    assert "request.jwt.claim.role" in sql_text
+    assert "REVOKE ALL ON FUNCTION public.reserve_photo_attachment_rpc" in sql_text
+    assert "GRANT EXECUTE ON FUNCTION public.reserve_photo_attachment_rpc" in sql_text
     assert "TO service_role" in sql_text
 
 
-def test_sql_draft_parser_validation_with_pglast():
+def test_canonical_migration_sql_parser_validation_with_pglast():
     """
-    Validates the Migration 005 SQL draft using pglast (the official PostgreSQL libpg_query C parser).
-    Clearly distinguishes parser syntax validation from database execution (no live execution).
+    Parse the current canonical Migration 005 SQL without executing it.
+    This is syntax parsing only, not database migration validation.
     """
     import pglast
 
     repo_root = Path(__file__).resolve().parent.parent.parent
-    draft_path = repo_root / "database" / "migrations" / "005_attach_incident_photos_rpc_draft.sql"
-    sql_text = draft_path.read_text(encoding="utf-8")
+    migration_path = repo_root / "database" / "migrations" / "005_incident_photo_storage_registry_and_rpcs.sql"
+    sql_text = migration_path.read_text(encoding="utf-8")
 
-    tree = pglast.parse_sql(sql_text)
-    assert len(tree) == 3, f"Expected exactly 3 SQL statements, got {len(tree)}"
-
-    stmt_names = [stmt.stmt.__class__.__name__ for stmt in tree]
-    assert stmt_names == ["CreateFunctionStmt", "GrantStmt", "GrantStmt"]
-
-
-# ==============================================================================
+    statements = pglast.parse_sql(sql_text)
+    assert len(statements) > 10, "Expected the canonical migration to contain multiple SQL statements"
 
 
 # ==============================================================================

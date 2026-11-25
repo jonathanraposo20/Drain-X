@@ -9,6 +9,8 @@ SAFETY INVARIANT:
 import importlib.util
 import json
 import os
+import re
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -17,7 +19,9 @@ import uuid
 import httpx
 import pytest
 
-TEST_POSTGRES_DSN = os.getenv("DRAINX_TEST_POSTGRES_DSN")
+from tests.postgres_test_guard import resolve_test_postgres_dsn, validate_disposable_postgres_dsn
+
+TEST_POSTGRES_DSN = resolve_test_postgres_dsn()
 _HAS_PSYCOPG3 = importlib.util.find_spec("psycopg") is not None
 
 if _HAS_PSYCOPG3:
@@ -34,7 +38,10 @@ pytestmark = pytest.mark.skipif(
 
 
 def _open_conn():
-    return psycopg.connect(TEST_POSTGRES_DSN, autocommit=False)
+    dsn = validate_disposable_postgres_dsn(TEST_POSTGRES_DSN)
+    if not dsn:
+        raise RuntimeError("DRAINX_TEST_POSTGRES_DSN is not configured.")
+    return psycopg.connect(dsn, autocommit=False)
 
 
 def _sqlstate(exc: BaseException) -> str | None:
@@ -120,13 +127,13 @@ def test_pg_migration_008_fk_reconciliation_and_on_delete_restrict():
             cur.execute("SAVEPOINT sp_del_dev")
             with pytest.raises(PG_ERROR) as exc_del_dev:
                 cur.execute("DELETE FROM public.devices WHERE device_id = 'DRAINX-ESP32-NODE-01'")
-            assert _sqlstate(exc_del_dev.value) == "23001"
+            assert _sqlstate(exc_del_dev.value) == "23503"
             cur.execute("ROLLBACK TO SAVEPOINT sp_del_dev")
 
             cur.execute("SAVEPOINT sp_del_sec")
             with pytest.raises(PG_ERROR) as exc_del_sec:
                 cur.execute("DELETE FROM public.drainage_sections WHERE section_id = 'SEC_SCREENING_01'")
-            assert _sqlstate(exc_del_sec.value) == "23001"
+            assert _sqlstate(exc_del_sec.value) == "23503"
             cur.execute("ROLLBACK TO SAVEPOINT sp_del_sec")
 
             assert d_sec01.startswith("dir_")

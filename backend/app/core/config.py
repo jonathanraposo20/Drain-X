@@ -1,9 +1,14 @@
 import base64
 import ipaddress
 import json
+import re
 from typing import Literal, Optional
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+AUTHORIZED_VERCEL_PREVIEW_ORIGIN_REGEX = (
+    r"^https://drain-x(?:-[a-z0-9-]+)?-jonathanraposo673-4283\.vercel\.app$"
+)
 
 
 class Settings(BaseSettings):
@@ -32,6 +37,7 @@ class Settings(BaseSettings):
         "http://localhost:3000",
     ]
     ADDITIONAL_CORS_ORIGINS: str | None = None  # Comma-separated extra allowed origins for staging/production
+    CORS_ORIGIN_REGEX: str | None = None  # Optional strictly anchored HTTPS regex (e.g., AUTHORIZED_VERCEL_PREVIEW_ORIGIN_REGEX)
 
     # Database & Supabase Cloud Settings (Optional for local operation; falls back to in-memory)
     DATABASE_URL: str | None = None
@@ -251,6 +257,28 @@ class Settings(BaseSettings):
         if v > 86400 * 30:
             raise ValueError("Rate limit window is unreasonably long (>30 days).")
         return v
+
+    @field_validator("CORS_ORIGINS")
+    @classmethod
+    def validate_cors_origins(cls, v: list[str]) -> list[str]:
+        cleaned = [origin.strip() for origin in v]
+        if any(origin == "*" for origin in cleaned):
+            raise ValueError("CORS_ORIGINS must not contain the wildcard origin.")
+        return cleaned
+
+    @field_validator("CORS_ORIGIN_REGEX")
+    @classmethod
+    def _validate_cors_origin_regex(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        if cleaned != AUTHORIZED_VERCEL_PREVIEW_ORIGIN_REGEX:
+            raise ValueError(
+                "CORS_ORIGIN_REGEX must exactly match the approved DRAIN-X Vercel preview origin pattern."
+            )
+        return cleaned
 
     @field_validator("RATE_LIMIT_TRUSTED_PROXIES", mode="before")
     @classmethod
