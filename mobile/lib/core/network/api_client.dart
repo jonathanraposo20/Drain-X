@@ -252,6 +252,17 @@ class ApiClient {
       final streamedResponse = await _httpClient.send(request).timeout(const Duration(seconds: 25));
       final response = await http.Response.fromStream(streamedResponse);
 
+      if (response.statusCode == 401 && _authService.currentSession?.isAuthenticated == true) {
+        try {
+          await _authService.refreshSession();
+        } on AuthException catch (error) {
+          throw ApiException(error.statusCode == 400 || error.statusCode == 401 ? 401 : 0,
+              'Could not refresh the authenticated session: ${error.message}');
+        }
+        throw ApiException(401,
+            'Session refreshed, but the evidence upload was not replayed. Review the incident before retrying.');
+      }
+
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
         return Incident.fromJson(data);
