@@ -39,7 +39,7 @@ def test_open_pg_connection_fails_closed_on_supabase_host(monkeypatch):
         "POSTGRES_DSN",
         "postgresql://postgres:pass@db.xhdtceqcnsheoskmuwsv.supabase.co:5432/postgres",
     )
-    with pytest.raises(RuntimeError, match="Supabase|production"):
+    with pytest.raises(RuntimeError, match="non-loopback"):
         dup_pg._open_pg_connection()
 
     monkeypatch.setattr(
@@ -47,7 +47,7 @@ def test_open_pg_connection_fails_closed_on_supabase_host(monkeypatch):
         "TEST_POSTGRES_DSN",
         "postgresql://postgres:pass@aws-0-ap-south-1.pooler.supabase.com:5432/postgres",
     )
-    with pytest.raises(RuntimeError, match="Supabase|production"):
+    with pytest.raises(RuntimeError, match="non-loopback"):
         m008_pg._open_conn()
 
 
