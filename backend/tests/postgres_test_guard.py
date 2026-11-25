@@ -38,24 +38,29 @@ def _extract_hosts(dsn: str) -> list[str]:
         # values and reject multi-host forms instead of trusting only parsed.hostname.
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         query_hosts = query.get("host", [])
-        if len(query_hosts) > 1:
-            raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: multiple host overrides are not allowed.")
+        query_hostaddrs = query.get("hostaddr", [])
+        if len(query_hosts) > 1 or len(query_hostaddrs) > 1:
+            raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: multiple connection host overrides are not allowed.")
         hosts = [authority_host] if authority_host else []
         if query_hosts:
             hosts.append(query_hosts[0])
+        # libpq hostaddr bypasses DNS resolution and determines the actual socket
+        # destination even when host=localhost is supplied.
+        if query_hostaddrs:
+            hosts.append(query_hostaddrs[0])
     else:
         # Reject repeated host parameters and comma-separated host lists. The
         # keyword form accepts quoted values, including whitespace in hostnames.
-        matches = list(re.finditer(
-            r"(?:^|\s)host\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s]+))",
-            dsn,
-            re.IGNORECASE,
-        ))
-        if len(matches) != 1:
+        def _keyword_values(name: str) -> list[str]:
+            pattern = rf"(?:^|\s){name}\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s]+))"
+            found = list(re.finditer(pattern, dsn, re.IGNORECASE))
+            return [next((part for part in match.groups() if part is not None), "") for match in found]
+
+        keyword_hosts = _keyword_values("host")
+        keyword_hostaddrs = _keyword_values("hostaddr")
+        if len(keyword_hosts) != 1 or len(keyword_hostaddrs) > 1:
             raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: exactly one target host is required.")
-        match = matches[0]
-        host = next((part for part in match.groups() if part is not None), "")
-        hosts = [host]
+        hosts = keyword_hosts + keyword_hostaddrs
 
     normalized_hosts = [_normalize_host(host) for host in hosts]
     if not normalized_hosts or any(not host or "," in host for host in normalized_hosts):
