@@ -10,47 +10,74 @@ import re
 import urllib.parse
 
 
-def _extract_host(dsn: str) -> str:
+def _normalize_host(host: str) -> str:
+    return host.strip().lower().rstrip(".")
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = _normalize_host(host)
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _extract_hosts(dsn: str) -> list[str]:
     parsed = urllib.parse.urlparse(dsn)
     if parsed.scheme:
         if parsed.scheme not in ("postgres", "postgresql"):
             raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: expected a PostgreSQL DSN.")
-        host = parsed.hostname or ""
+        try:
+            authority_host = parsed.hostname or ""
+        except ValueError as exc:
+            raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: malformed connection URI.") from exc
+
+        # libpq URI query parameters can override the authority host. Validate both
+        # values and reject multi-host forms instead of trusting only parsed.hostname.
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        query_hosts = query.get("host", [])
+        if len(query_hosts) > 1:
+            raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: multiple host overrides are not allowed.")
+        hosts = [authority_host] if authority_host else []
+        if query_hosts:
+            hosts.append(query_hosts[0])
     else:
-        match = re.search(
-            r"(?:^|\s)host\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s]+))",
+        # Reject repeated host parameters and comma-separated host lists. The
+        # keyword form accepts quoted values, including whitespace in hostnames.
+        matches = list(re.finditer(
+            r"(?:^|\\s)host\\s*=\\s*(?:'([^']*)'|\"([^\"]*)\"|([^\\s]+))",
             dsn,
             re.IGNORECASE,
-        )
-        host = next((part for part in match.groups() if part is not None), "") if match else ""
-    host = host.strip().lower().rstrip(".")
-    if not host or "," in host:
+        ))
+        if len(matches) != 1:
+            raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: exactly one target host is required.")
+        match = matches[0]
+        host = next((part for part in match.groups() if part is not None), "")
+        hosts = [host]
+
+    normalized_hosts = [_normalize_host(host) for host in hosts]
+    if not normalized_hosts or any(not host or "," in host for host in normalized_hosts):
         raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: unable to determine one target host.")
-    return host
+    return normalized_hosts
 
 
 def validate_disposable_postgres_dsn(dsn: str | None) -> str | None:
-    """Accept only localhost or an IP address explicitly classified as loopback."""
+    """Accept only localhost or IP loopback targets; reject every remote or ambiguous target."""
     if not dsn or not dsn.strip():
         return None
     cleaned = dsn.strip()
-    host = _extract_host(cleaned)
+    hosts = _extract_hosts(cleaned)
+
     # Supabase project references are 20 lowercase alphanumeric characters.
     # Reject them anywhere in the DSN, even when a misleading host is loopback.
     if re.search(r"(?<![a-z0-9])[a-z0-9]{20}(?![a-z0-9])", cleaned.lower()):
         raise RuntimeError(
             "Refusing PostgreSQL test DSN containing a production-style project identifier."
         )
-    if host == "localhost":
-        return cleaned
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError as exc:
-        raise RuntimeError(
-            "Refusing live PostgreSQL tests against a non-loopback host. "
-            "Use a disposable local PostgreSQL instance via DRAINX_TEST_POSTGRES_DSN."
-        ) from exc
-    if not address.is_loopback:
+
+    if any(not _is_loopback_host(host) for host in hosts):
         raise RuntimeError(
             "Refusing live PostgreSQL tests against a non-loopback host. "
             "Use a disposable local PostgreSQL instance via DRAINX_TEST_POSTGRES_DSN."
