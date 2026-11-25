@@ -17,55 +17,7 @@ import uuid
 
 import pytest
 
-_FORBIDDEN_PROD_HOST_SUFFIXES = (
-    ".supabase.co",
-    ".supabase.com",
-    ".supabase.net",
-    ".pooler.supabase.com",
-)
-_FORBIDDEN_PROD_PROJECT_REFS = ("xhdtceqcnsheoskmuwsv",)
-
-
-def _extract_dsn_host(dsn: str) -> str:
-    parsed = urllib.parse.urlparse(dsn)
-    if parsed.hostname:
-        return parsed.hostname.lower()
-    m = re.search(r"(?:^|\s)host\s*=\s*['\"]?([^\s'\"]+)", dsn, re.IGNORECASE)
-    return m.group(1).lower() if m else ""
-
-
-def validate_disposable_postgres_dsn(dsn: str | None) -> str | None:
-    """
-    Fail-closed validator for live PostgreSQL integration tests.
-    Never falls back to DATABASE_URL and rejects production Supabase hosts.
-    """
-    if not dsn or not dsn.strip():
-        return None
-    cleaned = dsn.strip()
-    host = _extract_dsn_host(cleaned)
-    lower_dsn = cleaned.lower()
-    if any(host.endswith(suffix) or suffix.lstrip(".") == host for suffix in _FORBIDDEN_PROD_HOST_SUFFIXES):
-        raise RuntimeError(
-            f"Refusing to run live PostgreSQL test against Supabase host '{host}'. "
-            "Use a disposable local PostgreSQL instance via DRAINX_TEST_POSTGRES_DSN."
-        )
-    if any(ref in lower_dsn for ref in _FORBIDDEN_PROD_PROJECT_REFS):
-        raise RuntimeError(
-            "Refusing to run live PostgreSQL test against known production project reference. "
-            "Use a disposable local PostgreSQL instance via DRAINX_TEST_POSTGRES_DSN."
-        )
-    if not host:
-        raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: unable to determine target host.")
-    return cleaned
-
-
-def resolve_test_postgres_dsn() -> str | None:
-    """Read ONLY DRAINX_TEST_POSTGRES_DSN (never DATABASE_URL)."""
-    raw = os.getenv("DRAINX_TEST_POSTGRES_DSN")
-    if not raw or not raw.strip():
-        return None
-    return validate_disposable_postgres_dsn(raw)
-
+from tests.postgres_test_guard import resolve_test_postgres_dsn, validate_disposable_postgres_dsn
 
 POSTGRES_DSN = resolve_test_postgres_dsn()
 _HAS_PSYCOPG3 = importlib.util.find_spec("psycopg") is not None

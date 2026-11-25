@@ -68,3 +68,5 @@ def test_cors_wildcard_is_rejected_and_stripped(monkeypatch):
         Settings(CORS_ORIGIN_REGEX="*")
     with pytest.raises(ValueError, match="wildcard|anchored"):
         Settings(CORS_ORIGIN_REGEX="https://drain-x.vercel.app")
+    with pytest.raises(ValueError, match="approved DRAIN-X"):
+        Settings(CORS_ORIGIN_REGEX=r"^https://.*\.vercel\.app$")

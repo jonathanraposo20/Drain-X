@@ -266,14 +266,10 @@ class Settings(BaseSettings):
         cleaned = v.strip()
         if not cleaned:
             return None
-        if cleaned in ("*", ".*", "^.*$", "^https://.*$"):
-            raise ValueError("CORS_ORIGIN_REGEX must not be a wildcard pattern.")
-        if not (cleaned.startswith("^https://") and cleaned.endswith("$")):
-            raise ValueError("CORS_ORIGIN_REGEX must be strictly anchored (^https://...$).")
-        try:
-            re.compile(cleaned)
-        except re.error as exc:
-            raise ValueError(f"Invalid CORS_ORIGIN_REGEX: {exc}") from exc
+        if cleaned != AUTHORIZED_VERCEL_PREVIEW_ORIGIN_REGEX:
+            raise ValueError(
+                "CORS_ORIGIN_REGEX must exactly match the approved DRAIN-X Vercel preview origin pattern."
+            )
         return cleaned
 
     @field_validator("RATE_LIMIT_TRUSTED_PROXIES", mode="before")

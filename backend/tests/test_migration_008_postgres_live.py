@@ -19,35 +19,9 @@ import uuid
 import httpx
 import pytest
 
-_FORBIDDEN_PROD_HOST_SUFFIXES = (
-    ".supabase.co",
-    ".supabase.com",
-    ".supabase.net",
-    ".pooler.supabase.com",
-)
-_FORBIDDEN_PROD_PROJECT_REFS = ("xhdtceqcnsheoskmuwsv",)
+from tests.postgres_test_guard import resolve_test_postgres_dsn, validate_disposable_postgres_dsn
 
-
-def validate_disposable_postgres_dsn(dsn: str | None) -> str | None:
-    """Fail-closed validator rejecting production Supabase hosts."""
-    if not dsn or not dsn.strip():
-        return None
-    cleaned = dsn.strip()
-    parsed = urllib.parse.urlparse(cleaned)
-    host = parsed.hostname.lower() if parsed.hostname else ""
-    if not host:
-        m = re.search(r"(?:^|\s)host\s*=\s*['\"]?([^\s'\"]+)", cleaned, re.IGNORECASE)
-        host = m.group(1).lower() if m else ""
-    if any(host.endswith(suffix) or suffix.lstrip(".") == host for suffix in _FORBIDDEN_PROD_HOST_SUFFIXES):
-        raise RuntimeError(f"Refusing to run migration 008 tests against Supabase host '{host}'.")
-    if any(ref in cleaned.lower() for ref in _FORBIDDEN_PROD_PROJECT_REFS):
-        raise RuntimeError("Refusing to run migration 008 tests against production project reference.")
-    if not host:
-        raise RuntimeError("Invalid DRAINX_TEST_POSTGRES_DSN: unable to determine target host.")
-    return cleaned
-
-
-TEST_POSTGRES_DSN = validate_disposable_postgres_dsn(os.getenv("DRAINX_TEST_POSTGRES_DSN"))
+TEST_POSTGRES_DSN = resolve_test_postgres_dsn()
 _HAS_PSYCOPG3 = importlib.util.find_spec("psycopg") is not None
 
 if _HAS_PSYCOPG3:
