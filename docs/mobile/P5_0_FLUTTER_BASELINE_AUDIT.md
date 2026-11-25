@@ -2,9 +2,24 @@
 
 **Date:** 2026-11-26  
 **Repository:** `jonathanraposo20/Drain-X` (`main`)  
-**Disposition:** Static source audit completed; runtime baseline pending local Flutter SDK execution.
+**Disposition:** Static source audit completed; local Flutter runtime baseline PASSED.
 
-## 1. Existing implementation inventory
+## 1. Runtime baseline — executed locally
+
+The developer ran the following commands from the `mobile` directory on 2026-11-26:
+
+| Command | Result |
+|---|---|
+| `flutter --version` | Flutter 3.47.9 stable; Dart 3.13.7 |
+| `flutter pub get` | Passed — dependencies resolved |
+| `flutter analyze` | Passed — **No issues found** |
+| `flutter test --reporter expanded` | Passed — **56 tests, 0 failures** |
+
+The dependency resolver reported 13 packages with newer versions incompatible with current dependency constraints. This is informational; dependencies were not upgraded as part of baseline capture.
+
+The test run included auth/session, citizen reporting and evidence, municipal dashboard, route guards, and related model/widget coverage. These are local automated tests; they do not establish live Supabase authentication, refresh rotation, secure-storage behavior, cloud Storage authorization, or production role behavior.
+
+## 2. Existing implementation inventory
 
 The mobile app is an existing multi-screen Flutter application, not a blank starter:
 
@@ -14,11 +29,11 @@ The mobile app is an existing multi-screen Flutter application, not a blank star
 - Municipal dashboard, incident detail, field-team selection, verify/assign/reassign/unassign/reject actions, and audit history.
 - Worker dashboard and incident/task detail flow.
 - Shared incident model, API client, validators, theme, empty states, and badges.
-- Eight test files: auth service, citizen reporting workflow, incident model, municipal dashboard, municipal triage assignment, route guards, session reliability, and app widget smoke test.
+- Eight test files covering auth service, citizen reporting workflow, incident model, municipal dashboard, municipal triage assignment, route guards, session reliability, and app widget smoke test.
 
 Dependencies currently include `geolocator`, `http`, `http_parser`, `image_picker`, and `intl`. The inspected pubspec does not include a secure-storage package.
 
-## 2. Confirmed gaps and risks
+## 3. Confirmed gaps and risks
 
 ### P0 — Must address before production mobile authentication / evidence upload
 
@@ -35,7 +50,7 @@ Dependencies currently include `geolocator`, `http`, `http_parser`, `image_picke
 8. **Worker team context has a hard-coded fallback label.** The app route supplies a sample Team Alpha label when the session has no assigned team. This is demo-friendly but must not be used to decide real task visibility or permissions.
 9. **Photo upload flow needs contract verification beyond the header.** Confirm backend response semantics, supported file count/size, MIME validation, and incident-scoped photo retrieval route. The legacy filename-only photo route is not the canonical route for current content-addressed evidence.
 
-## 3. API contract comparison
+## 4. API contract comparison
 
 The inspected client methods have corresponding backend routes for:
 
@@ -59,9 +74,9 @@ Important backend behavior confirmed in source:
 - Worker mutation authorization checks trusted JWT subject and team claims server-side.
 - Cloud photo upload requires `Idempotency-Key`; do not disable this backend requirement to accommodate the client.
 
-## 4. Existing test coverage (source inventory only)
+## 5. Existing test coverage and limits
 
-The test suite contains focused tests for:
+The executed local test suite passed all 56 tests. The source inventory includes focused tests for:
 
 - Demo sessions, role parsing from `app_metadata.role`, and rejection of editable `user_metadata.role` for privilege assignment.
 - Session expiry preflight, 401 invalidation, 403 session preservation, and no bearer token in demo mode.
@@ -72,28 +87,13 @@ The test suite contains focused tests for:
 
 These tests are mock-driven. They do not establish live Supabase authentication, refresh rotation, secure-storage behavior, cloud Storage authorization, or production role behavior.
 
-## 5. Runtime test status and limitation
-
-**Flutter analyze and `flutter test` were not executed in this audit.** The repository connector can inspect source files but does not provide a local Flutter SDK/runtime. No green runtime result is claimed.
-
-Run from the repository's `mobile` directory on the development machine:
-
-```powershell
-flutter --version
-flutter pub get
-flutter analyze
-flutter test --reporter expanded
-```
-
-Capture the exact Flutter/Dart versions and full command summaries. Do not update dependencies or regenerate `pubspec.lock` until the baseline has been recorded.
-
 ## 6. Recommended execution order
 
-1. Establish the local runtime baseline (`flutter analyze`, full `flutter test`) and fix baseline failures without broad refactors.
+1. **P5.0 baseline is complete.** The local Flutter analyzer and all 56 tests passed on Flutter 3.47.9 / Dart 3.13.7.
 2. Resolve the P0 contract/security gaps: refresh-token lifecycle, secure session persistence, upload idempotency key, citizen own-report retrieval, and server-authorized worker task listing.
 3. Add mock tests for each correction, including refresh-token rotation and concurrent 401 behavior.
 4. Add build-time environment configuration and verify local/staging/production URL selection.
-5. Continue the role-specific workflows and release verification.
+5. Continue the role-specific workflows and release verification, retaining the wider DRAIN-X scope: Google OAuth, ElevenLabs voice assistance, n8n automation, multilingual/Whisper capabilities, GIS/AI/sensor features, and offline operation.
 
 ## 7. Guardrails
 
