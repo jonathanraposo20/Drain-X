@@ -2178,11 +2178,18 @@ class StateStore:
             if update.assigned_worker_id is not None:
                 incident.assigned_worker_id = update.assigned_worker_id if update.assigned_worker_id.strip() else None
 
-            # Unassignment clearing invariants:
-            if update.assigned_to == "" or update.assigned_to is None and assignment_changed:
-                incident.assignment_type = AssignmentType.NONE
+            # Canonicalize the complete assignment snapshot before persistence.
+            # Legacy/in-memory records can contain empty strings or stale assignment
+            # metadata even when their assignment type is NONE. The cloud RPC expects
+            # NONE to mean every assignment field is SQL NULL.
+            if incident.assignment_type == AssignmentType.NONE:
+                incident.assigned_to = None
                 incident.assigned_team_id = None
                 incident.assigned_worker_id = None
+            else:
+                incident.assigned_to = incident.assigned_to.strip() if incident.assigned_to and incident.assigned_to.strip() else None
+                incident.assigned_team_id = incident.assigned_team_id.strip() if incident.assigned_team_id and incident.assigned_team_id.strip() else None
+                incident.assigned_worker_id = incident.assigned_worker_id.strip() if incident.assigned_worker_id and incident.assigned_worker_id.strip() else None
 
             if update.rejection_reason is not None:
                 incident.rejection_reason = update.rejection_reason
