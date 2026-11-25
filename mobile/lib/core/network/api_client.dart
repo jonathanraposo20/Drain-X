@@ -68,6 +68,40 @@ class ApiClient {
     }
   }
 
+
+  /// Refreshes once after a server-side 401. Safe GET requests are replayed
+  /// once with the rotated access token; mutations are never replayed because
+  /// their first response may be ambiguous and duplicate operational actions.
+  Future<http.Response> _sendWithRefresh(
+    Future<http.Response> Function() send, {
+    bool retryOnUnauthorized = false,
+  }) async {
+    await _preflightSessionCheck();
+    final response = await send();
+    if (response.statusCode != 401 ||
+        _authService.currentSession?.isAuthenticated != true) {
+      return response;
+    }
+
+    try {
+      await _authService.refreshSession();
+    } on AuthException catch (error) {
+      throw ApiException(
+        error.statusCode == 400 || error.statusCode == 401 ? 401 : 0,
+        'Could not refresh the authenticated session: ${error.message}',
+      );
+    }
+
+    if (retryOnUnauthorized) {
+      return send();
+    }
+    throw ApiException(
+      401,
+      'Session refreshed, but this operation was not replayed automatically. '
+      'Please review the current incident state before trying again.',
+    );
+  }
+
   /// Centralized response inspection for 401/403 status codes.
   /// Enforces:
   /// - 401 Unauthorized: Invalidates session and clears credentials centrally.
@@ -102,9 +136,7 @@ class ApiClient {
     final uri = Uri.parse(ApiConfig.incidentsUrl).replace(queryParameters: queryParams.isEmpty ? null : queryParams);
 
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body) as List<dynamic>;
@@ -125,9 +157,7 @@ class ApiClient {
 
     final uri = Uri.parse(ApiConfig.incidentDetailUrl(id));
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -168,13 +198,13 @@ class ApiClient {
     };
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 201) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -252,13 +282,13 @@ class ApiClient {
     if (municipalNotes != null) payload['municipal_notes'] = municipalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .patch(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -279,9 +309,7 @@ class ApiClient {
 
     final uri = Uri.parse(ApiConfig.municipalKpisUrl);
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         return jsonDecode(response.body) as Map<String, dynamic>;
@@ -321,9 +349,7 @@ class ApiClient {
 
     final uri = Uri.parse(ApiConfig.municipalQueueUrl).replace(queryParameters: queryParams);
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -352,9 +378,7 @@ class ApiClient {
 
     final uri = Uri.parse(ApiConfig.fieldTeamsUrl);
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body) as List<dynamic>;
@@ -385,13 +409,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -423,13 +447,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -461,13 +485,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -497,13 +521,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -533,13 +557,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -560,9 +584,7 @@ class ApiClient {
 
     final uri = Uri.parse(ApiConfig.incidentAuditUrl(id));
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body) as List<dynamic>;
