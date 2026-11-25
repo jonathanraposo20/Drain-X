@@ -940,6 +940,48 @@ def test_atomic_cloud_municipal_transaction_rpc(auth_client: TestClient):
         assert call_kwargs["action"] == "ASSIGNED"
 
 
+def test_cloud_status_only_update_canonicalizes_unassigned_snapshot(auth_client: TestClient):
+    """A status-only cloud update must send SQL NULLs for a NONE assignment snapshot."""
+    from app.services.persistence_repository import persistence_repo
+
+    muni_headers = _headers_for("municipality", user_id="dispatcher-snapshot-01")
+    created = auth_client.post("/api/v1/incidents", json={
+        "category": "FLOODING",
+        "description": "Status-only update with a legacy empty assignment snapshot.",
+        "latitude": 15.495,
+        "longitude": 73.832,
+        "source": "CITIZEN",
+    })
+    assert created.status_code == 201
+    incident_id = created.json()["id"]
+
+    # Simulate a stale/legacy in-memory object: NONE must never carry empty strings.
+    incident = state_store.get_incident(incident_id)
+    incident.assigned_to = " "
+    incident.assigned_team_id = ""
+    incident.assigned_worker_id = " "
+
+    rpc_result = {"id": incident_id, "status": "VERIFIED", "assignment_type": "NONE"}
+    with patch.object(persistence_repo, "_is_configured", True), \
+         patch.object(
+             persistence_repo,
+             "execute_municipal_incident_transaction_sync",
+             return_value=rpc_result,
+         ) as mock_rpc:
+        response = auth_client.patch(
+            f"/api/v1/incidents/{incident_id}",
+            headers=muni_headers,
+            json={"status": "VERIFIED"},
+        )
+
+    assert response.status_code == 200, response.text
+    args = mock_rpc.call_args.kwargs
+    assert args["assignment_type"] == "NONE"
+    assert args["assigned_to"] is None
+    assert args["assigned_team_id"] is None
+    assert args["assigned_worker_id"] is None
+
+
 def test_cloud_environment_mutation_fails_closed_on_cloud_error(auth_client: TestClient):
     """P1.3.6.2.3.1 Phase 4: In true cloud environment, municipal operation aborts if cloud write fails."""
     from app.services.persistence_repository import persistence_repo

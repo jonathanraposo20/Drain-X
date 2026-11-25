@@ -57,7 +57,8 @@ export const UrbanGisDashboard: React.FC<UrbanGisDashboardProps> = ({
     incidents: true,
   });
 
-  const [tileProvider, setTileProvider] = useState<'carto_dark' | 'osm_standard'>('carto_dark');
+  // Use the key-free OpenStreetMap layer by default to avoid CARTO API-key watermarks.
+  const [tileProvider, setTileProvider] = useState<'carto_dark' | 'osm_standard'>('osm_standard');
 
   // Selected Entity State for Inspection Drawer
   const [selectedStation, setSelectedStation] = useState<GisMonitoringStation | null>(null);
