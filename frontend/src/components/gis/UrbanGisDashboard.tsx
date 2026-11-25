@@ -24,6 +24,8 @@ import { GisLegend } from './GisLegend';
 import { CitizenReportModal } from './CitizenReportModal';
 import { MunicipalOperationsPanel } from './MunicipalOperationsPanel';
 import { apiClient } from '../../api/client';
+import { useOptionalAuth } from '../../auth/AuthContext';
+import { IncidentStreamClient } from '../../api/incidentStreamClient';
 import {
   MapPin,
   Layers,
@@ -93,6 +95,41 @@ export const UrbanGisDashboard: React.FC<UrbanGisDashboardProps> = ({
     const interval = setInterval(fetchIncidents, 6000);
     return () => clearInterval(interval);
   }, [fetchIncidents]);
+
+  // Connect to authoritative incident real-time WebSocket stream when authenticated
+  const auth = useOptionalAuth();
+  const token = auth?.session?.access_token || null;
+
+  useEffect(() => {
+    if (!token) return;
+
+    const stream = new IncidentStreamClient({
+      token,
+      onEvent: (event) => {
+        if (event.incident) {
+          setLiveIncidents((prev) => {
+            const exists = prev.some((i) => i.id === event.incident!.id);
+            if (exists) {
+              return prev.map((i) => (i.id === event.incident!.id ? event.incident! : i));
+            } else {
+              return [event.incident!, ...prev];
+            }
+          });
+        } else {
+          fetchIncidents();
+        }
+      },
+      onResyncRequired: () => {
+        fetchIncidents();
+      },
+    });
+
+    stream.connect();
+
+    return () => {
+      stream.disconnect();
+    };
+  }, [token, fetchIncidents]);
 
   // Handle new incident created
   const handleIncidentCreated = (newIncident: IncidentResponseContract) => {

@@ -269,7 +269,7 @@ def test_fault_detection_on_physical_telemetry(client: TestClient):
     assert any(a["alert_type"] == "IMPLAUSIBLE_READING" for a in alerts)
 
 
-def test_physical_telemetry_isolation_from_simulation(client: TestClient):
+def test_physical_telemetry_isolation_from_simulation(municipal_client: TestClient):
     """
     Verify that physical telemetry ingestion does not start or corrupt simulation scenarios.
     """
@@ -284,11 +284,11 @@ def test_physical_telemetry_isolation_from_simulation(client: TestClient):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    resp = client.post("/api/v1/telemetry", json=payload)
+    resp = municipal_client.post("/api/v1/telemetry", json=payload)
     assert resp.status_code == 201
 
     # Check simulation status is still not running an uncommanded scenario
-    sim_status = client.get("/api/v1/simulation/state")
+    sim_status = municipal_client.get("/api/v1/simulation/state")
     assert sim_status.status_code == 200
     sim_data = sim_status.json()
     # Ingesting physical telemetry must not have launched a simulation scenario

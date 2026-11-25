@@ -7,14 +7,51 @@ Endpoints for managing physical and simulated edge controllers (ESP32 DevKit V1)
 tracking hardware validation stages, firmware revisions, and connection timestamps.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Set
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.core.security import require_roles, get_current_user_claims
+from app.core.security import require_roles
 from app.services.persistence_repository import persistence_repo
 
 router = APIRouter(prefix="/devices", tags=["Device Registry"])
+
+_PROTECTED_DEVICE_METADATA_KEYS: FrozenSet[str] = frozenset({
+    "assigned_worker_id",
+    "assigned_worker",
+    "worker_id",
+    "assigned_team_id",
+    "assigned_team",
+    "team_id",
+    "team",
+    "assigned_devices",
+    "allowed_devices",
+    "assigned_device",
+    "assigned_sections",
+    "allowed_sections",
+    "assigned_section",
+    "section_id",
+    "owner_id",
+    "role",
+    "permissions",
+    "authorized_workers",
+    "authorized_teams",
+})
+
+
+def _find_protected_metadata_keys(obj: Any) -> Set[str]:
+    """Recursively detects authorization-sensitive metadata keys in nested payloads."""
+    found: Set[str] = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key_norm = str(k).strip().lower()
+            if key_norm in _PROTECTED_DEVICE_METADATA_KEYS:
+                found.add(key_norm)
+            found.update(_find_protected_metadata_keys(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.update(_find_protected_metadata_keys(item))
+    return found
 
 
 class DeviceRegistrationRequest(BaseModel):
@@ -60,13 +97,47 @@ async def get_device(device_id: str) -> Dict[str, Any]:
 @router.post(
     "",
     summary="Register or update an IoT edge device",
-    dependencies=[Depends(require_roles(["admin", "municipality", "worker", "service_role"]))],
 )
-async def register_device(payload: DeviceRegistrationRequest) -> Dict[str, Any]:
+async def register_device(
+    payload: DeviceRegistrationRequest,
+    claims: Dict[str, Any] = Depends(require_roles(["admin", "municipality", "worker", "service_role"])),
+) -> Dict[str, Any]:
     """
     Registers a new edge hardware node or updates firmware and validation stage.
     Protected by role-based access control when Supabase Auth is enabled.
+    Workers are strictly prohibited from setting or overwriting authorization-sensitive metadata.
     """
+    if claims.get("extracted_role") == "worker":
+        if _find_protected_metadata_keys(payload.metadata):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Field workers are not authorized to set or modify authorization-sensitive device metadata.",
+            )
+        try:
+            existing = await persistence_repo.get_device(payload.device_id, strict=True)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Device registry persistence store is unavailable.",
+            ) from exc
+
+        if existing is not None:
+            if _find_protected_metadata_keys(existing.get("metadata") or {}):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Field workers are not authorized to overwrite a device containing managed authorization metadata.",
+                )
+            if bool(payload.is_active) != bool(existing.get("is_active", True)):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Field workers are not authorized to change device activation status.",
+                )
+
     registered = await persistence_repo.register_device(payload.model_dump())
     return {
         "status": "success",

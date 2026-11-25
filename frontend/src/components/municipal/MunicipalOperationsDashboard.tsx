@@ -34,6 +34,8 @@ import {
   IncidentAuditContract,
 } from '../../types/contracts';
 import { apiClient, ApiError } from '../../api/client';
+import { useOptionalAuth } from '../../auth/AuthContext';
+import { IncidentStreamClient } from '../../api/incidentStreamClient';
 
 export const MUNICIPAL_FIELD_CREWS = [
   'Team Alpha — St. Inez Drainage Crew',
@@ -195,6 +197,30 @@ export const MunicipalOperationsDashboard: React.FC = () => {
   useEffect(() => {
     loadDashboardData();
   }, [loadDashboardData]);
+
+  // Connect to authoritative incident real-time WebSocket stream when authenticated
+  const auth = useOptionalAuth();
+  const token = auth?.session?.access_token || null;
+
+  useEffect(() => {
+    if (!token) return;
+
+    const stream = new IncidentStreamClient({
+      token,
+      onEvent: () => {
+        loadDashboardData(true);
+      },
+      onResyncRequired: () => {
+        loadDashboardData(true);
+      },
+    });
+
+    stream.connect();
+
+    return () => {
+      stream.disconnect();
+    };
+  }, [token, loadDashboardData]);
 
   const handleClearFilters = () => {
     setSearchQuery('');

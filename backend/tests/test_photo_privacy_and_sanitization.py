@@ -257,7 +257,8 @@ def test_7_cache_control_and_security_headers_present(client: TestClient):
 
     get_resp = client.get(photo_url)
     assert get_resp.status_code == 200
-    assert get_resp.headers["cache-control"] == "public, max-age=3600"
+    assert "private" in get_resp.headers["cache-control"]
+    assert "no-store" in get_resp.headers["cache-control"]
     assert get_resp.headers["x-content-type-options"] == "nosniff"
 
 

@@ -10,20 +10,26 @@ services:
     autoDeploy: false
     envVars:
       - key: ENVIRONMENT
-        value: development
+        value: production
       - key: DEBUG
         value: "false"
       - key: SYSTEM_MODE
         value: SIMULATION
+      - key: SUPABASE_AUTH_ENABLED
+        value: "true"
+      - key: RATE_LIMIT_ENABLED
+        value: "true"
+      - key: RATE_LIMIT_STORAGE_BACKEND
+        value: database
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: SUPABASE_AUTH_ENABLED
-        value: "false"
       - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: RATE_LIMIT_KEY_PEPPER
         sync: false
       - key: DEVICE_INGEST_API_KEY
         sync: false

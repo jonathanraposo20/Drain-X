@@ -438,7 +438,8 @@ def test_13_photo_serving_security_headers_and_unregistered_rejection(auth_clien
     assert get_photo_resp.status_code == 200
     assert get_photo_resp.headers["content-type"] == "image/jpeg"
     assert get_photo_resp.headers["x-content-type-options"] == "nosniff"
-    assert "public" in get_photo_resp.headers["cache-control"]
+    assert "private" in get_photo_resp.headers["cache-control"]
+    assert "no-store" in get_photo_resp.headers["cache-control"]
     assert len(get_photo_resp.content) > 0
 
     # 3. Unregistered photo filename (even if valid regex) returns 404
