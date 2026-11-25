@@ -51,7 +51,7 @@ DRAIN-X transforms urban drainage into a proactive, intelligent, closed-loop cyb
 
 ## 📍 Current Development Status
 
-The current repository checkpoint includes the backend incident-security and municipal-operations expansion, a React municipal operations dashboard, and active citizen, municipality, and worker workflows in the Flutter application.
+The current repository checkpoint includes the backend incident-security and municipal-operations expansion, a React municipal operations dashboard, Supabase-backed incident persistence, and role-aware operational APIs. Flutter/mobile end-to-end acceptance remains deferred until Phase 4 is formally closed.
 
 | Component / Layer | Status | Implementation Details |
 | :--- | :--- | :--- |
@@ -61,8 +61,9 @@ The current repository checkpoint includes the backend incident-security and mun
 | **Authentication & Authorization** | **Implemented** | Supabase JWT verification, trusted app_metadata.role extraction, role-aware API access, and protected municipal operations. |
 | **Incident Privacy & Media Handling** | **Implemented** | Server-side response redaction, image validation/re-encoding, and EXIF metadata removal for supported uploads. |
 | **Municipal Operations Dashboard** | **Implemented** | KPI cards, incident queue, filtering, pagination, incident inspection, triage actions, field-team assignment, and audit-history views. |
-| **Durable Incident Auditing** | **Implemented in Application; Cloud Migration Prepared** | Append-only local JSONL journal, Supabase persistence integration, and SQL migration for audit records and transactional triage. Migration 004 is prepared locally and is not represented as applied to production. |
-| **Flutter Mobile Application** | **Active Implementation** | Citizen, municipality, and worker entry flows; authentication/session handling; route guards; citizen reporting and incident views; municipal and worker dashboards; API, location, and media services. |
+| **Durable Incident Auditing** | **Implemented; Production RPC Path Configured** | Append-only local JSONL fallback, Supabase persistence integration, and transactional incident/audit RPCs. Production RPC execution is restricted to the backend service role. |
+| **GIS Tile Layer** | **Implemented** | OpenStreetMap Standard is the default key-free basemap; CARTO Dark remains an optional selectable layer. |
+| **Flutter Mobile Application** | **Deferred — Phase 4 Gate** | Mobile workflows are not treated as Phase 4 acceptance. End-to-end mobile verification is deferred until Phase 4 is formally closed. |
 | **Physical Prototype** | **Mechanical Preparation Complete; Electronics Integration Pending** | Chassis assembly, component placement, and mounting-hole preparation are complete. Sensors, ESP32, and actuator are not yet fully mounted, wired, and integrated with the backend. |
 
 ## 🏗 System Architecture
@@ -241,12 +242,13 @@ DRAIN-X establishes an unambiguous telemetry source and connection status abstra
 - **Role-Aware Incident Privacy:** Public, citizen, and worker responses redact reporter identity and internal staff notes; privileged municipal roles receive the operational fields required for triage.
 - **Photo Privacy:** Supported JPEG, PNG, and WebP uploads are validated and re-encoded server-side to remove EXIF and other embedded metadata, with image-size safeguards.
 - **Municipal Workflow Authorization:** Incident verification, assignment, reassignment, unassignment, rejection, and status changes are protected by backend role and workflow checks.
-- **Durable Audit Trail:** Municipal workflow actions create incident audit records. The database migration defines append-only audit protection and transactional incident/audit updates.
-- **RPC Privileges:** The prepared migration restricts municipal and citizen incident RPC execution to the backend service_role; clients are expected to use the FastAPI boundary rather than calling these RPCs directly.
+- **Durable Audit Trail:** Municipal workflow actions create incident audit records through the backend persistence layer, with a local append-only JSONL fallback.
+- **RPC Privileges:** Production incident transaction RPC execution is restricted to the backend service_role; clients are expected to use the FastAPI boundary rather than calling these RPCs directly.
+- **Incident Assignment Integrity:** Before cloud writes, unassigned (NONE) incidents are canonicalized so all assignment fields are SQL NULL. Legacy team-only assignee updates are resolved against the canonical field-team directory before persistence.
 - **WebSocket Safety Invariant:** Telemetry WebSockets are read-only monitoring channels; actuation commands are not accepted over WebSocket frames.
 - **CORS & Origin Isolation:** Dynamic origin validation prevents unauthorized cross-origin requests.
 
-> **Database migration status:** database/migrations/004_incident_audits_and_triage.sql is a prepared migration file. It has not been applied to production as part of this repository update. Review and test it against the target Supabase project before applying it.
+> **Database migration status:** The repository migration set has been validated against a disposable PostgreSQL 17 instance, including reapplication/idempotency checks for migration 008. Production Supabase migration history is not a one-to-one record of repository migrations 001–008: it records six later cleanup migrations, while the original numbered migration history is not fully represented there. Production database objects and RPC privileges have been audited separately; do not infer production application of every numbered repository migration from the migration-history table.
 
 ## 📖 API Reference
 
@@ -305,13 +307,16 @@ DRAIN-X uses Supabase PostgreSQL with backend-mediated persistence and role-awar
 1. database/migrations/001_initial_schema.sql: Core drainage, sensor, telemetry, alert, blockage, and prediction schema.
 2. database/migrations/002_devices_and_mode_history.sql: Edge-device registry, operational-mode history, and related indexes.
 3. database/migrations/003_supabase_rls_and_security.sql: Row Level Security policies and database security foundations.
-4. database/migrations/004_incident_audits_and_triage.sql: Prepared schema and policy changes for field teams, incidents, append-only incident audits, and municipal triage transactions. **Prepared locally; not yet applied to production.**
+4. database/migrations/004_incident_audits_and_triage.sql: Field teams, incident audit records, and transactional municipal triage.
+5. Repository migrations 005–008 extend the database security, operational, and performance setup. The full 001–008 sequence was validated locally against disposable PostgreSQL 17; migration 008 reapplication was verified as idempotent.
+6. Production Supabase has six separately recorded cleanup migrations. Because its migration history does not mirror the repository's original numbered sequence, production status is verified against the live schema and privileges rather than inferred from migration numbers.
 
 ### Incident Persistence & Audit Design:
 - The FastAPI backend mediates incident access and municipal workflow operations.
 - Incident audit events are persisted through the application persistence layer, with a local append-only JSONL journal as a durability fallback.
-- The migration defines an append-only audit table and a transaction RPC for incident state changes and corresponding audit insertion.
-- The prepared migration grants direct execution of the incident RPCs to service_role, keeping client access behind the backend API.
+- Supabase transaction RPCs apply incident state changes and corresponding audit insertion atomically.
+- Production RPC execution is restricted to service_role, keeping client access behind the backend API.
+- Assignment snapshots are normalized before RPC calls: NONE assignments persist with NULL assignment fields, while legacy team-only updates are resolved to canonical team records.
 
 ### Key Telemetry Indexes:
 - idx_sensor_readings_sensor_ts: (sensor_id, timestamp DESC)
@@ -374,21 +379,13 @@ SUPABASE_JWT_SECRET=your-hs256-secret-min-16-chars
 
 DRAIN-X includes automated tests across the backend, web frontend, and Flutter application.
 
-### Existing Recorded Baseline:
-The previously documented P1.2 baseline recorded:
-- **Backend:** 161 passing tests.
-- **Frontend:** 77 passing tests across 10 suites.
-- **Combined recorded baseline:** 238 passing tests.
-- **Frontend production build:** Previously verified successfully.
+### Latest Verified Test Results:
+- **GitHub Actions backend CI:** 680 passed, 9 skipped, 2 warnings on the PR #9 source branch.
+- **Disposable PostgreSQL 17 validation:** 673 backend tests passed against the disposable database configuration; migrations 001–008 applied, migration 008 reapplication passed, and backup/restore parity checks passed.
+- **Frontend:** 94 Vitest tests were previously verified; the Vercel check for PR #9 passed.
+- **Production acceptance:** Health/readiness and public status endpoints were previously verified. Auth login/refresh, full live JWT/RBAC role matrix, incident write lifecycle, private Storage upload/download, duplicate-scan confirmation, SAFE_HOLD transition, and live rate-limit burst remain not fully verified.
 
-### Coverage Added in the Latest Repository Update:
-- Backend incident authorization and privacy tests.
-- Municipal triage, assignment, and dashboard API tests.
-- Photo validation and metadata-sanitization tests.
-- Frontend municipal operations dashboard tests.
-- Flutter authentication, route-guard, session-reliability, citizen-reporting, municipal-dashboard, and triage workflow tests.
-
-> The 238-test figure is the previously recorded baseline, not a fresh total for the latest expanded test suite. Re-run the backend, frontend, and Flutter test commands before publishing a new aggregate test count.
+> These are separate test runs/configurations, not one combined test count. Skipped tests and warnings are reported rather than counted as passes.
 
 ## ☁️ Deployment Architecture
 
@@ -396,7 +393,7 @@ DRAIN-X is configured for staging hosting across independent cloud tiers:
 
 ```
 [ ESP32 Microcontroller ] ---> [ Render Web Service ] ---> [ Supabase Cloud ]
- (HTTPS + X-Device-Key)          (FastAPI ASGI Docker)       (PostgreSQL 15 + RLS)
+ (HTTPS + X-Device-Key)          (FastAPI ASGI Docker)       (PostgreSQL 17 + RLS)
                                           ^
                                           | (WSS / REST)
                                [ Vercel Edge Hosting ]
