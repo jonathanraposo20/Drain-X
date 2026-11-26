@@ -240,7 +240,19 @@ class AuthService with ChangeNotifier {
         fallbackName: current.name,
         fallbackRefreshToken: refreshToken,
       );
-      await _persistSession(refreshed);
+      try {
+        await _persistSession(refreshed);
+      } on AuthException {
+        // Supabase has already rotated the refresh token. If secure storage
+        // cannot save its replacement, the old token may no longer be usable.
+        // Fail closed rather than retaining credentials that can strand the
+        // user in a broken session after the next request or app restart.
+        await _invalidateAfterRefreshPersistenceFailure();
+        throw AuthException(
+          'Your session was refreshed, but the new credentials could not be '
+          'saved securely. Please sign in again.',
+        );
+      }
       _currentSession = refreshed;
       notifyListeners();
       return refreshed;
@@ -306,6 +318,27 @@ class AuthService with ChangeNotifier {
       await _sessionStore.writeSession(jsonEncode(session.toJson()));
     } catch (error) {
       throw AuthException('Could not securely persist the authentication session: $error');
+    }
+  }
+
+  /// Fails closed when Supabase rotates a refresh token but the replacement
+  /// cannot be persisted. The previous refresh token may already be invalid.
+  Future<void> _invalidateAfterRefreshPersistenceFailure() async {
+    final hadSession = _currentSession != null;
+    _currentSession = null;
+    try {
+      await _sessionStore.clearSession();
+    } catch (_) {
+      // A later restore will reject the stale token with Supabase and clear it.
+    }
+    if (hadSession) notifyListeners();
+    try {
+      AppRoutes.navigatorKey.currentState?.pushNamedAndRemoveUntil(
+        AppRoutes.welcome,
+        (route) => false,
+      );
+    } catch (_) {
+      // Safe no-op without an active Navigator (e.g. unit tests).
     }
   }
 
