@@ -156,6 +156,7 @@ void main() {
     );
     auth.setSessionForTesting(previousSession);
     store.value = jsonEncode(previousSession.toJson());
+    store.clears = 0;
     store.failNextWrite = true;
 
     var refreshCalls = 0;
