@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 
 class LocationResult {
@@ -101,8 +102,14 @@ class GeolocatorLocationService implements LocationService {
   }
 
   @override
-  Future<bool> openAppSettings() => Geolocator.openAppSettings();
+  Future<bool> openAppSettings() async {
+    if (kIsWeb) return false;
+    return Geolocator.openAppSettings();
+  }
 
   @override
-  Future<bool> openLocationSettings() => Geolocator.openLocationSettings();
+  Future<bool> openLocationSettings() async {
+    if (kIsWeb) return false;
+    return Geolocator.openLocationSettings();
+  }
 }

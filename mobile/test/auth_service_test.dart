@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:supabase_flutter/supabase_flutter.dart' as supabase;
 import 'package:drainx_mobile/core/auth/auth_service.dart';
 import 'package:drainx_mobile/core/config/api_config.dart';
 import 'package:drainx_mobile/models/user_session.dart';
@@ -11,10 +12,12 @@ void main() {
 
   setUp(() {
     authService = AuthService();
+    authService.setSupabaseClientForTesting(null);
     authService.logout(); // Reset session before each test
   });
 
   tearDown(() {
+    authService.setSupabaseClientForTesting(null);
     authService.logout();
     ApiConfig.supabaseUrl = null;
     ApiConfig.supabaseAnonKey = null;
@@ -134,43 +137,53 @@ void main() {
       expect(authService.currentRole, isNull);
     });
 
-    test('authenticates via mock Supabase endpoint extracting app_metadata.role', () async {
+    test('authenticates through Supabase SDK and trusts app_metadata.role', () async {
       ApiConfig.supabaseUrl = 'https://mock.supabase.co';
-      ApiConfig.supabaseAnonKey = 'mock-anon-key-12345';
+      ApiConfig.supabaseAnonKey = 'mock-publishable-key';
 
+      final now = DateTime.now().toUtc();
+      final exp = now.millisecondsSinceEpoch ~/ 1000 + 3600;
+      final payload = base64Url.encode(utf8.encode(jsonEncode({'exp': exp}))).replaceAll('=', '');
+      final accessToken = 'eyJhbGciOiJub25lIn0.$payload.signature';
       final mockClient = MockClient((request) async {
-        if (request.url.path.contains('/auth/v1/token')) {
-          final body = jsonDecode(request.body) as Map<String, dynamic>;
-          if (body['email'] == 'officer@drainx.gov' && body['password'] == 'Secret123!') {
-            return http.Response(
-              jsonEncode({
-                'access_token': 'jwt-mock-access-token-xyz',
-                'refresh_token': 'jwt-mock-refresh-token',
-                'expires_in': 3600,
-                'user': {
-                  'id': 'usr-supabase-uuid-1',
-                  'email': 'officer@drainx.gov',
-                  // Anti-Privilege Escalation: Role must come from app_metadata
-                  'app_metadata': {
-                    'role': 'municipality',
-                  },
-                  // Editable user_metadata attempts to claim admin (must be ignored)
-                  'user_metadata': {
-                    'role': 'admin_root',
-                    'full_name': 'Municipal Supervisor Rao',
-                  },
+        if (request.url.path.endsWith('/token') &&
+            request.url.queryParameters['grant_type'] == 'password') {
+          return http.Response(
+            jsonEncode({
+              'access_token': accessToken,
+              'refresh_token': 'jwt-mock-refresh-token',
+              'token_type': 'bearer',
+              'expires_in': 3600,
+              'expires_at': exp,
+              'user': {
+                'id': 'usr-supabase-uuid-1',
+                'aud': 'authenticated',
+                'created_at': now.toIso8601String(),
+                'email': 'officer@drainx.gov',
+                'app_metadata': {'role': 'municipality'},
+                'user_metadata': {
+                  'role': 'admin_root',
+                  'full_name': 'Municipal Supervisor Rao',
                 },
-              }),
-              200,
-              headers: {'Content-Type': 'application/json'},
-            );
-          }
-          return http.Response(jsonEncode({'error_description': 'Invalid credentials'}), 400);
+              },
+            }),
+            200,
+            headers: {'Content-Type': 'application/json'},
+          );
+        }
+        if (request.url.path.endsWith('/logout')) {
+          return http.Response('', 204);
         }
         return http.Response('Not Found', 404);
       });
 
-      authService.httpClient = mockClient;
+      final client = supabase.SupabaseClient(
+        'https://mock.supabase.co',
+        'mock-publishable-key',
+        authOptions: const supabase.AuthClientOptions(autoRefreshToken: false),
+        httpClient: mockClient,
+      );
+      authService.setSupabaseClientForTesting(client);
 
       final session = await authService.loginWithCredentials(
         email: 'officer@drainx.gov',
@@ -179,11 +192,83 @@ void main() {
 
       expect(session.userId, 'usr-supabase-uuid-1');
       expect(session.name, 'Municipal Supervisor Rao');
-      // Verify app_metadata was used, NOT user_metadata
       expect(session.role, UserRole.municipality);
-      expect(session.token, 'jwt-mock-access-token-xyz');
+      expect(session.token, accessToken);
+      expect(session.refreshToken, 'jwt-mock-refresh-token');
       expect(session.isAuthenticated, isTrue);
       expect(session.isDemo, isFalse);
+
+      authService.setSupabaseClientForTesting(null);
+      await client.dispose();
+    });
+
+    test('refreshes an expired Supabase session before protected API use', () async {
+      ApiConfig.supabaseUrl = 'https://mock.supabase.co';
+      ApiConfig.supabaseAnonKey = 'mock-publishable-key';
+      final nowSeconds = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      String tokenWithExp(int exp) {
+        final payload = base64Url.encode(
+          utf8.encode(jsonEncode({'exp': exp})),
+        ).replaceAll('=', '');
+        return 'eyJhbGciOiJub25lIn0.$payload.signature';
+      }
+
+      final expiredToken = tokenWithExp(nowSeconds - 60);
+      final freshToken = tokenWithExp(nowSeconds + 3600);
+      var refreshRequested = false;
+      final now = DateTime.now().toUtc();
+      final mockClient = MockClient((request) async {
+        final grantType = request.url.queryParameters['grant_type'];
+        if (request.url.path.endsWith('/token') &&
+            (grantType == 'password' || grantType == 'refresh_token')) {
+          final expired = grantType == 'password';
+          if (!expired) refreshRequested = true;
+          final exp = expired ? nowSeconds - 60 : nowSeconds + 3600;
+          return http.Response(
+            jsonEncode({
+              'access_token': expired ? expiredToken : freshToken,
+              'refresh_token': expired ? 'old-refresh-token' : 'rotated-refresh-token',
+              'token_type': 'bearer',
+              'expires_in': expired ? 0 : 3600,
+              'expires_at': exp,
+              'user': {
+                'id': 'usr-refresh-test',
+                'aud': 'authenticated',
+                'created_at': now.toIso8601String(),
+                'email': 'worker@drainx.gov',
+                'app_metadata': {'role': 'worker', 'team': 'Team Alpha'},
+                'user_metadata': {'full_name': 'Field Worker'},
+              },
+            }),
+            200,
+            headers: {'Content-Type': 'application/json'},
+          );
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final client = supabase.SupabaseClient(
+        'https://mock.supabase.co',
+        'mock-publishable-key',
+        authOptions: const supabase.AuthClientOptions(autoRefreshToken: false),
+        httpClient: mockClient,
+      );
+      authService.setSupabaseClientForTesting(client);
+      final session = await authService.loginWithCredentials(
+        email: 'worker@drainx.gov',
+        password: 'Secret123!',
+      );
+      expect(session.isTokenExpired, isTrue);
+
+      await authService.ensureValidSession();
+
+      expect(refreshRequested, isTrue);
+      expect(authService.currentToken, freshToken);
+      expect(authService.currentSession?.refreshToken, 'rotated-refresh-token');
+      expect(authService.currentSession?.isTokenExpired, isFalse);
+
+      authService.setSupabaseClientForTesting(null);
+      await client.dispose();
     });
   });
 }

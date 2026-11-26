@@ -5,7 +5,6 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:drainx_mobile/app/routes.dart';
 import 'package:drainx_mobile/core/auth/auth_service.dart';
-import 'package:drainx_mobile/core/config/api_config.dart';
 import 'package:drainx_mobile/core/network/api_client.dart';
 import 'package:drainx_mobile/features/auth/unauthorized_screen.dart';
 import 'package:drainx_mobile/features/auth/worker_login_screen.dart';
@@ -123,28 +122,15 @@ void main() {
       expect(capturedAuthHeader, isNull);
 
       // Test 2: When authenticated with token, Bearer header is automatically injected
-      ApiConfig.supabaseUrl = 'https://mock.supabase.co';
-      ApiConfig.supabaseAnonKey = 'anon-key-xyz';
-
-      final mockAuthClient = MockClient((request) async {
-        if (request.url.path.contains('/auth/v1/token')) {
-          return http.Response(
-            jsonEncode({
-              'access_token': 'secret-bearer-token-abc',
-              'user': {
-                'id': 'usr-1',
-                'app_metadata': {'role': 'municipality'},
-                'user_metadata': {'name': 'Officer Rao'},
-              },
-            }),
-            200,
-          );
-        }
-        return http.Response('Not Found', 404);
-      });
-
-      auth.httpClient = mockAuthClient;
-      await auth.loginWithCredentials(email: 'rao@drainx.gov', password: 'password');
+      auth.setSessionForTesting(UserSession(
+        userId: 'usr-1',
+        name: 'Officer Rao',
+        email: 'rao@drainx.gov',
+        role: UserRole.municipality,
+        authType: AuthType.authenticated,
+        token: 'secret-bearer-token-abc',
+        expiresAt: DateTime.now().add(const Duration(hours: 1)),
+      ));
 
       final authedClient = ApiClient(httpClient: mockClient, authService: auth);
       await authedClient.getIncidents();

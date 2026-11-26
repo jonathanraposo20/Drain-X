@@ -6,6 +6,7 @@ import '../../models/user_session.dart';
 import 'citizen_login_screen.dart';
 import 'municipal_login_screen.dart';
 import 'worker_login_screen.dart';
+import 'supabase_login_screen.dart';
 import '../citizen/citizen_dashboard_screen.dart';
 import '../municipal/municipal_dashboard_screen.dart';
 import '../worker/worker_dashboard_screen.dart';
@@ -18,6 +19,23 @@ class WelcomeScreen extends StatefulWidget {
 }
 
 class _WelcomeScreenState extends State<WelcomeScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final session = AuthService().currentSession;
+      if (session == null || !session.isAuthenticated) return;
+
+      final destination = switch (session.role) {
+        UserRole.citizen => '/citizen/dashboard',
+        UserRole.municipality => '/municipal/dashboard',
+        UserRole.fieldWorker => '/worker/dashboard',
+      };
+      Navigator.of(context).pushReplacementNamed(destination);
+    });
+  }
+
   void _openBackendConfigDialog() {
     final controller = TextEditingController(text: ApiConfig.baseUrl);
     showDialog(
@@ -253,7 +271,31 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
               const SizedBox(height: 12),
             ],
 
-            // Three Distinct Entry Experience Cards
+            // Real Supabase account sign-in is separate from the demo portals.
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => const SupabaseLoginScreen()),
+                    );
+                  },
+                  icon: const Icon(Icons.lock_outline),
+                  label: const Text('Sign in with DRAIN-X account'),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    foregroundColor: AppTheme.accentTeal,
+                    side: const BorderSide(color: AppTheme.accentTeal),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // Three Distinct Entry Experience Cards (Demo Mode)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20),
               child: Column(
