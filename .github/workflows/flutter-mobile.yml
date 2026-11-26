@@ -2,8 +2,6 @@ name: Flutter mobile checks
 
 on:
   pull_request:
-    branches:
-      - main
     paths:
       - "mobile/**"
       - ".github/workflows/flutter-mobile.yml"
