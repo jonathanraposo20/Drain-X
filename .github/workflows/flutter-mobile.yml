@@ -8,7 +8,7 @@ on:
       - ".github/workflows/flutter-mobile.yml"
   push:
     branches:
-      - main
+      - "**"
     paths:
       - "mobile/**"
       - ".github/workflows/flutter-mobile.yml"
