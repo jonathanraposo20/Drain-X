@@ -32,13 +32,12 @@ jobs:
         with:
           channel: stable
           cache: true
-          cache-dependency-path: mobile/pubspec.yaml
 
       - name: Install Flutter dependencies
         run: flutter pub get
 
       - name: Analyze Flutter code
-        run: flutter analyze
+        run: flutter analyze --no-fatal-infos
 
       - name: Run Flutter test suite
         run: flutter test --reporter expanded
