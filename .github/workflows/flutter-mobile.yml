@@ -1,4 +1,5 @@
 name: Flutter mobile checks
+# Validate mobile changes before merging P5.1.
 
 on:
   pull_request:
