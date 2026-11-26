@@ -19,6 +19,23 @@ class WelcomeScreen extends StatefulWidget {
 }
 
 class _WelcomeScreenState extends State<WelcomeScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final session = AuthService().currentSession;
+      if (session == null || !session.isAuthenticated) return;
+
+      final destination = switch (session.role) {
+        UserRole.citizen => '/citizen/dashboard',
+        UserRole.municipality => '/municipal/dashboard',
+        UserRole.fieldWorker => '/worker/dashboard',
+      };
+      Navigator.of(context).pushReplacementNamed(destination);
+    });
+  }
+
   void _openBackendConfigDialog() {
     final controller = TextEditingController(text: ApiConfig.baseUrl);
     showDialog(
