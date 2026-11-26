@@ -1,4 +1,5 @@
 name: Flutter mobile checks
+# Continuous validation for Flutter source changes.
 
 on:
   pull_request:
