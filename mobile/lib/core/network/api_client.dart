@@ -54,12 +54,62 @@ class ApiClient {
 
   /// Validates session expiry prior to initiating an authenticated request.
   /// Detects expired JWTs before placing bytes on the network.
-  void _preflightSessionCheck() {
+  Future<void> _preflightSessionCheck() async {
     final session = _authService.currentSession;
     if (session != null && session.isAuthenticated && session.isTokenExpired) {
-      _authService.handleUnauthorized();
-      throw ApiException(401, 'Authentication token has expired. Stale session invalidated.');
+      // A JWT without a refresh token cannot be renewed. Invalidate it before
+      // any protected request is dispatched, preserving the pre-refresh
+      // contract for legacy/partially provisioned sessions.
+      if (session.refreshToken == null || session.refreshToken!.isEmpty) {
+        _authService.handleUnauthorized(redirect: false);
+        throw ApiException(
+          401,
+          'Authentication token expired and no refresh credentials are available. Please sign in again.',
+        );
+      }
+      try {
+        await _authService.refreshSession();
+      } on AuthException catch (error) {
+        if (error.statusCode == 400 || error.statusCode == 401) {
+          throw ApiException(401, 'Authentication refresh was rejected. Please sign in again.');
+        }
+        throw ApiException(0, 'Unable to refresh the session while offline. Please retry when connected.');
+      }
     }
+  }
+
+
+  /// Refreshes once after a server-side 401. Safe GET requests are replayed
+  /// once with the rotated access token; mutations are never replayed because
+  /// their first response may be ambiguous and duplicate operational actions.
+  Future<http.Response> _sendWithRefresh(
+    Future<http.Response> Function() send, {
+    bool retryOnUnauthorized = false,
+  }) async {
+    await _preflightSessionCheck();
+    final response = await send();
+    if (response.statusCode != 401 ||
+        _authService.currentSession?.isAuthenticated != true) {
+      return response;
+    }
+
+    try {
+      await _authService.refreshSession();
+    } on AuthException catch (error) {
+      throw ApiException(
+        error.statusCode == 400 || error.statusCode == 401 ? 401 : 0,
+        'Could not refresh the authenticated session: ${error.message}',
+      );
+    }
+
+    if (retryOnUnauthorized) {
+      return send();
+    }
+    throw ApiException(
+      401,
+      'Session refreshed, but this operation was not replayed automatically. '
+      'Please review the current incident state before trying again.',
+    );
   }
 
   /// Centralized response inspection for 401/403 status codes.
@@ -85,7 +135,7 @@ class ApiClient {
     String? severity,
     String? source,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final queryParams = <String, String>{};
     if (status != null && status != 'ALL') queryParams['status'] = status;
@@ -96,9 +146,7 @@ class ApiClient {
     final uri = Uri.parse(ApiConfig.incidentsUrl).replace(queryParameters: queryParams.isEmpty ? null : queryParams);
 
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body) as List<dynamic>;
@@ -115,13 +163,11 @@ class ApiClient {
 
   // 2. GET /api/v1/incidents/{id}
   Future<Incident> getIncident(String id) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentDetailUrl(id));
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -148,7 +194,7 @@ class ApiClient {
     String source = 'CITIZEN',
     String? reporterName,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentsUrl);
     final payload = {
@@ -162,13 +208,13 @@ class ApiClient {
     };
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 201) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -189,7 +235,7 @@ class ApiClient {
       return getIncident(incidentId);
     }
 
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentPhotosUploadUrl(incidentId));
     final request = http.MultipartRequest('POST', uri);
@@ -216,6 +262,17 @@ class ApiClient {
       final streamedResponse = await _httpClient.send(request).timeout(const Duration(seconds: 25));
       final response = await http.Response.fromStream(streamedResponse);
 
+      if (response.statusCode == 401 && _authService.currentSession?.isAuthenticated == true) {
+        try {
+          await _authService.refreshSession();
+        } on AuthException catch (error) {
+          throw ApiException(error.statusCode == 400 || error.statusCode == 401 ? 401 : 0,
+              'Could not refresh the authenticated session: ${error.message}');
+        }
+        throw ApiException(401,
+            'Session refreshed, but the evidence upload was not replayed. Review the incident before retrying.');
+      }
+
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
         return Incident.fromJson(data);
@@ -236,7 +293,7 @@ class ApiClient {
     String? assignedTo,
     String? municipalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentDetailUrl(id));
     final payload = <String, dynamic>{};
@@ -246,13 +303,13 @@ class ApiClient {
     if (municipalNotes != null) payload['municipal_notes'] = municipalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .patch(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -269,13 +326,11 @@ class ApiClient {
 
   // 6. GET /api/v1/incidents/municipal/kpis
   Future<Map<String, dynamic>> getMunicipalKpis() async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.municipalKpisUrl);
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         return jsonDecode(response.body) as Map<String, dynamic>;
@@ -300,7 +355,7 @@ class ApiClient {
     int limit = 50,
     int offset = 0,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final queryParams = <String, String>{
       'limit': limit.toString(),
@@ -315,9 +370,7 @@ class ApiClient {
 
     final uri = Uri.parse(ApiConfig.municipalQueueUrl).replace(queryParameters: queryParams);
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -342,13 +395,11 @@ class ApiClient {
 
   // 8. GET /api/v1/incidents/field-teams
   Future<List<FieldTeam>> getFieldTeams() async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.fieldTeamsUrl);
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body) as List<dynamic>;
@@ -370,7 +421,7 @@ class ApiClient {
     String? severity,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentVerifyUrl(id));
     final payload = <String, dynamic>{};
@@ -379,13 +430,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -407,7 +458,7 @@ class ApiClient {
     String? reason,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentAssignUrl(id));
     final payload = <String, dynamic>{
@@ -417,13 +468,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -445,7 +496,7 @@ class ApiClient {
     required String reason,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentReassignUrl(id));
     final payload = <String, dynamic>{
@@ -455,13 +506,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -482,7 +533,7 @@ class ApiClient {
     required String reason,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentUnassignUrl(id));
     final payload = <String, dynamic>{
@@ -491,13 +542,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -518,7 +569,7 @@ class ApiClient {
     required String reason,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentRejectUrl(id));
     final payload = <String, dynamic>{
@@ -527,13 +578,13 @@ class ApiClient {
     if (internalNotes != null && internalNotes.isNotEmpty) payload['internal_notes'] = internalNotes;
 
     try {
-      final response = await _httpClient
+      final response = await _sendWithRefresh(() => _httpClient
           .post(
             uri,
             headers: _buildHeaders(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 10)));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -550,13 +601,11 @@ class ApiClient {
 
   // 14. GET /api/v1/incidents/{id}/audit
   Future<List<IncidentAudit>> getIncidentAudits(String id) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentAuditUrl(id));
     try {
-      final response = await _httpClient
-          .get(uri, headers: _buildHeaders())
-          .timeout(const Duration(seconds: 10));
+      final response = await _sendWithRefresh(() => _httpClient.get(uri, headers: _buildHeaders()).timeout(const Duration(seconds: 10)), retryOnUnauthorized: true);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body) as List<dynamic>;

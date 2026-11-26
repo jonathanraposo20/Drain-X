@@ -3,14 +3,26 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:drainx_mobile/core/auth/auth_service.dart';
+import 'package:drainx_mobile/core/auth/secure_session_store.dart';
 import 'package:drainx_mobile/core/config/api_config.dart';
 import 'package:drainx_mobile/models/user_session.dart';
+
+class _MemorySessionStore implements SecureSessionStore {
+  String? value;
+  @override
+  Future<String?> readSession() async => value;
+  @override
+  Future<void> writeSession(String value) async { this.value = value; }
+  @override
+  Future<void> clearSession() async { value = null; }
+}
 
 void main() {
   late AuthService authService;
 
   setUp(() {
     authService = AuthService();
+    authService.sessionStoreForTesting = _MemorySessionStore();
     authService.logout(); // Reset session before each test
   });
 
