@@ -1,5 +1,6 @@
 name: Flutter mobile checks
 # Continuous validation for Flutter source changes.
+# Also run on feature-branch pushes so fixes are checked before merging.
 
 on:
   pull_request:
