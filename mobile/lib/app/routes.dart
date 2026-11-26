@@ -17,18 +17,15 @@ class AppRoutes {
   static const String unauthorized = '/unauthorized';
 
   /// Wraps a destination widget in a role guard.
-  /// If unauthenticated, token is expired, or possessing an invalid role,
-  /// invalidates stale session and routes to UnauthorizedScreen.
+  /// Checks the restored local auth state and role. The Supabase SDK refreshes
+  /// expired tokens before API calls, so startup must not reject a restorable session.
   static Widget guarded({
     required UserRole requiredRole,
     required Widget Function(UserSession session) builder,
   }) {
     final authService = AuthService();
     final session = authService.currentSession;
-    if (session == null || (session.isAuthenticated && session.isTokenExpired) || !session.canAccess(requiredRole)) {
-      if (session != null && session.isAuthenticated && session.isTokenExpired) {
-        authService.handleUnauthorized(redirect: false);
-      }
+    if (session == null || !session.canAccess(requiredRole)) {
       return UnauthorizedScreen(
         requiredRole: requiredRole,
         userRole: session?.role,

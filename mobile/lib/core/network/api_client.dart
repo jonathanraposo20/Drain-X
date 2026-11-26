@@ -54,11 +54,11 @@ class ApiClient {
 
   /// Validates session expiry prior to initiating an authenticated request.
   /// Detects expired JWTs before placing bytes on the network.
-  void _preflightSessionCheck() {
-    final session = _authService.currentSession;
-    if (session != null && session.isAuthenticated && session.isTokenExpired) {
-      _authService.handleUnauthorized();
-      throw ApiException(401, 'Authentication token has expired. Stale session invalidated.');
+  Future<void> _preflightSessionCheck() async {
+    try {
+      await _authService.ensureValidSession();
+    } on AuthException catch (error) {
+      throw ApiException(error.statusCode ?? 0, error.message);
     }
   }
 
@@ -85,7 +85,7 @@ class ApiClient {
     String? severity,
     String? source,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final queryParams = <String, String>{};
     if (status != null && status != 'ALL') queryParams['status'] = status;
@@ -115,7 +115,7 @@ class ApiClient {
 
   // 2. GET /api/v1/incidents/{id}
   Future<Incident> getIncident(String id) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentDetailUrl(id));
     try {
@@ -148,7 +148,7 @@ class ApiClient {
     String source = 'CITIZEN',
     String? reporterName,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentsUrl);
     final payload = {
@@ -189,7 +189,7 @@ class ApiClient {
       return getIncident(incidentId);
     }
 
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentPhotosUploadUrl(incidentId));
     final request = http.MultipartRequest('POST', uri);
@@ -236,7 +236,7 @@ class ApiClient {
     String? assignedTo,
     String? municipalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentDetailUrl(id));
     final payload = <String, dynamic>{};
@@ -269,7 +269,7 @@ class ApiClient {
 
   // 6. GET /api/v1/incidents/municipal/kpis
   Future<Map<String, dynamic>> getMunicipalKpis() async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.municipalKpisUrl);
     try {
@@ -300,7 +300,7 @@ class ApiClient {
     int limit = 50,
     int offset = 0,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final queryParams = <String, String>{
       'limit': limit.toString(),
@@ -342,7 +342,7 @@ class ApiClient {
 
   // 8. GET /api/v1/incidents/field-teams
   Future<List<FieldTeam>> getFieldTeams() async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.fieldTeamsUrl);
     try {
@@ -370,7 +370,7 @@ class ApiClient {
     String? severity,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentVerifyUrl(id));
     final payload = <String, dynamic>{};
@@ -407,7 +407,7 @@ class ApiClient {
     String? reason,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentAssignUrl(id));
     final payload = <String, dynamic>{
@@ -445,7 +445,7 @@ class ApiClient {
     required String reason,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentReassignUrl(id));
     final payload = <String, dynamic>{
@@ -482,7 +482,7 @@ class ApiClient {
     required String reason,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentUnassignUrl(id));
     final payload = <String, dynamic>{
@@ -518,7 +518,7 @@ class ApiClient {
     required String reason,
     String? internalNotes,
   }) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentRejectUrl(id));
     final payload = <String, dynamic>{
@@ -550,7 +550,7 @@ class ApiClient {
 
   // 14. GET /api/v1/incidents/{id}/audit
   Future<List<IncidentAudit>> getIncidentAudits(String id) async {
-    _preflightSessionCheck();
+    await _preflightSessionCheck();
 
     final uri = Uri.parse(ApiConfig.incidentAuditUrl(id));
     try {
