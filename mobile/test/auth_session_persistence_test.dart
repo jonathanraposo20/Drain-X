@@ -15,12 +15,17 @@ class MemorySessionStore implements SecureSessionStore {
   String? value;
   int writes = 0;
   int clears = 0;
+  bool failNextWrite = false;
 
   @override
   Future<String?> readSession() async => value;
 
   @override
   Future<void> writeSession(String value) async {
+    if (failNextWrite) {
+      failNextWrite = false;
+      throw StateError('Simulated secure-storage write failure');
+    }
     this.value = value;
     writes++;
   }
@@ -136,6 +141,49 @@ void main() {
     expect(refreshed.refreshToken, 'refresh-new');
     expect(auth.currentToken, 'access-new');
     expect(jsonDecode(store.value!)['refresh_token'], 'refresh-new');
+  });
+
+  test('clears the session if secure storage fails after refresh-token rotation', () async {
+    final expiry = (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 60;
+    final previousSession = UserSession(
+      userId: 'user-1',
+      name: 'DRAIN-X User',
+      email: 'user@example.com',
+      role: UserRole.citizen,
+      authType: AuthType.authenticated,
+      token: testJwt(expiresAt: expiry),
+      refreshToken: 'refresh-before-rotation',
+    );
+    auth.setSessionForTesting(previousSession);
+    store.value = jsonEncode(previousSession.toJson());
+    store.failNextWrite = true;
+
+    var refreshCalls = 0;
+    auth.httpClient = MockClient((request) async {
+      refreshCalls++;
+      expect(request.url.queryParameters['grant_type'], 'refresh_token');
+      expect(jsonDecode(request.body)['refresh_token'], 'refresh-before-rotation');
+      return http.Response(
+        jsonEncode(authResponse(
+          accessToken: 'access-after-rotation',
+          refreshToken: 'refresh-after-rotation',
+        )),
+        200,
+      );
+    });
+
+    await expectLater(
+      auth.refreshSession(),
+      throwsA(predicate((error) =>
+          error is AuthException &&
+          error.message.contains('Please sign in again'))),
+    );
+
+    expect(refreshCalls, 1);
+    expect(auth.currentSession, isNull);
+    expect(auth.currentToken, isNull);
+    expect(store.value, isNull);
+    expect(store.clears, 1);
   });
 
   test('concurrent refresh calls share one rotating refresh request', () async {
