@@ -1,11 +1,28 @@
+import 'package:flutter/foundation.dart';
+
 class ApiConfig {
-  // Default to Android Emulator host IP (10.0.2.2).
-  // Can be adjusted at runtime to 'localhost' or computer LAN IP (e.g. 192.168.1.15:8000).
-  static String baseUrl = 'http://10.0.2.2:8000';
+  static const String _envBaseUrl = String.fromEnvironment(
+    'DRAINX_API_BASE_URL',
+    defaultValue: '',
+  );
+  static const String _envSupabaseUrl = String.fromEnvironment(
+    'SUPABASE_URL',
+    defaultValue: '',
+  );
+  static const String _envSupabaseAnonKey = String.fromEnvironment(
+    'SUPABASE_ANON_KEY',
+    defaultValue: '',
+  );
+
+  // Default to localhost on Web, Android Emulator host IP (10.0.2.2) on mobile,
+  // or compile-time --dart-define=DRAINX_API_BASE_URL when provided.
+  static String baseUrl = _envBaseUrl.isNotEmpty
+      ? _envBaseUrl
+      : (kIsWeb ? 'http://localhost:8000' : 'http://10.0.2.2:8000');
 
   // Optional Supabase endpoints for live authentication (never store service-role key)
-  static String? supabaseUrl;
-  static String? supabaseAnonKey;
+  static String? supabaseUrl = _envSupabaseUrl.isNotEmpty ? _envSupabaseUrl : null;
+  static String? supabaseAnonKey = _envSupabaseAnonKey.isNotEmpty ? _envSupabaseAnonKey : null;
 
   static const String apiV1Prefix = '/api/v1';
 
@@ -34,6 +51,7 @@ class ApiConfig {
 
   // Pre-configured environments for easy switching in demo mode
   static const Map<String, String> presetEnvironments = {
+    'Production Render Backend': 'https://drainx-backend.onrender.com',
     'Android Emulator (10.0.2.2:8000)': 'http://10.0.2.2:8000',
     'Localhost (Desktop/Web 8000)': 'http://localhost:8000',
     'Local Loopback (127.0.0.1:8000)': 'http://127.0.0.1:8000',
